@@ -202,8 +202,9 @@ class AlpagGenerator:
             return
 
         def on_success(context: dict[str, object]) -> None:
-            session = context.get(self)
+            session = context.get("self")
             if not isinstance(session, wqb.WQBSession):
+                logger.warning("patch_properties skipped: callback context missing WQBSession")
                 return
 
             children = context["resp"].json().get("children", [])
@@ -212,11 +213,13 @@ class AlpagGenerator:
                     f"https://api.worldquantbrain.com/simulations/{child}"
                 )
                 alpha_id = response.json()["alpha"]
-                session.patch_properties(
+                patch_response = session.patch_properties(
                     alpha_id=alpha_id,
                     tags=self.tags,
                     log=logger,
                 )
+                if hasattr(patch_response, "raise_for_status"):
+                    patch_response.raise_for_status()
 
         multi_alphas = wqb.to_multi_alphas(
             alphas=alpha_objs,
