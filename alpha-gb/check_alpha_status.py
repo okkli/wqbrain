@@ -626,6 +626,10 @@ class OperatorSpecBuilder:
         specs.update(OperatorSpecBuilder._build_transformational_specs())
         # Group operators
         specs.update(OperatorSpecBuilder._build_group_specs())
+        # Special operators
+        specs.update(OperatorSpecBuilder._build_special_specs())
+        # Reduce operators
+        specs.update(OperatorSpecBuilder._build_reduce_specs())
 
         return specs
 
@@ -664,7 +668,9 @@ class OperatorSpecBuilder:
                     ParamSpec('x', ParamType.ANY),
                     ParamSpec('y', ParamType.ANY)
                 ],
-                keyword_params={'filter': ParamSpec('filter', ParamType.BOOL, optional=True, default_value=False)}
+                keyword_params={'filter': ParamSpec('filter', ParamType.BOOL, optional=True, default_value=False)},
+                variadic=True,
+                min_args=2
             ),
             'log': OperatorSpec(
                 name='log',
@@ -748,6 +754,49 @@ class OperatorSpecBuilder:
                 positional_params=[ParamSpec('x', ParamType.GROUP)],
                 keyword_params={},
                 return_type=ParamType.GROUP
+            ),
+            'pasteurize': OperatorSpec(
+                name='pasteurize',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'purify': OperatorSpec(
+                name='purify',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'arc_tan': OperatorSpec(
+                name='arc_tan',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'sigmoid': OperatorSpec(
+                name='sigmoid',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'tanh': OperatorSpec(
+                name='tanh',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'nan_out': OperatorSpec(
+                name='nan_out',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={
+                    'lower': ParamSpec('lower', ParamType.FLOAT, optional=True, default_value=0),
+                    'upper': ParamSpec('upper', ParamType.FLOAT, optional=True, default_value=0)
+                }
+            ),
+            'round': OperatorSpec(
+                name='round',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'floor': OperatorSpec(
+                name='floor',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={}
             ),
         }
 
@@ -847,6 +896,18 @@ class OperatorSpecBuilder:
                     ParamSpec('input1', ParamType.ANY),
                     ParamSpec('input2', ParamType.ANY)
                 ],
+                keyword_params={},
+                return_type=ParamType.MATRIX
+            ),
+            'is_not_nan': OperatorSpec(
+                name='is_not_nan',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={},
+                return_type=ParamType.MATRIX
+            ),
+            'is_finite': OperatorSpec(
+                name='is_finite',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
                 keyword_params={},
                 return_type=ParamType.MATRIX
             ),
@@ -1072,17 +1133,18 @@ class OperatorSpecBuilder:
                 name='kth_element',
                 positional_params=[
                     ParamSpec('x', ParamType.MATRIX),
-                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0),
+                    ParamSpec('k', ParamType.INT, value_constraint=lambda v: v > 0)
                 ],
                 keyword_params={
-                    'k': ParamSpec('k', ParamType.INT, optional=False, value_constraint=lambda v: v > 0)
+                    'ignore': ParamSpec('ignore', ParamType.STRING, optional=True, default_value="NaN")
                 }
             ),
             'hump': OperatorSpec(
                 name='hump',
                 positional_params=[ParamSpec('x', ParamType.MATRIX)],
                 keyword_params={
-                    'hump': ParamSpec('hump', ParamType.FLOAT, optional=False,
+                    'hump': ParamSpec('hump', ParamType.FLOAT, optional=True, default_value=0.01,
                                      value_constraint=lambda v: 0 < v < 1)
                 }
             ),
@@ -1098,9 +1160,9 @@ class OperatorSpecBuilder:
                 name='ts_target_tvr_decay',
                 positional_params=[ParamSpec('x', ParamType.MATRIX)],
                 keyword_params={
-                    'lambda_min': ParamSpec('lambda_min', ParamType.FLOAT, optional=False, default_value=0),
-                    'lambda_max': ParamSpec('lambda_max', ParamType.FLOAT, optional=False, default_value=1),
-                    'target_tvr': ParamSpec('target_tvr', ParamType.FLOAT, optional=False, default_value=0.1)
+                    'lambda_min': ParamSpec('lambda_min', ParamType.FLOAT, optional=True, default_value=0),
+                    'lambda_max': ParamSpec('lambda_max', ParamType.FLOAT, optional=True, default_value=1),
+                    'target_tvr': ParamSpec('target_tvr', ParamType.FLOAT, optional=True, default_value=0.1)
                 }
             ),
             'ts_target_tvr_delta_limit': OperatorSpec(
@@ -1110,9 +1172,158 @@ class OperatorSpecBuilder:
                     ParamSpec('y', ParamType.MATRIX)
                 ],
                 keyword_params={
-                    'lambda_min': ParamSpec('lambda_min', ParamType.FLOAT, optional=False, default_value=0),
-                    'lambda_max': ParamSpec('lambda_max', ParamType.FLOAT, optional=False, default_value=1),
-                    'target_tvr': ParamSpec('target_tvr', ParamType.FLOAT, optional=False, default_value=0.1)
+                    'lambda_min': ParamSpec('lambda_min', ParamType.FLOAT, optional=True, default_value=0),
+                    'lambda_max': ParamSpec('lambda_max', ParamType.FLOAT, optional=True, default_value=1),
+                    'target_tvr': ParamSpec('target_tvr', ParamType.FLOAT, optional=True, default_value=0.1)
+                }
+            ),
+            'ts_returns': OperatorSpec(
+                name='ts_returns',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={
+                    'mode': ParamSpec('mode', ParamType.INT, optional=True, default_value=1)
+                }
+            ),
+            'ts_entropy': OperatorSpec(
+                name='ts_entropy',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'ts_co_kurtosis': OperatorSpec(
+                name='ts_co_kurtosis',
+                positional_params=[
+                    ParamSpec('y', ParamType.MATRIX),
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'ts_kurtosis': OperatorSpec(
+                name='ts_kurtosis',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'ts_min_max_diff': OperatorSpec(
+                name='ts_min_max_diff',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={
+                    'f': ParamSpec('f', ParamType.FLOAT, optional=True, default_value=0.5)
+                }
+            ),
+            'ts_min_max_cps': OperatorSpec(
+                name='ts_min_max_cps',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={
+                    'f': ParamSpec('f', ParamType.FLOAT, optional=True, default_value=2)
+                }
+            ),
+            'ts_ir': OperatorSpec(
+                name='ts_ir',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'ts_theilsen': OperatorSpec(
+                name='ts_theilsen',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('y', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'hump_decay': OperatorSpec(
+                name='hump_decay',
+                positional_params=[ParamSpec('x', ParamType.MATRIX)],
+                keyword_params={
+                    'p': ParamSpec('p', ParamType.FLOAT, optional=True, default_value=0)
+                }
+            ),
+            'ts_weighted_decay': OperatorSpec(
+                name='ts_weighted_decay',
+                positional_params=[ParamSpec('x', ParamType.MATRIX)],
+                keyword_params={
+                    'k': ParamSpec('k', ParamType.FLOAT, optional=True, default_value=0.5)
+                }
+            ),
+            'ts_co_skewness': OperatorSpec(
+                name='ts_co_skewness',
+                positional_params=[
+                    ParamSpec('y', ParamType.MATRIX),
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'ts_min_diff': OperatorSpec(
+                name='ts_min_diff',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'ts_max_diff': OperatorSpec(
+                name='ts_max_diff',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'ts_moment': OperatorSpec(
+                name='ts_moment',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={
+                    'k': ParamSpec('k', ParamType.INT, optional=True, default_value=0)
+                }
+            ),
+            'ts_skewness': OperatorSpec(
+                name='ts_skewness',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={}
+            ),
+            'ts_poly_regression': OperatorSpec(
+                name='ts_poly_regression',
+                positional_params=[
+                    ParamSpec('y', ParamType.MATRIX),
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('d', ParamType.INT, value_constraint=lambda v: v > 0)
+                ],
+                keyword_params={
+                    'k': ParamSpec('k', ParamType.INT, optional=True, default_value=1)
+                }
+            ),
+            'ts_target_tvr_hump': OperatorSpec(
+                name='ts_target_tvr_hump',
+                positional_params=[ParamSpec('x', ParamType.MATRIX)],
+                keyword_params={
+                    'lambda_min': ParamSpec('lambda_min', ParamType.FLOAT, optional=True, default_value=0),
+                    'lambda_max': ParamSpec('lambda_max', ParamType.FLOAT, optional=True, default_value=1),
+                    'target_tvr': ParamSpec('target_tvr', ParamType.FLOAT, optional=True, default_value=0.1)
                 }
             ),
         }
@@ -1125,7 +1336,7 @@ class OperatorSpecBuilder:
                 name='winsorize',
                 positional_params=[ParamSpec('x', ParamType.MATRIX)],
                 keyword_params={
-                    'std': ParamSpec('std', ParamType.FLOAT, optional=False,
+                    'std': ParamSpec('std', ParamType.FLOAT, optional=True, default_value=4,
                                     value_constraint=lambda v: v > 0)
                 }
             ),
@@ -1161,11 +1372,11 @@ class OperatorSpecBuilder:
                 name='scale',
                 positional_params=[ParamSpec('x', ParamType.MATRIX)],
                 keyword_params={
-                    'scale': ParamSpec('scale', ParamType.INT, optional=True, default_value=1,
+                    'scale': ParamSpec('scale', ParamType.FLOAT, optional=True, default_value=1,
                                       value_constraint=lambda v: v > 0),
-                    'longscale': ParamSpec('longscale', ParamType.INT, optional=True, default_value=1,
+                    'longscale': ParamSpec('longscale', ParamType.FLOAT, optional=True, default_value=1,
                                           value_constraint=lambda v: v > 0),
-                    'shortscale': ParamSpec('shortscale', ParamType.INT, optional=True, default_value=1,
+                    'shortscale': ParamSpec('shortscale', ParamType.FLOAT, optional=True, default_value=1,
                                            value_constraint=lambda v: v > 0)
                 }
             ),
@@ -1185,6 +1396,33 @@ class OperatorSpecBuilder:
                                        value_constraint=lambda v: v in ['gaussian', 'cauchy', 'uniform']),
                     'sigma': ParamSpec('sigma', ParamType.FLOAT, optional=True, default_value=1.0)
                 }
+            ),
+            'regression_proj': OperatorSpec(
+                name='regression_proj',
+                positional_params=[
+                    ParamSpec('y', ParamType.MATRIX),
+                    ParamSpec('x', ParamType.MATRIX)
+                ],
+                keyword_params={}
+            ),
+            'rank_gmean_amean_diff': OperatorSpec(
+                name='rank_gmean_amean_diff',
+                positional_params=[
+                    ParamSpec('input1', ParamType.MATRIX),
+                    ParamSpec('input2', ParamType.MATRIX),
+                    ParamSpec('input3', ParamType.MATRIX)
+                ],
+                keyword_params={},
+                variadic=True,
+                min_args=3
+            ),
+            'vector_proj': OperatorSpec(
+                name='vector_proj',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('y', ParamType.MATRIX)
+                ],
+                keyword_params={}
             ),
         }
 
@@ -1216,6 +1454,36 @@ class OperatorSpecBuilder:
                 keyword_params={},
                 return_type=ParamType.MATRIX
             ),
+            'vec_kurtosis': OperatorSpec(
+                name='vec_kurtosis',
+                positional_params=[ParamSpec('x', ParamType.VECTOR)],
+                keyword_params={},
+                return_type=ParamType.MATRIX
+            ),
+            'vec_count': OperatorSpec(
+                name='vec_count',
+                positional_params=[ParamSpec('x', ParamType.VECTOR)],
+                keyword_params={},
+                return_type=ParamType.MATRIX
+            ),
+            'vec_skewness': OperatorSpec(
+                name='vec_skewness',
+                positional_params=[ParamSpec('x', ParamType.VECTOR)],
+                keyword_params={},
+                return_type=ParamType.MATRIX
+            ),
+            'vec_stddev': OperatorSpec(
+                name='vec_stddev',
+                positional_params=[ParamSpec('x', ParamType.VECTOR)],
+                keyword_params={},
+                return_type=ParamType.MATRIX
+            ),
+            'vec_range': OperatorSpec(
+                name='vec_range',
+                positional_params=[ParamSpec('x', ParamType.VECTOR)],
+                keyword_params={},
+                return_type=ParamType.MATRIX
+            ),
         }
 
     @staticmethod
@@ -1226,7 +1494,10 @@ class OperatorSpecBuilder:
                 name='bucket',
                 positional_params=[ParamSpec('x', ParamType.MATRIX)],
                 keyword_params={
-                    'range': ParamSpec('range', ParamType.STRING, optional=False)
+                    'range': ParamSpec('range', ParamType.STRING, optional=True),
+                    'buckets': ParamSpec('buckets', ParamType.STRING, optional=True),
+                    'skipBoth': ParamSpec('skipBoth', ParamType.BOOL, optional=True, default_value=False),
+                    'NaNGroup': ParamSpec('NaNGroup', ParamType.BOOL, optional=True, default_value=False)
                 },
                 return_type=ParamType.GROUP
             ),
@@ -1237,6 +1508,20 @@ class OperatorSpecBuilder:
                     ParamSpec('y', ParamType.ANY),
                     ParamSpec('z', ParamType.ANY)
                 ],
+                keyword_params={}
+            ),
+            'tail': OperatorSpec(
+                name='tail',
+                positional_params=[ParamSpec('x', ParamType.MATRIX)],
+                keyword_params={
+                    'lower': ParamSpec('lower', ParamType.FLOAT, optional=True, default_value=0),
+                    'upper': ParamSpec('upper', ParamType.FLOAT, optional=True, default_value=0),
+                    'newval': ParamSpec('newval', ParamType.FLOAT, optional=True, default_value=0)
+                }
+            ),
+            'generate_stats': OperatorSpec(
+                name='generate_stats',
+                positional_params=[ParamSpec('alpha', ParamType.ANY)],
                 keyword_params={}
             ),
         }
@@ -1321,6 +1606,178 @@ class OperatorSpecBuilder:
                 ],
                 keyword_params={},
                 return_type=ParamType.GROUP
+            ),
+            'group_vector_proj': OperatorSpec(
+                name='group_vector_proj',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('y', ParamType.MATRIX),
+                    ParamSpec('g', ParamType.GROUP)
+                ],
+                keyword_params={}
+            ),
+            'group_extra': OperatorSpec(
+                name='group_extra',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('weight', ParamType.ANY),
+                    ParamSpec('group', ParamType.GROUP)
+                ],
+                keyword_params={}
+            ),
+            'group_count': OperatorSpec(
+                name='group_count',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('group', ParamType.GROUP)
+                ],
+                keyword_params={}
+            ),
+            'group_std_dev': OperatorSpec(
+                name='group_std_dev',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('group', ParamType.GROUP)
+                ],
+                keyword_params={}
+            ),
+            'group_sum': OperatorSpec(
+                name='group_sum',
+                positional_params=[
+                    ParamSpec('x', ParamType.MATRIX),
+                    ParamSpec('group', ParamType.GROUP)
+                ],
+                keyword_params={}
+            ),
+            'combo_a': OperatorSpec(
+                name='combo_a',
+                positional_params=[ParamSpec('alpha', ParamType.MATRIX)],
+                keyword_params={
+                    'nlength': ParamSpec('nlength', ParamType.INT, optional=True, default_value=250,
+                                        value_constraint=lambda v: v > 0),
+                    'mode': ParamSpec('mode', ParamType.STRING, optional=True, default_value='algo1',
+                                     value_constraint=lambda v: v in ['algo1', 'algo2', 'algo3'])
+                }
+            ),
+        }
+
+    @staticmethod
+    def _build_special_specs() -> Dict[str, OperatorSpec]:
+        """构建特殊运算符规格"""
+        return {
+            'inst_pnl': OperatorSpec(
+                name='inst_pnl',
+                positional_params=[ParamSpec('x', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'self_corr': OperatorSpec(
+                name='self_corr',
+                positional_params=[ParamSpec('input', ParamType.MATRIX)],
+                keyword_params={}
+            ),
+            'in': OperatorSpec(
+                name='in',
+                positional_params=[],
+                keyword_params={}
+            ),
+            'universe_size': OperatorSpec(
+                name='universe_size',
+                positional_params=[],
+                keyword_params={}
+            ),
+        }
+
+    @staticmethod
+    def _build_reduce_specs() -> Dict[str, OperatorSpec]:
+        """构建Reduce运算符规格"""
+        return {
+            'reduce_ir': OperatorSpec(
+                name='reduce_ir',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'reduce_avg': OperatorSpec(
+                name='reduce_avg',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={
+                    'threshold': ParamSpec('threshold', ParamType.FLOAT, optional=True, default_value=0)
+                }
+            ),
+            'reduce_powersum': OperatorSpec(
+                name='reduce_powersum',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={
+                    'constant': ParamSpec('constant', ParamType.INT, optional=True, default_value=2),
+                    'precise': ParamSpec('precise', ParamType.BOOL, optional=True, default_value=False)
+                }
+            ),
+            'reduce_max': OperatorSpec(
+                name='reduce_max',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'reduce_min': OperatorSpec(
+                name='reduce_min',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'reduce_norm': OperatorSpec(
+                name='reduce_norm',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'reduce_sum': OperatorSpec(
+                name='reduce_sum',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'reduce_range': OperatorSpec(
+                name='reduce_range',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'reduce_percentage': OperatorSpec(
+                name='reduce_percentage',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={
+                    'percentage': ParamSpec('percentage', ParamType.FLOAT, optional=True, default_value=0.5,
+                                           value_constraint=lambda v: 0 <= v <= 1)
+                }
+            ),
+            'reduce_skewness': OperatorSpec(
+                name='reduce_skewness',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'reduce_count': OperatorSpec(
+                name='reduce_count',
+                positional_params=[
+                    ParamSpec('input', ParamType.ANY),
+                    ParamSpec('threshold', ParamType.FLOAT)
+                ],
+                keyword_params={}
+            ),
+            'reduce_kurtosis': OperatorSpec(
+                name='reduce_kurtosis',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={}
+            ),
+            'reduce_choose': OperatorSpec(
+                name='reduce_choose',
+                positional_params=[
+                    ParamSpec('input', ParamType.ANY),
+                    ParamSpec('nth', ParamType.INT)
+                ],
+                keyword_params={
+                    'ignoreNan': ParamSpec('ignoreNan', ParamType.BOOL, optional=True, default_value=True)
+                }
+            ),
+            'reduce_stddev': OperatorSpec(
+                name='reduce_stddev',
+                positional_params=[ParamSpec('input', ParamType.ANY)],
+                keyword_params={
+                    'threshold': ParamSpec('threshold', ParamType.FLOAT, optional=True, default_value=0)
+                }
             ),
         }
 
