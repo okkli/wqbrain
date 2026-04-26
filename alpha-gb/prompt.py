@@ -71,7 +71,7 @@ def prompt(region, delay, universe, alpha_description, num_alphas, data_ids, ops
     When a function requires named parameters (e.g., `winsorize(x, std=4)`, `kth_element(x, d, k=1)`, `ts_decay_linear(x, d, dense=false)`), you MUST use named parameter syntax and CANNOT use positional arguments.
 
     Provide only {num_alphas} alpha expressions in a json format, they should not be the same.
-    注意重要: type类型是vector的数据id必须使用(vec_avg 或者 vec_sum)进行包括才能进行operator!!!
+    注意重要: type类型是vector的数据id必须使用({[item['name'] for item in ops if item['category'] == 'Vector' and "REGULAR" in item['scope']]})进行包括才能进行operator!!!
 
     Return a JSON array where each element has these properties(It needs to be loaded by json.loads):
     - "expression": The alpha expression you provide

@@ -181,6 +181,8 @@ class AlpagGenerator:
                 "id": field.get("id"),
                 "type": field.get("type"),
                 "description": field.get("description"),
+                "dateCoverage": field.get("dateCoverage"),
+                "coverage": field.get("coverage"),
             }
             for field in fields
             if isinstance(field, dict)
