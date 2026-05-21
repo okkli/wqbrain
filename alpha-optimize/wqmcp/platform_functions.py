@@ -54,16 +54,18 @@ class SimulationSettings(BaseModel):
     neutralization: str = "NONE"
     truncation: float = 0.0
     pasteurization: str = "ON"
-    unitHandling: str = "VERIFY"
-    nanHandling: str = "OFF"
+    unitHandling: Optional[str] = "VERIFY"
+    nanHandling: Optional[str] = "OFF"
     language: str = "FASTEXPR"
     visualization: bool = True
-    testPeriod: str = "P0Y0M"
+    testPeriod: Optional[str] = "P0Y0M"
     selectionHandling: str = "POSITIVE"
     selectionLimit: int = 1000
     maxTrade: str = "OFF"
     maxPosition: str = "OFF"
     componentActivation: str = "IS"
+    # PYTHON-language specific
+    lookback: Optional[int] = None
 
 class SimulationData(BaseModel):
     type: str = "REGULAR"  # "REGULAR" or "SUPER"
@@ -305,14 +307,24 @@ class BrainApiClient:
             
             # Prepare settings based on simulation type
             settings_dict = simulation_data.settings.model_dump()
-            
+
             # Remove fields based on simulation type
             if simulation_data.type == "REGULAR":
                 # Remove SUPER-specific fields for REGULAR
                 settings_dict.pop('selectionHandling', None)
                 settings_dict.pop('selectionLimit', None)
                 settings_dict.pop('componentActivation', None)
-            
+
+            # Remove fields based on expression language
+            language = (settings_dict.get('language') or '').upper()
+            if language == "PYTHON":
+                # PYTHON payload omits these FASTEXPR-only fields
+                for k in ('unitHandling', 'nanHandling', 'testPeriod'):
+                    settings_dict.pop(k, None)
+            else:
+                # Non-PYTHON languages don't carry lookback
+                settings_dict.pop('lookback', None)
+
             # Filter out None values from settings
             settings_dict = {k: v for k, v in settings_dict.items() if v is not None}
             
@@ -1706,12 +1718,13 @@ async def create_simulation(
     selection_limit: int = 1000,
     component_activation: str = "IS",
     max_position: str = "OFF",
+    lookback: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     🚀 Create a new simulation on BRAIN platform.
-    
+
     This tool creates and starts a simulation with your alpha code. Use this after you have your alpha formula ready.
-    
+
     Args:
         type: Simulation type ("REGULAR" or "SUPER")
         instrument_type: Type of instruments (e.g., "EQUITY")
@@ -1721,19 +1734,23 @@ async def create_simulation(
         decay: Decay value for the simulation
         neutralization: Neutralization method
         truncation: Truncation value
-        test_period: Test period (e.g., "P0Y0M" for 1 year 6 months)
-        unit_handling: Unit handling method
-        nan_handling: NaN handling method
-        language: Expression language (e.g., "FASTEXPR")
+        test_period: Test period (e.g., "P0Y0M"). Ignored when language="PYTHON".
+        unit_handling: Unit handling method. Ignored when language="PYTHON".
+        nan_handling: NaN handling method. Ignored when language="PYTHON".
+        language: Expression language. "FASTEXPR" (default) or "PYTHON".
         visualization: Enable visualization
-        regular: Regular simulation code (for REGULAR type)
+        regular: Regular simulation code (for REGULAR type). For language="PYTHON" pass a Python source string.
         combo: Combo code (for SUPER type)
         selection: Selection code (for SUPER type)
-    
+        lookback: PYTHON-only lookback window (required when language="PYTHON", ignored otherwise).
+
     Returns:
         Simulation creation result with ID and location
     """
     try:
+        if (language or "").upper() == "PYTHON" and lookback is None:
+            return {"error": "lookback is required when language='PYTHON'"}
+
         settings = SimulationSettings(
             instrumentType=instrument_type,
             region=region,
@@ -1753,8 +1770,9 @@ async def create_simulation(
             selectionLimit=selection_limit,
             componentActivation=component_activation,
             maxPosition=max_position,
+            lookback=lookback,
         )
-        
+
         sim_data = SimulationData(
             type=type,
             settings=settings,
@@ -1762,7 +1780,7 @@ async def create_simulation(
             combo=combo,
             selection=selection
         )
-        
+
         return await brain_client.create_simulation(sim_data)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -2354,19 +2372,21 @@ async def create_multi_simulation(
     language: str = "FASTEXPR",
     visualization: bool = True,
     pasteurization: str = "ON",
-    max_trade: str = "OFF"
+    max_trade: str = "OFF",
+    lookback: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     🚀 Create multiple regular alpha simulations on BRAIN platform in a single request.
-    
+
     This tool creates a multisimulation with multiple regular alpha expressions,
     waits for all simulations to complete, and returns detailed results for each alpha.
-    
+
     ⏰ NOTE: Multisimulations can take 8+ minutes to complete. This tool will wait
     for the entire process and return comprehensive results.
     Call get_platform_setting_options to get the valid options for the simulation.
     Args:
-        alpha_expressions: List of alpha expressions (2-8 expressions required)
+        alpha_expressions: List of alpha expressions (2-10 expressions required).
+            For language="PYTHON" each entry is a Python source string.
         instrument_type: Type of instruments (default: "EQUITY")
         region: Market region (default: "USA")
         universe: Universe of stocks (default: "TOP3000")
@@ -2374,14 +2394,15 @@ async def create_multi_simulation(
         decay: Decay value (default: 0.0)
         neutralization: Neutralization method (default: "NONE")
         truncation: Truncation value (default: 0.0)
-        test_period: Test period (default: "P0Y0M")
-        unit_handling: Unit handling method (default: "VERIFY")
-        nan_handling: NaN handling method (default: "OFF")
-        language: Expression language (default: "FASTEXPR")
+        test_period: Test period (default: "P0Y0M"). Ignored when language="PYTHON".
+        unit_handling: Unit handling method (default: "VERIFY"). Ignored when language="PYTHON".
+        nan_handling: NaN handling method (default: "OFF"). Ignored when language="PYTHON".
+        language: Expression language (default: "FASTEXPR"). Use "PYTHON" for Python alphas.
         visualization: Enable visualization (default: True)
         pasteurization: Pasteurization setting (default: "ON")
         max_trade: Max trade setting (default: "OFF")
-    
+        lookback: PYTHON-only lookback window (required when language="PYTHON", ignored otherwise).
+
     Returns:
         Dictionary containing multisimulation results and individual alpha details
     """
@@ -2389,31 +2410,40 @@ async def create_multi_simulation(
         # Validate input
         if len(alpha_expressions) < 2:
             return {"error": "At least 2 alpha expressions are required"}
-        if len(alpha_expressions) > 8:
-            return {"error": "Maximum 8 alpha expressions allowed per request"}
-        
+        if len(alpha_expressions) > 10:
+            return {"error": "Maximum 10 alpha expressions allowed per request"}
+
+        is_python = (language or "").upper() == "PYTHON"
+        if is_python and lookback is None:
+            return {"error": "lookback is required when language='PYTHON'"}
+
         # Create multisimulation data
         multisimulation_data = []
         for alpha_expr in alpha_expressions:
+            settings: Dict[str, Any] = {
+                'instrumentType': instrument_type,
+                'region': region,
+                'universe': universe,
+                'delay': delay,
+                'decay': decay,
+                'neutralization': neutralization,
+                'truncation': truncation,
+                'pasteurization': pasteurization,
+                'language': language,
+                'visualization': visualization,
+                'maxTrade': max_trade,
+            }
+            if is_python:
+                settings['lookback'] = lookback
+            else:
+                settings['unitHandling'] = unit_handling
+                settings['nanHandling'] = nan_handling
+                settings['testPeriod'] = test_period
+
             simulation_item = {
                 'type': 'REGULAR',
-                'settings': {
-                    'instrumentType': instrument_type,
-                    'region': region,
-                    'universe': universe,
-                    'delay': delay,
-                    'decay': decay,
-                    'neutralization': neutralization,
-                    'truncation': truncation,
-                    'pasteurization': pasteurization,
-                    'unitHandling': unit_handling,
-                    'nanHandling': nan_handling,
-                    'language': language,
-                    'visualization': visualization,
-                    'testPeriod': test_period,
-                    'maxTrade': max_trade
-                },
-                'regular': alpha_expr
+                'settings': settings,
+                'regular': alpha_expr,
             }
             multisimulation_data.append(simulation_item)
         
