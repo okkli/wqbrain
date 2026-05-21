@@ -1,0 +1,8 @@
+qdrant-client>=1.12.0,<1.20.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+tenacity>=9.0.0
+
+# 备选 dense provider（任选其一，BGE-M3 不需要）
+# voyageai>=0.3.0
+# openai>=1.40.0

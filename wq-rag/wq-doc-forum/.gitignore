@@ -1,0 +1,30 @@
+# 凭据
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 编辑器 / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 临时文件
+*.tmp
+*.bak
+
+# 数据（不入 git）
+# 理由：
+#   1. 隐私 — 论坛 body 含用户自填邮箱/手机号邮箱，二次扩散 = PII 风险
+#   2. 版权 — 论坛/教程是 WorldQuant Brain 平台用户生成内容，转载受 ToS 约束
+#   3. 体量 — 20MB+ 持续增长，每次 forum_sync 都会变 diff，导致仓库历史爆炸
+# 重建方式：clone 后 `python forum_sync.py && python kb_sync.py` 即可重新生成
+data/

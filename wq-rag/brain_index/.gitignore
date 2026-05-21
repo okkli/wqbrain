@@ -1,0 +1,19 @@
+# 凭据（继承自仓库根 .gitignore，这里显式声明）
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 编辑器 / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 项目临时产物
+*.log
+failed_chunks.jsonl
+.qdrant_dump/
