@@ -1619,6 +1619,8 @@ def save_config(config: Dict[str, Any]):
 mcp = FastMCP(
     "brain-platform-mcp",
     "A server for interacting with the WorldQuant BRAIN platform",
+    # host="127.0.0.1",
+    # port="8761"
 )
 
 @mcp.tool()
@@ -2676,4 +2678,6 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
 # --- Main entry point ---
 if __name__ == "__main__":
     print("running the server")
-    mcp.run()
+    mcp.run(
+        # transport="streamable-http"
+    )
