@@ -2,6 +2,14 @@
 """
 WorldQuant BRAIN MCP Server - Python Version
 A comprehensive Model Context Protocol (MCP) server for WorldQuant BRAIN platform integration.
+
+Login: managed by the credd daemon (brain-serve/creds-daemon) over its HTTP interface.
+This server holds no password and never logs in by itself — it calls GET {CREDD_URL}/cookies
+(CREDD_URL default http://127.0.0.1:8762) authenticated by the X-Auth-Token header
+(CREDD_TOKEN env var), injects the cookies into its session, and self-heals on BRAIN 401
+by re-pulling once (deduped via X-Cookie-Version). Safe for many concurrent MCP clients
+(streamable-http): all BRAIN I/O runs in a bounded thread pool with real per-request
+timeouts; nothing blocks the shared event loop.
 """
 
 import json
@@ -9,7 +17,6 @@ import asyncio
 import logging
 from typing import Dict, List, Optional, Any, Union, Tuple
 import re
-import base64
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -17,6 +24,7 @@ import os
 import sys
 import math
 import io
+import threading
 # try set gbk problem
 try:
     if hasattr(sys.stdout, 'reconfigure'):
@@ -28,8 +36,10 @@ except Exception:
 
 import requests
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel
 
 from pathlib import Path
 
@@ -40,11 +50,104 @@ from forum_functions import forum_client
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Pydantic models for type safety
-class AuthCredentials(BaseModel):
-    email: EmailStr
-    password: str
 
+def _retry_after_seconds(response: requests.Response) -> float:
+    """Parse the Retry-After header. Header values are strings — never compare
+    them to int 0 directly. Missing/unparsable → 0.0."""
+    try:
+        return float(response.headers.get("Retry-After", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# --- credd (creds-daemon) HTTP interface ------------------------------------
+# Login state comes from the credd daemon over its HTTP API (GET /cookies with
+# an X-Auth-Token header) — this process never sees the BRAIN password and does
+# no login of its own. See brain-serve/creds-daemon/README.md for the contract.
+CREDD_URL = os.environ.get("CREDD_URL", "http://127.0.0.1:8762").rstrip("/")
+CREDD_TOKEN = os.environ.get("CREDD_TOKEN", "")
+_BRAIN_COOKIE_DOMAIN = ".worldquantbrain.com"
+
+
+class CreddUnavailable(RuntimeError):
+    """credd itself is unreachable / returned an error (distinct from a BRAIN 401)."""
+
+
+class CreddSession(requests.Session):
+    """requests.Session whose BRAIN cookies come from credd's HTTP interface.
+
+    - cookies are pulled from ``GET {CREDD_URL}/cookies`` (``X-Auth-Token`` header
+      when ``CREDD_TOKEN`` is set) and injected as one atomic jar rebind;
+    - a BRAIN 401 self-heals: re-pull from credd once and retry, deduped by the
+      ``X-Cookie-Version`` response header so a credd in backoff can't cause a
+      401→refetch→401 spin;
+    - thread-safe: refresh is serialized by a lock and the jar is swapped whole,
+      so worker threads never observe a partially-cleared jar.
+    """
+
+    def __init__(self, *, credd_timeout: float = 15) -> None:
+        super().__init__()
+        self._credd_timeout = credd_timeout
+        self._refresh_lock = threading.Lock()
+        self._cookie_version: Optional[str] = None
+        self.refresh_cookies()
+
+    def _fetch_from_credd(self) -> Tuple[Dict[str, str], Optional[str]]:
+        """GET /cookies from credd, mapping its error contract to clear messages."""
+        headers = {"X-Auth-Token": CREDD_TOKEN} if CREDD_TOKEN else None
+        try:
+            r = requests.get(f"{CREDD_URL}/cookies", headers=headers,
+                             timeout=self._credd_timeout)
+        except requests.RequestException as exc:
+            raise CreddUnavailable(
+                f"credd unreachable at {CREDD_URL} (is creds-daemon running?): {exc}"
+            ) from exc
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+            except ValueError:
+                body = {"error": "error", "detail": r.text[:200]}
+            code = body.get("error")
+            msg = f"credd returned {r.status_code}: {code} — {body.get('detail')}"
+            if code == "biometric_required" and body.get("biometric_url"):
+                msg += (f". Complete it in a browser at {body['biometric_url']} "
+                        f"then POST {CREDD_URL}/complete-biometric")
+            elif code == "unauthorized":
+                msg += ". Check that this process's CREDD_TOKEN matches credd's"
+            elif code in ("backoff", "rate_limited"):
+                msg += f". Retry after ~{body.get('retry_after', '?')}s"
+            raise CreddUnavailable(msg)
+        return r.json(), r.headers.get("X-Cookie-Version")
+
+    def refresh_cookies(self) -> Optional[str]:
+        """Replace the whole cookie jar from credd; returns the cookie version."""
+        with self._refresh_lock:
+            cookies, version = self._fetch_from_credd()
+            jar = requests.cookies.RequestsCookieJar()
+            for name, value in cookies.items():
+                jar.set(name, value, domain=_BRAIN_COOKIE_DOMAIN, path="/")
+            self.cookies = jar  # atomic rebind — never a partially-cleared jar
+            self._cookie_version = version
+            return version
+
+    def request(self, method, url, *args, **kwargs):  # type: ignore[override]
+        # Capture the version BEFORE the attempt: if another thread refreshes the
+        # jar while our request is in flight, comparing against the post-failure
+        # version would wrongly skip the retry ("no newer cookie") even though
+        # our failed request never used the refreshed jar.
+        version_used = self._cookie_version
+        resp = super().request(method, url, *args, **kwargs)
+        if not (resp.status_code == 401 and "worldquantbrain.com" in str(url)):
+            return resp
+        try:
+            new_version = self.refresh_cookies()
+        except CreddUnavailable:
+            return resp  # credd down → surface the original 401, don't mask it
+        if version_used is not None and new_version == version_used:
+            return resp  # credd has no newer cookie (likely in backoff) → don't loop
+        return super().request(method, url, *args, **kwargs)
+
+# Pydantic models for type safety
 class SimulationSettings(BaseModel):
     instrumentType: str = "EQUITY"
     region: str = "USA"
@@ -79,17 +182,24 @@ class BrainApiClient:
     
     def __init__(self):
         self.base_url = "https://api.worldquantbrain.com"
-        self.session = requests.Session()
-        self.auth_credentials = None
-        self.is_authenticating = False
-        
-        self._auth_lock = asyncio.Lock()
-
-        # Configure session
-        self.session.timeout = 30
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        # Login state lives in credd (creds-daemon). The session is a lazily
+        # created CreddSession: cookies come from credd, a BRAIN 401 self-heals
+        # by re-pulling cookies from credd (thread-safe, atomic jar swap).
+        self.session: Optional[CreddSession] = None
+        self._session_lock = asyncio.Lock()
+        # Dedicated bounded executor for all BRAIN HTTP I/O, so slow calls can't
+        # exhaust the loop's default thread pool shared with other work.
+        self._executor = ThreadPoolExecutor(
+            max_workers=int(os.environ.get("WQMCP_HTTP_WORKERS", "32")),
+            thread_name_prefix="wqmcp-http",
+        )
+        # (connect, read) timeout applied to every request unless overridden.
+        # NOTE: requests.Session has no working `.timeout` attribute — it must
+        # be passed per request (see _request).
+        self.request_timeout = (
+            float(os.environ.get("WQMCP_CONNECT_TIMEOUT", "10")),
+            float(os.environ.get("WQMCP_READ_TIMEOUT", "60")),
+        )
     
     def log(self, message: str, level: str = "INFO"):
         """Log messages to stderr to avoid MCP protocol interference."""
@@ -108,185 +218,143 @@ class BrainApiClient:
             # Final fallback: just print the level and a safe message
             print(f"[{level}] Log message", file=sys.stderr)
 
-    async def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Run a synchronous requests call in a thread pool to avoid blocking the event loop."""
-        loop = asyncio.get_running_loop()
-        func = getattr(self.session, method)
-        return await loop.run_in_executor(None, lambda: func(url, **kwargs))
+    def _build_session(self) -> CreddSession:
+        """Blocking: pull cookies from credd and build the session. Run in executor."""
+        session = CreddSession()  # fetches cookies from credd; raises CreddUnavailable if down
+        adapter = HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=int(os.environ.get("WQMCP_POOL_MAXSIZE", "32")),
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        return session
 
-    async def authenticate(self, email: str, password: str) -> Dict[str, Any]:
-        """Authenticate with WorldQuant BRAIN platform with biometric support."""
-        self.log("🔐 Starting Authentication process...", "INFO")
-        
-        try:
-            # Store credentials for potential re-authentication
-            self.auth_credentials = {'email': email, 'password': password}
-            
-            # Clear any existing session data
-            self.session.cookies.clear()
-            self.session.auth = None
-            
-            # Create Basic Authentication header (base64 encoded credentials)
-            import base64
-            credentials = f"{email}:{password}"
-            encoded_credentials = base64.b64encode(credentials.encode()).decode()
-            
-            # Send POST request with Basic Authentication header
-            headers = {
-                'Authorization': f'Basic {encoded_credentials}'
-            }
-            
-            response = await self._request('post', 'https://api.worldquantbrain.com/authentication', headers=headers)
-            
-            # Check for successful authentication (status code 201)
-            if response.status_code == 201:
-                self.log("Authentication successful", "SUCCESS")
-                
-                # Check if JWT token was automatically stored by session
-                jwt_token = self.session.cookies.get('t')
-                if jwt_token:
-                    self.log("JWT token automatically stored by session", "SUCCESS")
-                else:
-                    self.log("⚠️ No JWT token found in session", "WARNING")
-                
-                # Return success response
-                return {
-                    'user': {'email': email},
-                    'status': 'authenticated',
-                    'permissions': ['read', 'write'],
-                    'message': 'Authentication successful',
-                    'status_code': response.status_code,
-                    'has_jwt': jwt_token is not None
-                }
-            
-            # Check if biometric authentication is required (401 with persona)
-            elif response.status_code == 401:
-                www_auth = response.headers.get("WWW-Authenticate")
-                location = response.headers.get("Location")
-                
-                if www_auth == "persona" and location:
-                    self.log("🔴 Biometric authentication required", "INFO")
-                    
-                    # Handle biometric authentication
-                    from urllib.parse import urljoin
-                    biometric_url = urljoin(response.url, location)
-                    
-                    return await self._handle_biometric_auth(biometric_url, email)
-                else:
-                    raise Exception("Incorrect email or password")
+    async def _ensure_session(self) -> CreddSession:
+        """Lazily create the credd-backed session (first tool call pays the cost)."""
+        if self.session is not None:
+            return self.session
+        async with self._session_lock:
+            if self.session is None:
+                loop = asyncio.get_running_loop()
+                self.session = await loop.run_in_executor(self._executor, self._build_session)
+                self.log(f"Session initialized from credd ({CREDD_URL})", "SUCCESS")
+            return self.session
+
+    async def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Run a synchronous requests call in the bounded thread pool with a real
+        timeout, so a hung call can never freeze the event loop or leak a thread."""
+        session = await self._ensure_session()
+        kwargs.setdefault('timeout', self.request_timeout)
+        loop = asyncio.get_running_loop()
+        func = getattr(session, method)
+        return await loop.run_in_executor(self._executor, lambda: func(url, **kwargs))
+
+    async def poll_simulation(self, location: str,
+                              max_wait: Optional[float] = None) -> Tuple[bool, Optional[requests.Response]]:
+        """Poll a simulation location until BRAIN stops sending Retry-After.
+
+        Shared by single- and multi-simulation waits so the wait policy lives in
+        one place. Returns (done, last_response):
+        - done=True  → simulation finished (2xx response, no Retry-After header;
+          last_response is never None in this case);
+        - done=False → max_wait elapsed, or the endpoint kept erroring; last_response
+          may be None if every attempt raised (e.g. total network outage).
+        A transient non-2xx or a request exception (timeout, connection reset) is
+        tolerated and retried instead of being mistaken for completion or aborting
+        a long-running wait.
+        """
+        if max_wait is None:
+            max_wait = float(os.environ.get("WQMCP_SIM_MAX_WAIT", "1800"))
+        error_limit = int(os.environ.get("WQMCP_SIM_ERROR_LIMIT", "12"))  # ×5s ≈ 1 min
+        waited = 0.0
+        consecutive_errors = 0
+        last_resp: Optional[requests.Response] = None
+        while True:
+            try:
+                resp = await self._request('get', location)
+            except Exception as e:
+                # Transient network error mid-poll: tolerate, don't abort the wait.
+                consecutive_errors += 1
+                if consecutive_errors >= error_limit:
+                    self.log(f"Polling {location} kept failing: {e}", "ERROR")
+                    return False, last_resp
+                wait = 5.0
             else:
-                raise Exception(f"Authentication failed with status code: {response.status_code}")
-                    
-        except requests.HTTPError as e:
-            self.log(f"❌ HTTP error during authentication: {e}", "ERROR")
-            raise
+                last_resp = resp
+                if "Retry-After" in resp.headers:
+                    consecutive_errors = 0
+                    wait = max(_retry_after_seconds(resp), 1.0)
+                elif resp.status_code >= 400:
+                    consecutive_errors += 1
+                    if consecutive_errors >= error_limit:
+                        return False, resp
+                    wait = 5.0
+                else:
+                    return True, resp
+            if waited >= max_wait:
+                return False, last_resp
+            await asyncio.sleep(wait)
+            waited += wait
+
+    async def authenticate(self, email: str = "", password: str = "") -> Dict[str, Any]:
+        """Refresh login state from credd. Credentials live only in the
+        creds-daemon — email/password arguments are accepted for backward
+        compatibility but ignored."""
+        self.log("🔐 Refreshing BRAIN login state from credd...", "INFO")
+        try:
+            session = await self._ensure_session()
+            loop = asyncio.get_running_loop()
+            # Force-pull the latest cookies from credd (credd itself re-auths
+            # in place only when actually stale, with anti-lockout backoff).
+            await loop.run_in_executor(self._executor, session.refresh_cookies)
+
+            response = await self._request('get', f"{self.base_url}/authentication")
+            if response.status_code == 200:
+                data = {}
+                try:
+                    data = response.json()
+                except ValueError:
+                    pass
+                return {
+                    'user': data.get('user', {}),
+                    'status': 'authenticated',
+                    'token_expiry': (data.get('token') or {}).get('expiry'),
+                    'message': 'Authenticated via credd (creds-daemon)',
+                    'credd_url': CREDD_URL,
+                }
+            raise Exception(
+                f"credd cookie did not pass BRAIN validation (HTTP {response.status_code}). "
+                f"Check credd /status at {CREDD_URL} — it may be in backoff or awaiting "
+                f"biometric verification (complete it via its biometric_url, then POST /complete-biometric)."
+            )
+        except CreddUnavailable as e:
+            self.log(f"❌ credd unavailable: {e}", "ERROR")
+            raise Exception(
+                f"credd (login daemon) unavailable at {CREDD_URL}: {e}. "
+                f"Start creds-daemon (brain-serve/creds-daemon/run.sh) or set CREDD_URL."
+            )
         except Exception as e:
             self.log(f"❌ Authentication failed: {str(e)}", "ERROR")
             raise
-    
-    async def _handle_biometric_auth(self, biometric_url: str, email: str) -> Dict[str, Any]:
-        """Handle biometric authentication using browser automation."""
-        self.log("🌐 Starting biometric authentication...", "INFO")
-        
-        try:
-            # Import playwright for browser automation
-            from playwright.async_api import async_playwright
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=False)
-                page = await browser.new_page()
-
-                self.log("🌐 Opening browser for biometric authentication...", "INFO")
-                await page.goto(biometric_url)
-                self.log("Browser page loaded successfully", "SUCCESS")
-
-                # Print instructions
-                print("\n" + "="*60, file=sys.stderr)
-                print("BIOMETRIC AUTHENTICATION REQUIRED", file=sys.stderr)
-                print("="*60, file=sys.stderr)
-                print("Browser window is open with biometric authentication page", file=sys.stderr)
-                print("Complete the biometric authentication in the browser", file=sys.stderr)
-                print("The system will automatically check when you're done...", file=sys.stderr)
-                print("="*60, file=sys.stderr)
-
-                # Keep checking until authentication is complete
-                max_attempts = 60  # 5 minutes maximum (60 * 5 seconds)
-                attempt = 0
-
-                while attempt < max_attempts:
-                    await asyncio.sleep(5)  # Check every 5 seconds
-                    attempt += 1
-
-                    # Check if authentication completed
-                    check_response = await self._request('post', biometric_url)
-                    self.log(f"🔄 Checking authentication status (attempt {attempt}/{max_attempts}): {check_response.status_code}", "INFO")
-
-                    if check_response.status_code == 201:
-                        self.log("Biometric authentication successful!", "SUCCESS")
-
-                        await browser.close()
-                        
-                        # Check JWT token
-                        jwt_token = self.session.cookies.get('t')
-                        if jwt_token:
-                            self.log("JWT token received", "SUCCESS")
-                        
-                        # Return success response
-                        return {
-                            'user': {'email': email},
-                            'status': 'authenticated',
-                            'permissions': ['read', 'write'],
-                            'message': 'Biometric authentication successful',
-                            'status_code': check_response.status_code,
-                            'has_jwt': jwt_token is not None
-                        }
-                
-                await browser.close()
-                raise Exception("Biometric authentication timed out")
-
-        except Exception as e:
-            self.log(f"❌ Biometric authentication failed: {str(e)}", "ERROR")
-            raise
-    
     async def is_authenticated(self) -> bool:
-        """Check if currently authenticated using JWT token."""
+        """Check the credd-backed session against BRAIN (401 self-heals once inside
+        CreddSession before we see the result)."""
         try:
-            # Check if we have a JWT token in cookies
-            jwt_token = self.session.cookies.get('t')
-            if not jwt_token:
-                self.log("❌ No JWT token found", "INFO")
-                return False
-            
-            # Test authentication with a simple API call
             response = await self._request('get', f"{self.base_url}/authentication")
-            if response.status_code == 200:
-                return True
-            elif response.status_code == 401:
-                self.log("❌ JWT token expired or invalid (401)", "INFO")
-                return False
-            else:
-                self.log(f"⚠️ Unexpected status code during auth check: {response.status_code}", "WARNING")
-                return False
+            return response.status_code == 200
         except Exception as e:
             self.log(f"❌ Error checking authentication: {str(e)}", "ERROR")
             return False
-    
-    async def ensure_authenticated(self):
-        """Ensure authentication is valid, re-authenticate if needed."""
-        async with self._auth_lock:
-            if not await self.is_authenticated():
-                if not self.auth_credentials:
-                    self.log("No credentials in memory, loading from config...", "INFO")
-                    config = load_config()
-                    creds = config.get("credentials", {})
-                    email = creds.get("email")
-                    password = creds.get("password")
-                    if not email or not password:
-                        raise Exception("Authentication credentials not found in config. Please authenticate first.")
-                    self.auth_credentials = {'email': email, 'password': password}
 
-                self.log("🔄 Re-authenticating...", "INFO")
-                await self.authenticate(self.auth_credentials['email'], self.auth_credentials['password'])
+    async def ensure_authenticated(self):
+        """Make sure the credd-backed session exists. Intentionally cheap: no
+        global lock and no per-call network probe — an expired cookie self-heals
+        inside CreddSession when a request hits 401 (re-pull from credd + retry)."""
+        await self._ensure_session()
     
     async def get_authentication_status(self) -> Optional[Dict[str, Any]]:
         """Get current authentication status and user info."""
@@ -355,14 +423,30 @@ class BrainApiClient:
 
             self.log(f"Simulation created with ID: {simulation_id}", "SUCCESS")
 
-            while True:
-                simulation_progress = await self._request('get', location)
-                if simulation_progress.headers.get("Retry-After", 0) == 0:
-                    break
-                print("Sleeping for " + simulation_progress.headers["Retry-After"] + " seconds")
-                await asyncio.sleep(float(simulation_progress.headers["Retry-After"]))
+            done, simulation_progress = await self.poll_simulation(location)
+            if not done:
+                still_running = simulation_progress is not None and simulation_progress.status_code < 400
+                return {
+                    "status": "IN_PROGRESS" if still_running else "ERROR",
+                    "simulation_id": simulation_id,
+                    "location": location,
+                    "http_status": simulation_progress.status_code if simulation_progress is not None else None,
+                    "note": (f"Simulation not finished yet (or progress endpoint erroring). "
+                             f"Check later with lookINTO_SimError_message(['{location}'])."),
+                }
             print("Alpha done simulating, getting alpha details")
-            alpha_id = simulation_progress.json()["alpha"]
+            sim_result = simulation_progress.json()
+            alpha_id = sim_result.get("alpha")
+            if not alpha_id:
+                # Failed simulation: surface BRAIN's own error instead of crashing
+                # on a null alpha id.
+                return {
+                    "status": sim_result.get("status", "ERROR"),
+                    "simulation_id": simulation_id,
+                    "location": location,
+                    "message": sim_result.get("message"),
+                    "raw": sim_result,
+                }
             alpha = await self._request('get', "https://api.worldquantbrain.com/alphas/" + alpha_id)
             result = alpha.json()
             result['note'] = "if you got a negative alpha sharpe, you can just add a minus sign in front of the last line of the Alpha to flip then think the next step."
@@ -922,25 +1006,33 @@ class BrainApiClient:
             response.raise_for_status()
             data = response.json()
 
-            # Post-process results for image handling
+            # Post-process results for image handling. base64 decode (multi-MB per
+            # image) + file writes + regex are CPU/disk work — run in the executor
+            # so they never stall the event loop shared by all MCP clients.
             results = data.get('results', [])
-            for msg in results:
-                try:
-                    desc = msg.get('description')
-                    processed_desc, attachments = process_description(desc, msg.get('id', 'msg'))
-                    if attachments or desc != processed_desc:
-                        msg['description'] = processed_desc
-                        if attachments:
-                            msg['extracted_images'] = attachments
-                        else:
-                            # If changed but no attachments (ignore mode) mark sanitized
-                            msg['sanitized'] = True
-                except UnicodeEncodeError as ue:
-                    self.log(f"Unicode encoding error sanitizing message {msg.get('id')}: {ue}", "WARNING")
-                    # Keep original description if encoding fails
-                    continue
-                except Exception as inner_e:
-                    self.log(f"Failed to sanitize message {msg.get('id')}: {inner_e}", "WARNING")
+
+            def _sanitize_all():
+                for msg in results:
+                    try:
+                        desc = msg.get('description')
+                        processed_desc, attachments = process_description(desc, msg.get('id', 'msg'))
+                        if attachments or desc != processed_desc:
+                            msg['description'] = processed_desc
+                            if attachments:
+                                msg['extracted_images'] = attachments
+                            else:
+                                # If changed but no attachments (ignore mode) mark sanitized
+                                msg['sanitized'] = True
+                    except UnicodeEncodeError as ue:
+                        self.log(f"Unicode encoding error sanitizing message {msg.get('id')}: {ue}", "WARNING")
+                        # Keep original description if encoding fails
+                        continue
+                    except Exception as inner_e:
+                        self.log(f"Failed to sanitize message {msg.get('id')}: {inner_e}", "WARNING")
+
+            # Default executor (not self._executor): keeps CPU/disk sanitize work
+            # from competing with other clients' HTTP calls for pool threads.
+            await asyncio.get_running_loop().run_in_executor(None, _sanitize_all)
             data['results'] = results
             data['image_handling'] = image_handling
             return data
@@ -1619,46 +1711,31 @@ def save_config(config: Dict[str, Any]):
 mcp = FastMCP(
     "brain-platform-mcp",
     "A server for interacting with the WorldQuant BRAIN platform",
-    # host="127.0.0.1",
-    # port="8761"
+    host="0.0.0.0",
+    port="8761"
 )
 
 @mcp.tool()
 async def authenticate(email: Optional[str] = "", password: Optional[str] = "") -> Dict[str, Any]:
     """
-    🔐 Authenticate with WorldQuant BRAIN platform.
-    
-    This is the first step in any BRAIN workflow. You must authenticate before using any other tools.
-    
+    🔐 Verify / refresh the BRAIN login state.
+
+    Login is managed centrally by the credd daemon (creds-daemon) — this MCP no
+    longer logs in with a password itself. Calling this tool is optional: every
+    other tool self-heals its login automatically. Use it to check that the
+    platform connection is healthy.
+
     Args:
-        email: Your BRAIN platform email address (optional if in config or .brain_credentials)
-        password: Your BRAIN platform password (optional if in config or .brain_credentials)
-    
+        email: Ignored (kept for backward compatibility; credentials live in credd)
+        password: Ignored (kept for backward compatibility; credentials live in credd)
+
     Returns:
-        Authentication result with user info and permissions
+        Authentication status from the credd-backed session
     """
     try:
-        # Load config to get credentials if not provided
-        config = load_config()
-        credentials = config.get("credentials", {})
-        email = email or credentials.get("email")
-        password = password or credentials.get("password")
-        if not email or not password:
-            return {"error": "Authentication credentials not provided or found in config."}
-        
-        auth_result = await brain_client.authenticate(email, password)
-        
-        # Save successful credentials
-        if auth_result.get('status') == 'authenticated':
-            if 'credentials' not in config:
-                config['credentials'] = {}
-            config['credentials']['email'] = email
-            config['credentials']['password'] = password
-            save_config(config)
-            
-        return auth_result
+        return await brain_client.authenticate(email or "", password or "")
     except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+        return {"error": str(e)}
 
 @mcp.tool()
 async def manage_config(action: str = "get", settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2125,13 +2202,13 @@ async def get_glossary_terms(email: str = "", password: str = "") -> List[Dict[s
         A list of glossary terms with definitions
     """
     try:
+        # Login is credd-backed: the browser context reuses brain_client's session
+        # cookies, so email/password are legacy pass-throughs and may be empty.
         config = load_config()
         credentials = config.get("credentials", {})
-        email = email or credentials.get("email")
-        password = password or credentials.get("password")
-        if not email or not password:
-            raise ValueError("Authentication credentials not provided or found in config.")
-        
+        email = email or credentials.get("email", "")
+        password = password or credentials.get("password", "")
+
         return await brain_client.get_glossary_terms(email, password)
     except Exception as e:
         logger.error(f"Error in get_glossary_terms tool: {e}")
@@ -2155,13 +2232,12 @@ async def search_forum_posts(search_query: str, email: str = "", password: str =
         Search results with analysis
     """
     try:
+        # Login is credd-backed; email/password are legacy pass-throughs.
         config = load_config()
         credentials = config.get("credentials", {})
-        email = email or credentials.get("email")
-        password = password or credentials.get("password")
-        if not email or not password:
-            return {"error": "Authentication credentials not provided or found in config."}
-            
+        email = email or credentials.get("email", "")
+        password = password or credentials.get("password", "")
+
         return await brain_client.search_forum_posts(email, password, search_query, max_results)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -2183,12 +2259,11 @@ async def read_forum_post(article_id: str, email: str = "", password: str = "",
         Forum post content with comments
     """
     try:
+        # Login is credd-backed; email/password are legacy pass-throughs.
         config = load_config()
         credentials = config.get("credentials", {})
-        email = email or credentials.get("email")
-        password = password or credentials.get("password")
-        if not email or not password:
-            return {"error": "Authentication credentials not provided or found in config."}
+        email = email or credentials.get("email", "")
+        password = password or credentials.get("password", "")
 
         return await brain_client.read_forum_post(email, password, article_id, include_comments)
     except Exception as e:
@@ -2449,8 +2524,9 @@ async def create_multi_simulation(
             }
             multisimulation_data.append(simulation_item)
         
-        # Send multisimulation request
-        response = brain_client.session.post(f"{brain_client.base_url}/simulations", json=multisimulation_data)
+        # Send multisimulation request (must go through _request: a direct
+        # session.post here would block the shared event loop for every client)
+        response = await brain_client._request('post', f"{brain_client.base_url}/simulations", json=multisimulation_data)
         
         if response.status_code != 201:
             return {"error": f"Failed to create multisimulation. Status: {response.status_code}"}
@@ -2482,17 +2558,16 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
             wait_attempt += 1
             
             try:
-                multisim_response = brain_client.session.get(location)
+                multisim_response = await brain_client._request('get', location)
                 if multisim_response.status_code == 200:
                     multisim_data = multisim_response.json()
                     children = multisim_data.get('children', [])
-                    
+
                     if children:
                         break
                     else:
                         # Wait before next attempt - use longer intervals for multisimulations
-                        retry_after = multisim_response.headers.get("Retry-After", 5)
-                        wait_time = float(retry_after)
+                        wait_time = _retry_after_seconds(multisim_response) or 5.0
                         await asyncio.sleep(wait_time)
                 else:
                     await asyncio.sleep(5)
@@ -2509,37 +2584,22 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
                 # The children are full URLs, not just IDs
                 child_url = child_id if child_id.startswith('http') else f"{brain_client.base_url}/simulations/{child_id}"
                 
-                # Wait for this alpha to complete - more tolerant timing
-                finished = False
-                max_alpha_attempts = 100  # Increased for longer alpha processing
-                alpha_attempt = 0
-                
-                while not finished and alpha_attempt < max_alpha_attempts:
-                    alpha_attempt += 1
-                    
+                # Wait for this alpha to complete — same shared wait policy as
+                # single simulations (wall-clock bounded, transient-error tolerant)
+                finished, alpha_progress = await brain_client.poll_simulation(child_url)
+                alpha_data = {}
+                if finished:
                     try:
-                        alpha_progress = brain_client.session.get(child_url)
-                        if alpha_progress.status_code == 200:
-                            alpha_data = alpha_progress.json()
-                            retry_after = alpha_progress.headers.get("Retry-After", 0)
-                            
-                            if retry_after == 0:
-                                finished = True
-                                break
-                            else:
-                                wait_time = float(retry_after)
-                                await asyncio.sleep(wait_time)
-                        else:
-                            await asyncio.sleep(5)
-                    except Exception as e:
-                        await asyncio.sleep(5)
-                
+                        alpha_data = alpha_progress.json()
+                    except ValueError:
+                        finished = False
+
                 if finished:
                     # Get alpha details from the completed simulation
                     alpha_id = alpha_data.get("alpha")
                     if alpha_id:
                         # Now get the actual alpha details from the alpha endpoint
-                        alpha_details = brain_client.session.get(f"{brain_client.base_url}/alphas/{alpha_id}")
+                        alpha_details = await brain_client._request('get', f"{brain_client.base_url}/alphas/{alpha_id}")
                         if alpha_details.status_code == 200:
                             alpha_detail_data = alpha_details.json()
                             alpha_results.append({
@@ -2559,9 +2619,11 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
                             'error': 'No alpha ID found in completed simulation'
                         })
                 else:
+                    last_status = alpha_progress.status_code if alpha_progress is not None else "no response"
                     alpha_results.append({
                         'location': child_url,
-                        'error': f'Alpha simulation did not complete within {max_alpha_attempts} attempts'
+                        'error': ('Alpha simulation did not complete within the wait limit '
+                                  f'(last status: {last_status}); check the location later')
                     })
                     
             except Exception as e:
@@ -2591,41 +2653,32 @@ async def get_daily_and_quarterly_payment(email: str = "", password: str = "") -
     """
     Get daily and quarterly payment information from WorldQuant BRAIN platform.
     
-    This function retrieves both base payments (daily alpha performance payments) and 
+    This function retrieves both base payments (daily alpha performance payments) and
     other payments (competition rewards, quarterly payments, referrals, etc.).
-    
+
     Args:
-        email: Your BRAIN platform email address (optional if in config)
-        password: Your BRAIN platform password (optional if in config)
-    
+        email: Ignored (kept for backward compatibility; login is managed by credd)
+        password: Ignored (kept for backward compatibility; login is managed by credd)
+
     Returns:
         Dictionary containing base payment and other payment data with summaries and detailed records
     """
     try:
-        config = load_config()
-        credentials = config.get("credentials", {})
-        email = email or credentials.get("email")
-        password = password or credentials.get("password")
-        if not email or not password:
-            return {"error": "Authentication credentials not provided or found in config."}
-            
-        await brain_client.authenticate(email, password)
-        
-        # Get base payments
+        # Get base payments (login comes from credd via the session; no creds needed)
         try:
-            base_response = brain_client.session.get(f"{brain_client.base_url}/users/self/activities/base-payment")
+            base_response = await brain_client._request('get', f"{brain_client.base_url}/users/self/activities/base-payment")
             base_response.raise_for_status()
             base_payments = base_response.json()
-        except:
+        except Exception:
             base_payments = "no data"
-            
+
         try:
             # Get other payments
-            other_response = brain_client.session.get(f"{brain_client.base_url}/users/self/activities/other-payment")
+            other_response = await brain_client._request('get', f"{brain_client.base_url}/users/self/activities/other-payment")
             other_response.raise_for_status()
             other_payments = other_response.json()
-        except:
-            other_payments = "no data"    
+        except Exception:
+            other_payments = "no data"
         return {
             "base_payments": base_payments,
             "other_payments": other_payments
@@ -2647,7 +2700,7 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
     results = []
     for loc in locations:
         try:
-            resp = brain_client.session.get(loc)
+            resp = await brain_client._request('get', loc)
             if resp.status_code != 200:
                 results.append({
                     "location": loc,
@@ -2679,5 +2732,5 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
 if __name__ == "__main__":
     print("running the server")
     mcp.run(
-        # transport="streamable-http"
+         transport="streamable-http"
     )
