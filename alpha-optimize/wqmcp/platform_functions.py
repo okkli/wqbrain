@@ -416,45 +416,94 @@ class BrainApiClient:
             payload = {k: v for k, v in payload.items() if v is not None}
             
             response = await self._request('post', f"{self.base_url}/simulations", json=payload)
+            if response.status_code == 429:
+                # Per-account concurrent simulation slots are full (e.g. other
+                # sessions' simulations still running) — return structured info
+                # instead of a raw error so the client can back off sensibly.
+                retry_after = _retry_after_seconds(response) or 30.0
+                return {
+                    "status": "RATE_LIMITED",
+                    "retry_after_seconds": retry_after,
+                    "note": ("BRAIN's per-account concurrent simulation limit is reached "
+                             "(another simulation is still running on this account). "
+                             f"Retry create_simulation after ~{int(retry_after)}s, or first "
+                             "finish/check the running ones; you can do other work meanwhile."),
+                }
             response.raise_for_status()
 
             location = response.headers.get('Location', '')
-            simulation_id = location.split('/')[-1] if location else None
+            if not location:
+                raise Exception("BRAIN returned no Location header for the submitted simulation")
+            simulation_id = location.split('/')[-1]
 
-            self.log(f"Simulation created with ID: {simulation_id}", "SUCCESS")
+            self.log(f"Simulation submitted with ID: {simulation_id}", "SUCCESS")
 
-            done, simulation_progress = await self.poll_simulation(location)
-            if not done:
-                still_running = simulation_progress is not None and simulation_progress.status_code < 400
-                return {
-                    "status": "IN_PROGRESS" if still_running else "ERROR",
-                    "simulation_id": simulation_id,
-                    "location": location,
-                    "http_status": simulation_progress.status_code if simulation_progress is not None else None,
-                    "note": (f"Simulation not finished yet (or progress endpoint erroring). "
-                             f"Check later with lookINTO_SimError_message(['{location}'])."),
-                }
-            print("Alpha done simulating, getting alpha details")
-            sim_result = simulation_progress.json()
-            alpha_id = sim_result.get("alpha")
-            if not alpha_id:
-                # Failed simulation: surface BRAIN's own error instead of crashing
-                # on a null alpha id.
-                return {
-                    "status": sim_result.get("status", "ERROR"),
-                    "simulation_id": simulation_id,
-                    "location": location,
-                    "message": sim_result.get("message"),
-                    "raw": sim_result,
-                }
-            alpha = await self._request('get', "https://api.worldquantbrain.com/alphas/" + alpha_id)
-            result = alpha.json()
-            result['note'] = "if you got a negative alpha sharpe, you can just add a minus sign in front of the last line of the Alpha to flip then think the next step."
-            return result
-            
+            # Submit-only: return immediately so the MCP client is never parked
+            # on a long-running HTTP call. Progress/result via check_simulation_progress.
+            return {
+                "status": "SUBMITTED",
+                "simulation_id": simulation_id,
+                "progress_url": location,
+                "note": ("Simulation is running asynchronously (typically 1-5 minutes). "
+                         "Call check_simulation_progress with this progress_url to get "
+                         "progress (0.0-1.0) and, once finished, the full alpha result. "
+                         "You can do other work between checks."),
+            }
+
         except Exception as e:
             self.log(f"❌ Failed to create simulation: {str(e)}", "ERROR")
             raise
+
+    async def check_simulation_progress(self, location: str, wait_seconds: float = 0) -> Dict[str, Any]:
+        """Check a submitted simulation once (or wait briefly), returning progress
+        while running and the full alpha details once finished."""
+        await self.ensure_authenticated()
+
+        wait_seconds = max(0.0, min(float(wait_seconds or 0), 120.0))
+        if wait_seconds > 0:
+            done, resp = await self.poll_simulation(location, max_wait=wait_seconds)
+        else:
+            resp = await self._request('get', location)
+            done = resp.status_code < 400 and "Retry-After" not in resp.headers
+
+        if resp is None:
+            return {"status": "UNKNOWN", "progress_url": location,
+                    "error": "No response from BRAIN (network errors); retry later."}
+        if not done:
+            if resp.status_code >= 400:
+                return {"status": "ERROR", "http_status": resp.status_code,
+                        "progress_url": location, "body": (resp.text or "")[:500]}
+            body = {}
+            try:
+                body = resp.json()
+            except ValueError:
+                pass
+            return {
+                "status": "RUNNING",
+                "progress": body.get("progress"),
+                "retry_after_seconds": _retry_after_seconds(resp) or 5.0,
+                "progress_url": location,
+                "note": "Still running; check again after retry_after_seconds (do other work meanwhile).",
+            }
+
+        try:
+            sim_result = resp.json()
+        except ValueError:
+            return {"status": "ERROR", "progress_url": location,
+                    "error": "Simulation endpoint returned non-JSON body", "body": (resp.text or "")[:500]}
+        alpha_id = sim_result.get("alpha")
+        if not alpha_id:
+            # Failed simulation: surface BRAIN's own error message.
+            return {
+                "status": sim_result.get("status", "ERROR"),
+                "progress_url": location,
+                "message": sim_result.get("message"),
+                "raw": sim_result,
+            }
+        alpha = await self._request('get', f"{self.base_url}/alphas/{alpha_id}")
+        result = alpha.json()
+        result['note'] = "if you got a negative alpha sharpe, you can just add a minus sign in front of the last line of the Alpha to flip then think the next step."
+        return result
     
     async def get_alpha_details(self, alpha_id: str) -> Dict[str, Any]:
         """Get detailed information about an alpha."""
@@ -1800,9 +1849,13 @@ async def create_simulation(
     lookback: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    🚀 Create a new simulation on BRAIN platform.
+    🚀 Submit a new simulation on BRAIN platform (returns immediately).
 
-    This tool creates and starts a simulation with your alpha code. Use this after you have your alpha formula ready.
+    This tool submits a simulation with your alpha code and returns right away with
+    a simulation_id and a progress_url — it does NOT wait for the simulation to
+    finish (simulations typically take 1-5 minutes). To get progress and the final
+    result, call check_simulation_progress with the returned progress_url. You can
+    do other work between checks.
 
     Args:
         type: Simulation type ("REGULAR" or "SUPER")
@@ -1824,7 +1877,8 @@ async def create_simulation(
         lookback: PYTHON-only lookback window (required when language="PYTHON", ignored otherwise).
 
     Returns:
-        Simulation creation result with ID and location
+        {"status": "SUBMITTED", "simulation_id": ..., "progress_url": ...} — poll
+        check_simulation_progress(progress_url) for progress and the final result.
     """
     try:
         if (language or "").upper() == "PYTHON" and lookback is None:
@@ -1861,6 +1915,35 @@ async def create_simulation(
         )
 
         return await brain_client.create_simulation(sim_data)
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def check_simulation_progress(progress_url: str, wait_seconds: float = 0) -> Dict[str, Any]:
+    """
+    ⏳ Check the progress / result of a submitted simulation.
+
+    Use this after create_simulation returns {"status": "SUBMITTED", "progress_url": ...}.
+    While the simulation is running you get its progress (0.0-1.0) and a suggested
+    retry_after_seconds; once it finishes you get the full alpha details (same shape
+    as get_alpha_details). If the simulation failed, you get BRAIN's error message.
+
+    Args:
+        progress_url: The progress_url returned by create_simulation
+            (e.g. "https://api.worldquantbrain.com/simulations/<id>")
+        wait_seconds: Optional bounded wait before answering (0 = check once and
+            return immediately; max 120). Use e.g. 30-60 to block briefly when you
+            have nothing else to do.
+
+    Returns:
+        {"status": "RUNNING", "progress": 0.42, "retry_after_seconds": ...} while
+        running; full alpha details when finished; {"status": "ERROR"/..., "message": ...}
+        when the simulation failed.
+    """
+    try:
+        if not progress_url or "worldquantbrain.com" not in str(progress_url):
+            return {"error": "progress_url must be the simulations URL returned by create_simulation"}
+        return await brain_client.check_simulation_progress(progress_url, wait_seconds)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
