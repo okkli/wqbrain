@@ -252,52 +252,105 @@ class BrainApiClient:
         func = getattr(session, method)
         return await loop.run_in_executor(self._executor, lambda: func(url, **kwargs))
 
-    async def poll_simulation(self, location: str,
-                              max_wait: Optional[float] = None) -> Tuple[bool, Optional[requests.Response]]:
-        """Poll a simulation location until BRAIN stops sending Retry-After.
+    async def _check_once(self, location: str) -> Dict[str, Any]:
+        """One status check of a simulation location — single or multi.
 
-        Shared by single- and multi-simulation waits so the wait policy lives in
-        one place. Returns (done, last_response):
-        - done=True  → simulation finished (2xx response, no Retry-After header;
-          last_response is never None in this case);
-        - done=False → max_wait elapsed, or the endpoint kept erroring; last_response
-          may be None if every attempt raised (e.g. total network outage).
-        A transient non-2xx or a request exception (timeout, connection reset) is
-        tolerated and retried instead of being mistaken for completion or aborting
-        a long-running wait.
+        A multi-simulation parent exposes a `children` list; each child is an
+        ordinary simulation, so multi handling composes out of the single case.
         """
-        if max_wait is None:
-            max_wait = float(os.environ.get("WQMCP_SIM_MAX_WAIT", "1800"))
-        error_limit = int(os.environ.get("WQMCP_SIM_ERROR_LIMIT", "12"))  # ×5s ≈ 1 min
-        waited = 0.0
-        consecutive_errors = 0
-        last_resp: Optional[requests.Response] = None
-        while True:
+        resp = await self._request('get', location)
+        if resp.status_code >= 400:
+            return {"status": "ERROR", "http_status": resp.status_code,
+                    "progress_url": location, "body": (resp.text or "")[:500]}
+        try:
+            body = resp.json() if (resp.text or "").strip() else {}
+        except ValueError:
+            return {"status": "ERROR", "progress_url": location,
+                    "error": "Simulation endpoint returned non-JSON body",
+                    "body": (resp.text or "")[:500]}
+
+        children = body.get("children") or []
+        if children:
+            return await self._check_multi_children(location, children)
+
+        if "Retry-After" in resp.headers:
+            return {
+                "status": "RUNNING",
+                "progress": body.get("progress"),
+                "retry_after_seconds": _retry_after_seconds(resp) or 5.0,
+                "progress_url": location,
+                "note": "Still running; check again after retry_after_seconds (do other work meanwhile).",
+            }
+
+        # Finished single simulation
+        alpha_id = body.get("alpha")
+        if not alpha_id:
+            # Failed simulation: surface BRAIN's own error message.
+            return {"status": body.get("status", "ERROR"), "progress_url": location,
+                    "message": body.get("message"), "raw": body}
+        alpha = await self._request('get', f"{self.base_url}/alphas/{alpha_id}")
+        result = alpha.json()
+        result['note'] = "if you got a negative alpha sharpe, you can just add a minus sign in front of the last line of the Alpha to flip then think the next step."
+        return result
+
+    async def _check_multi_children(self, location: str, children: List[str]) -> Dict[str, Any]:
+        """Check all children of a multi-simulation concurrently."""
+        child_urls = [c if str(c).startswith('http') else f"{self.base_url}/simulations/{c}"
+                      for c in children]
+
+        async def child_state(url: str) -> Dict[str, Any]:
             try:
-                resp = await self._request('get', location)
+                r = await self._request('get', url)
             except Exception as e:
-                # Transient network error mid-poll: tolerate, don't abort the wait.
-                consecutive_errors += 1
-                if consecutive_errors >= error_limit:
-                    self.log(f"Polling {location} kept failing: {e}", "ERROR")
-                    return False, last_resp
-                wait = 5.0
-            else:
-                last_resp = resp
-                if "Retry-After" in resp.headers:
-                    consecutive_errors = 0
-                    wait = max(_retry_after_seconds(resp), 1.0)
-                elif resp.status_code >= 400:
-                    consecutive_errors += 1
-                    if consecutive_errors >= error_limit:
-                        return False, resp
-                    wait = 5.0
-                else:
-                    return True, resp
-            if waited >= max_wait:
-                return False, last_resp
-            await asyncio.sleep(wait)
-            waited += wait
+                return {"location": url, "status": "UNKNOWN", "error": str(e)}
+            if r.status_code >= 400:
+                return {"location": url, "status": "ERROR", "http_status": r.status_code}
+            try:
+                b = r.json() if (r.text or "").strip() else {}
+            except ValueError:
+                b = {}
+            if "Retry-After" in r.headers:
+                return {"location": url, "status": "RUNNING", "progress": b.get("progress")}
+            alpha_id = b.get("alpha")
+            if not alpha_id:
+                return {"location": url, "status": b.get("status", "ERROR"),
+                        "message": b.get("message")}
+            return {"location": url, "status": "COMPLETE", "alpha_id": alpha_id}
+
+        states = list(await asyncio.gather(*[child_state(u) for u in child_urls]))
+        unfinished = [s for s in states if s["status"] in ("RUNNING", "UNKNOWN")]
+        if unfinished:
+            done_n = len(states) - len(unfinished)
+            return {
+                "status": "RUNNING",
+                "type": "MULTI",
+                "completed_children": done_n,
+                "total_children": len(states),
+                "children": states,
+                "retry_after_seconds": 5.0,
+                "progress_url": location,
+                "note": "Multi-simulation still running; check again after retry_after_seconds.",
+            }
+
+        # All children settled — fetch alpha details for the completed ones concurrently.
+        async def with_details(s: Dict[str, Any]) -> Dict[str, Any]:
+            if s["status"] != "COMPLETE":
+                return s
+            try:
+                d = await self._request('get', f"{self.base_url}/alphas/{s['alpha_id']}")
+                return {**s, "details": d.json()}
+            except Exception as e:
+                return {**s, "error": f"failed to fetch alpha details: {e}"}
+
+        full = list(await asyncio.gather(*[with_details(s) for s in states]))
+        return {
+            "status": "COMPLETE",
+            "type": "MULTI",
+            "total_children": len(full),
+            "alpha_results": full,
+            "progress_url": location,
+            "note": "if you got a negative alpha sharpe, you can just add a minus sign in front of the last line of the Alpha to flip then think the next step.",
+        }
 
     async def authenticate(self, email: str = "", password: str = "") -> Dict[str, Any]:
         """Refresh login state from credd. Credentials live only in the
@@ -455,55 +508,31 @@ class BrainApiClient:
             raise
 
     async def check_simulation_progress(self, location: str, wait_seconds: float = 0) -> Dict[str, Any]:
-        """Check a submitted simulation once (or wait briefly), returning progress
-        while running and the full alpha details once finished."""
+        """Check a submitted simulation (single OR multi) once — or keep checking
+        within a bounded wait budget — returning progress while running and full
+        alpha details once finished. Transient 5xx/network errors are retried
+        while wait budget remains instead of aborting the wait."""
         await self.ensure_authenticated()
 
-        wait_seconds = max(0.0, min(float(wait_seconds or 0), 120.0))
-        if wait_seconds > 0:
-            done, resp = await self.poll_simulation(location, max_wait=wait_seconds)
-        else:
-            resp = await self._request('get', location)
-            done = resp.status_code < 400 and "Retry-After" not in resp.headers
-
-        if resp is None:
-            return {"status": "UNKNOWN", "progress_url": location,
-                    "error": "No response from BRAIN (network errors); retry later."}
-        if not done:
-            if resp.status_code >= 400:
-                return {"status": "ERROR", "http_status": resp.status_code,
-                        "progress_url": location, "body": (resp.text or "")[:500]}
-            body = {}
+        wait_budget = max(0.0, min(float(wait_seconds or 0), 120.0))
+        waited = 0.0
+        while True:
             try:
-                body = resp.json()
-            except ValueError:
-                pass
-            return {
-                "status": "RUNNING",
-                "progress": body.get("progress"),
-                "retry_after_seconds": _retry_after_seconds(resp) or 5.0,
-                "progress_url": location,
-                "note": "Still running; check again after retry_after_seconds (do other work meanwhile).",
-            }
-
-        try:
-            sim_result = resp.json()
-        except ValueError:
-            return {"status": "ERROR", "progress_url": location,
-                    "error": "Simulation endpoint returned non-JSON body", "body": (resp.text or "")[:500]}
-        alpha_id = sim_result.get("alpha")
-        if not alpha_id:
-            # Failed simulation: surface BRAIN's own error message.
-            return {
-                "status": sim_result.get("status", "ERROR"),
-                "progress_url": location,
-                "message": sim_result.get("message"),
-                "raw": sim_result,
-            }
-        alpha = await self._request('get', f"{self.base_url}/alphas/{alpha_id}")
-        result = alpha.json()
-        result['note'] = "if you got a negative alpha sharpe, you can just add a minus sign in front of the last line of the Alpha to flip then think the next step."
-        return result
+                state = await self._check_once(location)
+            except Exception as e:
+                if waited >= wait_budget:
+                    raise
+                state = {"status": "RUNNING", "retry_after_seconds": 5.0,
+                         "progress_url": location, "transient_error": str(e)}
+            transient_5xx = (state.get("status") == "ERROR"
+                             and (state.get("http_status") or 0) >= 500)
+            if state.get("status") != "RUNNING" and not transient_5xx:
+                return state
+            if waited >= wait_budget:
+                return state
+            wait = max(min(state.get("retry_after_seconds") or 5.0, wait_budget - waited), 1.0)
+            await asyncio.sleep(wait)
+            waited += wait
     
     async def get_alpha_details(self, alpha_id: str) -> Dict[str, Any]:
         """Get detailed information about an alpha."""
@@ -1921,24 +1950,28 @@ async def create_simulation(
 @mcp.tool()
 async def check_simulation_progress(progress_url: str, wait_seconds: float = 0) -> Dict[str, Any]:
     """
-    ⏳ Check the progress / result of a submitted simulation.
+    ⏳ Check the progress / result of a submitted simulation — single OR multi.
 
-    Use this after create_simulation returns {"status": "SUBMITTED", "progress_url": ...}.
-    While the simulation is running you get its progress (0.0-1.0) and a suggested
-    retry_after_seconds; once it finishes you get the full alpha details (same shape
-    as get_alpha_details). If the simulation failed, you get BRAIN's error message.
+    Use this after create_simulation or create_multi_simulation returns
+    {"status": "SUBMITTED", "progress_url": ...}. The URL type is detected
+    automatically:
+    - single simulation: progress (0.0-1.0) while running; full alpha details
+      (same shape as get_alpha_details) when finished; BRAIN's error message if
+      the simulation failed.
+    - multi-simulation: per-child status with completed_children/total_children
+      while running; once ALL children finish, alpha_results with each child's
+      full alpha details.
 
     Args:
-        progress_url: The progress_url returned by create_simulation
-            (e.g. "https://api.worldquantbrain.com/simulations/<id>")
+        progress_url: The progress_url returned by create_simulation /
+            create_multi_simulation (e.g. "https://api.worldquantbrain.com/simulations/<id>")
         wait_seconds: Optional bounded wait before answering (0 = check once and
             return immediately; max 120). Use e.g. 30-60 to block briefly when you
             have nothing else to do.
 
     Returns:
-        {"status": "RUNNING", "progress": 0.42, "retry_after_seconds": ...} while
-        running; full alpha details when finished; {"status": "ERROR"/..., "message": ...}
-        when the simulation failed.
+        {"status": "RUNNING", ...} with progress info while running; final results
+        when finished; {"status": "ERROR"/..., "message": ...} on failure.
     """
     try:
         if not progress_url or "worldquantbrain.com" not in str(progress_url):
@@ -2536,13 +2569,14 @@ async def create_multi_simulation(
     lookback: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    🚀 Create multiple regular alpha simulations on BRAIN platform in a single request.
+    🚀 Submit multiple regular alpha simulations in a single request (returns immediately).
 
-    This tool creates a multisimulation with multiple regular alpha expressions,
-    waits for all simulations to complete, and returns detailed results for each alpha.
-
-    ⏰ NOTE: Multisimulations can take 8+ minutes to complete. This tool will wait
-    for the entire process and return comprehensive results.
+    This tool submits a multisimulation with multiple regular alpha expressions and
+    returns right away with a progress_url — it does NOT wait for completion
+    (multisimulations typically take 3-10 minutes). Poll the SAME
+    check_simulation_progress tool with the returned progress_url: it detects the
+    multi-simulation automatically and reports per-child progress, then all alpha
+    results once finished. You can do other work between checks.
     Call get_platform_setting_options to get the valid options for the simulation.
     Args:
         alpha_expressions: List of alpha expressions (2-10 expressions required).
@@ -2564,7 +2598,10 @@ async def create_multi_simulation(
         lookback: PYTHON-only lookback window (required when language="PYTHON", ignored otherwise).
 
     Returns:
-        Dictionary containing multisimulation results and individual alpha details
+        {"status": "SUBMITTED", "type": "MULTI", "multisimulation_id": ...,
+         "progress_url": ...} — poll check_simulation_progress(progress_url) for
+        per-child progress and the final results; or {"status": "RATE_LIMITED", ...}
+        when the account's concurrent simulation slots are full.
     """
     try:
         # Validate input
@@ -2610,125 +2647,43 @@ async def create_multi_simulation(
         # Send multisimulation request (must go through _request: a direct
         # session.post here would block the shared event loop for every client)
         response = await brain_client._request('post', f"{brain_client.base_url}/simulations", json=multisimulation_data)
-        
+
+        if response.status_code == 429:
+            retry_after = _retry_after_seconds(response) or 30.0
+            return {
+                "status": "RATE_LIMITED",
+                "retry_after_seconds": retry_after,
+                "note": ("BRAIN's per-account concurrent simulation limit is reached "
+                         "(another simulation is still running on this account). "
+                         f"Retry create_multi_simulation after ~{int(retry_after)}s, or first "
+                         "finish/check the running ones; you can do other work meanwhile."),
+            }
         if response.status_code != 201:
             return {"error": f"Failed to create multisimulation. Status: {response.status_code}"}
-        
+
         # Get multisimulation location
         location = response.headers.get('Location', '')
         if not location:
             return {"error": "No location header in multisimulation response"}
-        
-        # Wait for children to appear and get results
-        return await _wait_for_multisimulation_completion(location, len(alpha_expressions))
-        
+
+        # Submit-only: return immediately, same pattern as create_simulation.
+        # The SAME check_simulation_progress tool handles this URL — it detects
+        # the multi-simulation children and reports per-child progress/results.
+        return {
+            "status": "SUBMITTED",
+            "type": "MULTI",
+            "multisimulation_id": location.split('/')[-1],
+            "expected_children": len(alpha_expressions),
+            "progress_url": location,
+            "note": ("Multi-simulation is running asynchronously (typically 3-10 minutes for "
+                     f"{len(alpha_expressions)} alphas). Call check_simulation_progress with this "
+                     "progress_url to get per-child progress and, once finished, all alpha results. "
+                     "You can do other work between checks."),
+        }
+
     except Exception as e:
         return {"error": f"Error creating multisimulation: {str(e)}"}
 
-async def _wait_for_multisimulation_completion(location: str, expected_children: int) -> Dict[str, Any]:
-    """Wait for multisimulation to complete and return results"""
-    try:
-        # Simple progress indicator for users
-        print(f"Waiting for multisimulation to complete... (this may take several minutes)")
-        print(f"Expected {expected_children} alpha simulations")
-        print()
-        # Wait for children to appear - much more tolerant for 8+ minute multisimulations
-        children = []
-        max_wait_attempts = 200  # Increased significantly for 8+ minute multisimulations
-        wait_attempt = 0
-        
-        while wait_attempt < max_wait_attempts and len(children) == 0:
-            wait_attempt += 1
-            
-            try:
-                multisim_response = await brain_client._request('get', location)
-                if multisim_response.status_code == 200:
-                    multisim_data = multisim_response.json()
-                    children = multisim_data.get('children', [])
-
-                    if children:
-                        break
-                    else:
-                        # Wait before next attempt - use longer intervals for multisimulations
-                        wait_time = _retry_after_seconds(multisim_response) or 5.0
-                        await asyncio.sleep(wait_time)
-                else:
-                    await asyncio.sleep(5)
-            except Exception as e:
-                await asyncio.sleep(5)
-        
-        if not children:
-            return {"error": f"Children did not appear within {max_wait_attempts} attempts (multisimulation may still be processing)"}
-        
-        # Process each child to get alpha results
-        alpha_results = []
-        for i, child_id in enumerate(children):
-            try:
-                # The children are full URLs, not just IDs
-                child_url = child_id if child_id.startswith('http') else f"{brain_client.base_url}/simulations/{child_id}"
-                
-                # Wait for this alpha to complete — same shared wait policy as
-                # single simulations (wall-clock bounded, transient-error tolerant)
-                finished, alpha_progress = await brain_client.poll_simulation(child_url)
-                alpha_data = {}
-                if finished:
-                    try:
-                        alpha_data = alpha_progress.json()
-                    except ValueError:
-                        finished = False
-
-                if finished:
-                    # Get alpha details from the completed simulation
-                    alpha_id = alpha_data.get("alpha")
-                    if alpha_id:
-                        # Now get the actual alpha details from the alpha endpoint
-                        alpha_details = await brain_client._request('get', f"{brain_client.base_url}/alphas/{alpha_id}")
-                        if alpha_details.status_code == 200:
-                            alpha_detail_data = alpha_details.json()
-                            alpha_results.append({
-                                'alpha_id': alpha_id,
-                                'location': child_url,
-                                'details': alpha_detail_data
-                            })
-                        else:
-                            alpha_results.append({
-                                'alpha_id': alpha_id,
-                                'location': child_url,
-                                'error': f'Failed to get alpha details: {alpha_details.status_code}'
-                            })
-                    else:
-                        alpha_results.append({
-                            'location': child_url,
-                            'error': 'No alpha ID found in completed simulation'
-                        })
-                else:
-                    last_status = alpha_progress.status_code if alpha_progress is not None else "no response"
-                    alpha_results.append({
-                        'location': child_url,
-                        'error': ('Alpha simulation did not complete within the wait limit '
-                                  f'(last status: {last_status}); check the location later')
-                    })
-                    
-            except Exception as e:
-                alpha_results.append({
-                    'location': f"child_{i+1}",
-                    'error': str(e)
-                })
-        
-        # Return comprehensive results
-        print(f"Multisimulation completed! Retrieved {len(alpha_results)} alpha results")
-        return {
-            'success': True,
-            'message': f'Successfully created {expected_children} regular alpha simulations',
-            'total_requested': expected_children,
-            'total_created': len(alpha_results),
-            'multisimulation_id': location.split('/')[-1],
-            'multisimulation_location': location,
-            'alpha_results': alpha_results
-        }
-        
-    except Exception as e:
-        return {"error": f"Error waiting for multisimulation completion: {str(e)}"}
 # --- Payment and Financial Tools ---
 
 @mcp.tool()
