@@ -60,6 +60,23 @@ def _retry_after_seconds(response: requests.Response) -> float:
         return 0.0
 
 
+def _http_error_detail(response: requests.Response, context: str = "") -> str:
+    """One-line HTTP error including the API's response body (truncated).
+
+    BRAIN's 4xx bodies carry the actual rejection reason, e.g.
+    [{"settings":{"universe":["\"TOP9999\" is not a valid choice."]}}] —
+    raise_for_status() drops them, leaving an undiagnosable "400 Bad Request"."""
+    detail = (response.text or "").strip()
+    if len(detail) > 1000:
+        detail = detail[:1000] + "…"
+    msg = f"{response.status_code} {response.reason} for url: {response.url}"
+    if context:
+        msg = f"{context}: {msg}"
+    if detail:
+        msg += f" — body: {detail}"
+    return msg
+
+
 # --- credd (creds-daemon) HTTP interface ------------------------------------
 # Login state comes from the credd daemon over its HTTP API (GET /cookies with
 # an X-Auth-Token header) — this process never sees the BRAIN password and does
@@ -147,6 +164,27 @@ class CreddSession(requests.Session):
             return resp  # credd has no newer cookie (likely in backoff) → don't loop
         return super().request(method, url, *args, **kwargs)
 
+SIMULATION_MODES = ("QUICK", "FULL")
+
+
+def _normalize_simulation_mode(simulation_mode: Optional[str], visualization: bool):
+    """Validate simulationMode and apply the platform rule that QUICK mode
+    must be submitted with visualization=false.
+
+    Returns (mode_or_None, visualization) or raises ValueError.
+    """
+    if simulation_mode is None or str(simulation_mode).strip() == "":
+        return None, visualization
+    mode = str(simulation_mode).strip().upper()
+    if mode not in SIMULATION_MODES:
+        raise ValueError(
+            f"simulation_mode must be one of {list(SIMULATION_MODES)}, got '{simulation_mode}'"
+        )
+    if mode == "QUICK":
+        visualization = False
+    return mode, visualization
+
+
 # Pydantic models for type safety
 class SimulationSettings(BaseModel):
     instrumentType: str = "EQUITY"
@@ -162,6 +200,10 @@ class SimulationSettings(BaseModel):
     language: str = "FASTEXPR"
     visualization: bool = True
     testPeriod: Optional[str] = "P0Y0M"
+    # "QUICK" (fast feedback: core metrics only, no visualizations / Theme /
+    # Competition / correlation checks, not directly submittable) or "FULL".
+    # None -> field omitted from the payload (platform default, i.e. FULL).
+    simulationMode: Optional[str] = None
     selectionHandling: str = "POSITIVE"
     selectionLimit: int = 1000
     maxTrade: str = "OFF"
@@ -482,6 +524,10 @@ class BrainApiClient:
                              f"Retry create_simulation after ~{int(retry_after)}s, or first "
                              "finish/check the running ones; you can do other work meanwhile."),
                 }
+            if response.status_code >= 400:
+                # Surface BRAIN's rejection reason (invalid settings choice,
+                # blank expression, ...) instead of a bare "400 Bad Request".
+                raise Exception(_http_error_detail(response, "simulation rejected"))
             response.raise_for_status()
 
             location = response.headers.get('Location', '')
@@ -948,6 +994,8 @@ class BrainApiClient:
             }
             
             response = await self._request('get', f"{self.base_url}/simulations/super-selection", params=selection_data)
+            if response.status_code >= 400:
+                raise Exception(_http_error_detail(response, "selection rejected"))
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -1876,6 +1924,7 @@ async def create_simulation(
     component_activation: str = "IS",
     max_position: str = "OFF",
     lookback: Optional[int] = None,
+    simulation_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     🚀 Submit a new simulation on BRAIN platform (returns immediately).
@@ -1904,6 +1953,13 @@ async def create_simulation(
         combo: Combo code (for SUPER type)
         selection: Selection code (for SUPER type)
         lookback: PYTHON-only lookback window (required when language="PYTHON", ignored otherwise).
+        simulation_mode: "QUICK" or "FULL" (default None = platform default, FULL).
+            QUICK = fast feedback for rapid iteration: returns core metrics only
+            (PnL, sub-universe PnL, weight concentration, fitness, IS ladder,
+            Sharpe, returns, turnover), skips visualizations and the Theme /
+            Competition / correlation checks, and the alpha is NOT directly
+            submittable. QUICK forces visualization=False. Use FULL for
+            near-submission-ready alphas that need all checks.
 
     Returns:
         {"status": "SUBMITTED", "simulation_id": ..., "progress_url": ...} — poll
@@ -1912,6 +1968,10 @@ async def create_simulation(
     try:
         if (language or "").upper() == "PYTHON" and lookback is None:
             return {"error": "lookback is required when language='PYTHON'"}
+        try:
+            simulation_mode, visualization = _normalize_simulation_mode(simulation_mode, visualization)
+        except ValueError as e:
+            return {"error": str(e)}
 
         settings = SimulationSettings(
             instrumentType=instrument_type,
@@ -1933,6 +1993,7 @@ async def create_simulation(
             componentActivation=component_activation,
             maxPosition=max_position,
             lookback=lookback,
+            simulationMode=simulation_mode,
         )
 
         sim_data = SimulationData(
@@ -2567,6 +2628,7 @@ async def create_multi_simulation(
     pasteurization: str = "ON",
     max_trade: str = "OFF",
     lookback: Optional[int] = None,
+    simulation_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     🚀 Submit multiple regular alpha simulations in a single request (returns immediately).
@@ -2596,6 +2658,10 @@ async def create_multi_simulation(
         pasteurization: Pasteurization setting (default: "ON")
         max_trade: Max trade setting (default: "OFF")
         lookback: PYTHON-only lookback window (required when language="PYTHON", ignored otherwise).
+        simulation_mode: "QUICK" or "FULL" (default None = platform default, FULL).
+            QUICK = fast feedback (core metrics only, no visualizations, no
+            Theme / Competition / correlation checks, not directly submittable);
+            forces visualization=False. Applies to every alpha in the batch.
 
     Returns:
         {"status": "SUBMITTED", "type": "MULTI", "multisimulation_id": ...,
@@ -2613,6 +2679,10 @@ async def create_multi_simulation(
         is_python = (language or "").upper() == "PYTHON"
         if is_python and lookback is None:
             return {"error": "lookback is required when language='PYTHON'"}
+        try:
+            simulation_mode, visualization = _normalize_simulation_mode(simulation_mode, visualization)
+        except ValueError as e:
+            return {"error": str(e)}
 
         # Create multisimulation data
         multisimulation_data = []
@@ -2630,6 +2700,8 @@ async def create_multi_simulation(
                 'visualization': visualization,
                 'maxTrade': max_trade,
             }
+            if simulation_mode:
+                settings['simulationMode'] = simulation_mode
             if is_python:
                 settings['lookback'] = lookback
             else:
@@ -2659,7 +2731,11 @@ async def create_multi_simulation(
                          "finish/check the running ones; you can do other work meanwhile."),
             }
         if response.status_code != 201:
-            return {"error": f"Failed to create multisimulation. Status: {response.status_code}"}
+            # Include BRAIN's per-item rejection reasons (400 bodies are a JSON
+            # array with one entry per expression) — a bare status is undiagnosable.
+            detail = _http_error_detail(response)
+            brain_client.log(f"❌ Failed to create multisimulation: {detail}", "ERROR")
+            return {"error": f"Failed to create multisimulation. {detail}"}
 
         # Get multisimulation location
         location = response.headers.get('Location', '')
