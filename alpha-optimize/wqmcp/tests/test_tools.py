@@ -58,10 +58,12 @@ async def test_errors_are_mcp_errors(mcp_session, fake):
         assert is_error and "invalid alpha id" in text
         is_error, text = await call(session, "get_alpha", alpha_id="MISSING")
         assert is_error and "HTTP 404" in text
-        is_error, text = await call(session, "get_simulation",
-                                    simulation_ids=["http://127.0.0.1:8762/cookies?x=worldquantbrain.com"])
-        assert is_error and "not a BRAIN simulation URL" in text
-        assert fake.state.credd_calls == 1  # only the session bootstrap; the URL was never fetched
+        for url in (f"{fake.url}/cookies?x=worldquantbrain.com", "http://127.0.0.1:8762/cookies",
+                    f"{fake.url}/simulations/S1/../../cookies"):
+            is_error, text = await call(session, "get_simulation", simulation_ids=[url])
+            assert is_error and "not a BRAIN simulation URL" in text
+        assert fake.state.credd_calls == 1  # only the session bootstrap; the URLs were never fetched
+        assert len(fake.state.calls("GET", "/cookies")) == 1
 
 
 async def test_simulation_flow(mcp_session, fake):
@@ -145,3 +147,13 @@ async def test_write_kill_switches(mcp_session, fake, monkeypatch):
             is_error, text = await call(session, tool, **args)
             assert is_error and "WQMCP_READ_ONLY=1" in text, tool
     assert not fake.state.calls("POST", "/simulations") and not fake.state.calls("POST", "/alphas/A1/submit")
+
+
+
+async def test_empty_bodies_are_wrapped(mcp_session, fake, monkeypatch):
+    async def empty(*a, **k):
+        return None
+    async with mcp_session() as session:
+        monkeypatch.setattr(server.brain, "consultant", empty)
+        is_error, res = await call(session, "get_activity", kind="value-factor")
+        assert not is_error and res == {"result": None}

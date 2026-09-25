@@ -22,7 +22,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from brain_client import ACTIVITY_KINDS, BrainClient, InvalidArgument
+from brain_client import ACTIVITY_KINDS, RECORDSET_TYPES, BrainClient, InvalidArgument
 
 logger = logging.getLogger("wqmcp")
 
@@ -41,6 +41,10 @@ def _require_writes(what: str) -> None:
 def _transport_security() -> Optional[TransportSecuritySettings]:
     extra = [h.strip() for h in os.environ.get("WQMCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
     if not extra:
+        if HOST not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning("WQMCP_HOST=%s without WQMCP_ALLOWED_HOSTS: no DNS-rebinding protection and "
+                           "no authentication. Put an authenticating reverse proxy in front and set "
+                           "WQMCP_ALLOWED_HOSTS to the host names it forwards.", HOST)
         return None  # FastMCP's default: DNS-rebinding protection for loopback binds
     return TransportSecuritySettings(
         allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *extra],
@@ -91,6 +95,11 @@ Offset = Annotated[int, Field(ge=0)]
 
 def _none_if_blank(value: Optional[str]) -> Optional[str]:
     return value if value not in ("",) else None
+
+
+def _obj(value: Any) -> Dict[str, Any]:
+    """Tools are typed -> Dict; wrap an empty (None) or list body from BRAIN."""
+    return value if isinstance(value, dict) else {"result": value}
 
 
 # ============================================================ account
@@ -273,8 +282,7 @@ async def get_alpha(alpha_id: str, full: bool = False) -> Dict[str, Any]:
 @mcp.tool(annotations=READ)
 async def get_alpha_recordset(
     alpha_id: str,
-    recordset: Annotated[Optional[Literal["pnl", "sharpe", "turnover", "daily-pnl", "yearly-stats"]],
-                         Field(description="Omit to list the recordsets available for this alpha")] = None,
+    recordset: Annotated[Optional[str], Field(description=f"e.g. {', '.join(RECORDSET_TYPES)}; omit to list the recordsets available for this alpha")] = None,
     wait_seconds: Wait = 30,
     max_rows: Annotated[int, Field(ge=0, le=10000, description="Keep only the most recent rows (0 = all)")] = 300,
 ) -> Dict[str, Any]:
@@ -304,7 +312,7 @@ async def submit_alpha(
 ) -> Dict[str, Any]:
     """Submit an alpha to BRAIN. Irreversible, so the default is a dry run that returns the
     pre-submission checks. With confirm=True it submits and follows BRAIN's asynchronous
-    submission until the final checks: status SUBMITTED, REJECTED (see failed) or PENDING
+    submission until the final checks: SUBMITTED, REJECTED (see failed), or PENDING/BUSY
     (call again with confirm=True; it resumes polling and never submits twice)."""
     if confirm:
         _require_writes("submit_alpha")
@@ -354,11 +362,12 @@ async def update_alpha(
 
 
 @mcp.tool(annotations=READ)
-async def get_alpha_performance(alpha_id: str, competition_id: Optional[str] = None) -> Dict[str, Any]:
+async def get_alpha_performance(alpha_id: str, competition_id: Optional[str] = None,
+                                wait_seconds: Wait = 30) -> Dict[str, Any]:
     """How adding this alpha changes your portfolio: before/after stats (sharpe, fitness,
     turnover, returns, drawdown, margin), yearly stats and PnL. With competition_id, the
     competition's before/after view instead."""
-    return await brain.alpha_performance(alpha_id, competition_id)
+    return _obj(await brain.alpha_performance(alpha_id, competition_id, wait_seconds))
 
 
 # ================================================================ data
@@ -417,7 +426,7 @@ async def get_datafields(
     """Data fields usable in expressions, filtered by dataset/search/type, paged with
     offset/next_offset. field_id returns a single field's details."""
     if field_id:
-        return await brain.datafield(field_id)
+        return _obj(await brain.datafield(field_id))
     params = {"instrumentType": "EQUITY", "region": region, "delay": delay, "universe": universe,
               "dataset.id": dataset_id, "search": search, "type": field_type, "category": category,
               "subcategory": subcategory, "theme": theme, "coverage>": min_coverage,
@@ -476,7 +485,7 @@ async def get_activity(
     alphas submitted between start_date and end_date (no per-alpha requests).
     """
     if kind == "value-factor":
-        return await brain.consultant()
+        return _obj(await brain.consultant())
     if kind == "diversity-score":
         if not start_date or not end_date:
             raise InvalidArgument("diversity-score needs start_date and end_date")
@@ -488,8 +497,8 @@ async def get_activity(
             result["official"] = {"error": str(exc)}
         return result
     assert kind in ACTIVITY_KINDS
-    return await brain.activity(kind, grouping=grouping, start_date=start_date, end_date=end_date,
-                                since=since, max_rows=max_rows)
+    return _obj(await brain.activity(kind, grouping=grouping, start_date=start_date, end_date=end_date,
+                                     since=since, max_rows=max_rows))
 
 
 @mcp.tool(annotations=READ)
@@ -557,7 +566,7 @@ async def get_documentation(
 ) -> Dict[str, Any]:
     """Official BRAIN documentation. Without page_id: tutorials with their pages (ids + titles).
     With page_id: that page's content blocks (text, headings, formulas, example simulations)."""
-    return await brain.documentation(page_id, limit)
+    return _obj(await brain.documentation(page_id, limit))
 
 
 # =============================================================== forum
