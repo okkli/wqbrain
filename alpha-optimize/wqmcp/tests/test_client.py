@@ -165,6 +165,14 @@ async def test_check_alpha_polls_and_reports_failures(client, fake):
     assert [r["id"] for r in corr["top"]] == ["X2", "X4", "X1"]
 
 
+async def test_correlation_failure_does_not_hide_checks(client, fake, monkeypatch):
+    async def broken(alpha_id, kind, wait_seconds, top=5):
+        raise BrainAPIError(412, "GET", f"/alphas/{alpha_id}/correlations/{kind}", "not available")
+    monkeypatch.setattr(client, "correlation", broken)
+    res = await client.check_alpha("A1", wait_seconds=10, correlations=["power-pool"])
+    assert res["status"] == "DONE" and res["correlations"][0]["status"] == "ERROR"
+
+
 async def test_check_alpha_rejects_unknown_correlation(client, fake):
     with pytest.raises(InvalidArgument):
         await client.check_alpha("A1", 0, correlations=["production"])
@@ -307,14 +315,46 @@ async def test_401_refreshes_cookie_once_for_concurrent_requests(client, fake):
     assert fake.state.credd_calls == 2  # one refresh, not one per thread
 
 
-async def test_429_sets_shared_cooldown(client, fake):
+async def test_429_is_retried_then_surfaced(client, fake):
     fake.state.rate_limit_next_get = 1
-    with pytest.raises(BrainAPIError) as exc:
-        await client.get_alpha("A1")
-    assert exc.value.status == 429 and exc.value.retry_after == 1
     t0 = time.monotonic()
-    await client.get_alpha("A2")
+    assert (await client.get_alpha("A1"))["id"] == "A1"  # retried after Retry-After
     assert time.monotonic() - t0 >= 0.8
+    fake.state.rate_limit_next_get = 5
+    with pytest.raises(BrainAPIError) as exc:
+        await client.get_alpha("A2")
+    assert exc.value.status == 429 and exc.value.retry_after == 1
+    assert len(fake.state.calls("GET", "/alphas/A2")) == 3  # GETs: 3 attempts, then give up
+
+
+async def test_writes_are_not_retried(client, fake):
+    fake.state.sim_slots_full = True
+    settings = await client.build_settings("REGULAR", {})
+    await client.create_simulations([{"type": "REGULAR", "settings": settings, "regular": "rank(close)"}])
+    assert len(fake.state.calls("POST", "/simulations")) == 1
+
+
+async def test_network_errors_are_typed(fake):
+    c = brain_client.BrainClient(fake.url)
+    await c.get_alpha("A1")  # bootstrap the session against the fake
+    c.base_url = "http://127.0.0.1:9"  # nothing listens here
+    with pytest.raises(brain_client.BrainNetworkError):
+        await c.get_alpha("A1")
+    c._executor.shutdown(wait=False)
+
+
+async def test_diversity_score_refilters_window(client, fake):
+    fake.state.alphas[0]["dateSubmitted"] = "2025-06-01T00:00:00Z"
+    res = await client.diversity_score("2026-01-01", "2026-12-31")
+    assert res["filtered_out"] == 1 and res["N"] == 249 and "outside the window" in res["note"]
+
+
+async def test_user_id_is_required_for_user_scoped_calls(client, fake, monkeypatch):
+    async def no_user(refresh=False):
+        return {"authenticated": True, "user_id": None}
+    monkeypatch.setattr(client, "status", no_user)
+    with pytest.raises(brain_client.BrainError):
+        await client.leaderboard("leader", limit=5, offset=0, order=None, aggregate=None, user=None, mine=True)
 
 
 async def test_status_reports_user(client, fake):
