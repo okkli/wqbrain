@@ -586,8 +586,8 @@ class BrainClient:
                    first_method: str = "GET") -> PollResult:
         """Follow the catalog's Retry-After protocol for GET ``path``.
 
-        In progress = 2xx with ``Retry-After`` > 0. Done = 2xx without it (the
-        body is then parsed). 429 and 5xx are retried while the wait budget lasts;
+        In progress = 2xx that carries ``Retry-After`` (any value). Done = 2xx
+        without it (the body is then parsed). 429 and 5xx are retried while the wait budget lasts;
         other 4xx raise immediately (no blind retries).
         """
         budget = clamp(wait_seconds, 0, MAX_WAIT_SECONDS, 0)
@@ -1372,7 +1372,10 @@ class BrainClient:
         results = [{"id": t.get("id"), "title": t.get("title"), "category": t.get("category"),
                     "pages": [{"id": p.get("id"), "title": p.get("title")} for p in t.get("pages") or []]}
                    for t in data.get("results") or []]
-        return {**page_meta(data, limit, 0), "results": results}
+        out: Dict[str, Any] = {"count": data.get("count"), "returned": len(results), "results": results}
+        if data.get("next"):
+            out["note"] = "More tutorials exist; call again with a larger limit (max 200)."
+        return out
 
 
 # --------------------------------------------------------------------------- #

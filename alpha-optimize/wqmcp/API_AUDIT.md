@@ -1,9 +1,10 @@
 # wqmcp 接口使用与冗余审计（对照 WQ API Catalog 1.15.3）
 
-- 审计对象：`alpha-optimize/wqmcp/platform_functions.py`（40 个 `@mcp.tool`）、`alpha-optimize/wqmcp/forum_functions.py`
+- 审计对象（v1）：`alpha-optimize/wqmcp/platform_functions.py`（40 个 `@mcp.tool`）、`alpha-optimize/wqmcp/forum_functions.py`
 - 参照：`wqapi-visible-catalog-1.15.3.md`，93 个前端可见接口
 - 方法：7 个按接口域划分的审计 agent 和 1 个冗余分析 agent 独立审计，每组结果再由一个复核 agent 逐条对照代码行和目录行尝试推翻，最后由完整性 critic 补漏。138 条已确认或部分确认的发现中，高危问题我另外逐一对照代码和目录核对过。
 - 结果：共提出 127 条，推翻 1 条（SIM-16，见文末）；复核阶段补充 5 条，critic 补充 7 条。最终保留 **138 条：高 11、中 59、低 68**。
+- v2 修复状态：见第八节（FIXED 115 · REMOVED 9 · PARTIAL 8 · UNVERIFIABLE 6 · NOT_FIXED 0）。
 - 局限：
   - 目录是逆向整理的结果，不是官方契约。
   - 目录不收录 `visibility: hidden` 的接口，所以"不在目录中"只代表无法验证，不代表接口不存在。
@@ -1564,3 +1565,178 @@ return operators`。目录 5085：`"type": "array"`。
 
 - **SIM-16**：PYTHON 语言会删掉 unitHandling/nanHandling，而目录把这两个字段标为 required（无法核实）
   - 推翻理由：442 行注释 "PYTHON payload omits these FASTEXPR-only fields" 表明这是按已知的 PYTHON 请求体有意删掉的。目录的 required 列表来自 OPTIONS，而目录自己在 5961 行说明 "OPTIONS 将这些分支字段都标为 required，实际应按 type 选择对应分支"，可见 OPTIONS 的 required 不区分分支，不能作为 PYTHON 请求必须带 unitHandling/nanHandling 的依据。没有任何证据表明 PYTHON 请求因此被拒绝，finding 自己也承认只能算需要实测的风险。
+
+---
+
+## 八、v2 修复状态
+
+分支 `claude/wqmcp-review-refactor` 重写了 wqmcp。重写后由独立 agent 对照新代码逐条复核，依据写到文件和行号，另有一个 bug 复审 agent 专门挑新代码的问题。
+
+行号对应复核时的代码版本，之后可能有少量偏移。
+
+状态统计（共 138 条）：FIXED 115 · PARTIAL 8 · NOT_FIXED 0 · REMOVED 9 · UNVERIFIABLE 6
+
+| 编号 | 状态 | 依据（新代码位置或替代方案） | 遗留事项 |
+|---|---|---|---|
+| AUTH-1 | FIXED | get_activity(kind='diversity') 调 /users/self/activities/diversity 并校验 grouping：brain_client.py:1161-1168 | |
+| AUTH-2 | REMOVED | get_user_profile 已删；本人状态由 brain_status 只调 GET /authentication，不回传 PII：brain_client.py:630-647 | 可选：用 GET /users/{id}/profile 提供他人公开档案 |
+| AUTH-3 | FIXED | diversity_score 直接用 listAlphas 字段，无逐个请求、无静默跳过：brain_client.py:1226-1236 | |
+| AUTH-4 | FIXED | 按 limit/offset 翻页到 count，超上限置 complete=False 并提示：brain_client.py:1200-1214, 1263-1264 | |
+| AUTH-5 | FIXED | 客户端按 dateSubmitted 重新过滤窗口，报告 filtered_out：brain_client.py:1215-1225, 1258-1260 | 小项：dateSubmitted>/< 是否生效只影响翻页量 |
+| AUTH-6 | FIXED | 去掉 N+1，_is_atom/pyramids 取自列表结果：brain_client.py:1226-1236 | |
+| AUTH-7 | FIXED | 文档写明为客户端估算（server.py:484-485）；官方值走 kind='value-factor'：brain_client.py:1181-1183 | 小项：文档未注明 value-factor 仅顾问可用 |
+| AUTH-8 | FIXED | P 与 P_max 共用 pyramid_key；multipliers 失败时 S_P/得分为 None，提示合并：brain_client.py:1237-1266 | |
+| AUTH-9 | FIXED | 按端点设 Accept，base-payment 用 3.0，默认 2.0：brain_client.py:188-211 | |
+| AUTH-10 | FIXED | payment 走 call()，出错抛带响应体的 BrainAPIError；records 裁剪：brain_client.py:1176-1178, 552-561 | |
+| AUTH-11 | FIXED | user id 取自 /authentication 并缓存，取不到直接报错：brain_client.py:649-654, 1280-1281 | |
+| AUTH-12 | FIXED | refresh_cookies(stale_version) 避免重复拉取，10 秒内不重试：brain_client.py:279-301 | |
+| AUTH-13 | FIXED | 单一 status() 只调 GET /authentication，返回 user_id/expiry/permissions：brain_client.py:630-647 | |
+| AUTH-14 | FIXED | 只保留目录路径，无回退：brain_client.py:1161-1164 | |
+| AUTH-15 | FIXED | startDate/endDate 校验 YYYY-MM-DD：brain_client.py:1169-1173；文档见 server.py:473 | |
+| AUTH-16 | FIXED | 所有工具都没有 email/password 参数：server.py:108-123 | |
+| AUTH-17 | FIXED | 仅 401/403 视为未登录，204/空体算成功，返回 permissions：brain_client.py:636-647 | |
+| AUTH-18 | FIXED | get_activity 文档无 p_max：server.py:478-486 | |
+| AUTH-19 | FIXED | board 为 Literal，暴露 limit/offset/order/aggregate/user：server.py:504-517；brain_client.py:1269-1283 | |
+| AUTH-20 | FIXED | 无 ensure_authenticated；冷会话 refresh 不再二次拉取：brain_client.py:630-635 | |
+| DATA-1 | FIXED | get_datafields 暴露 limit/offset，返回 has_more/next_offset：server.py:422-423；brain_client.py:1122-1132 | |
+| DATA-2 | FIXED | get_datasets 暴露 limit/offset/order，描述裁剪：server.py:390-392；brain_client.py:1110-1120 | |
+| DATA-3 | FIXED | field_type 为含 UNIVERSE/SYMBOL 的 Literal，默认 None，空值不发送：server.py:414；brain_client.py:1125 | |
+| DATA-4 | FIXED | get_datafields 的 theme 现在会发送：server.py:417, 432 | |
+| DATA-5 | FIXED | theme 默认 None，仅显式给出时发送：server.py:385；brain_client.py:1113 | |
+| DATA-6 | FIXED | /data-sets、/data-fields、/operators 默认 Accept 2.0：brain_client.py:205-211 | |
+| DATA-7 | FIXED | 新增 category/subcategory/theme、coverage>、valueScore>、alphaCount>/<、order：server.py:383-403, 415-433 | 小项：未暴露 dateCoverage、coverage< |
+| DATA-8 | FIXED | /operators 缓存 1 小时，可按 category/scope/name 过滤，默认精简：brain_client.py:1145-1152；server.py:437-461 | 小项：冷缓存时并发请求未合并 |
+| DATA-9 | FIXED | 只在一处规范化为列表，工具返回 {count,results,categories}：brain_client.py:1148-1150 | |
+| DATA-10 | FIXED | 错误体经 error_message 透出；GET 对 429/502/503/504/网络错误有界重试：brain_client.py:147-167, 563-583 | |
+| DATA-11 | FIXED | include_fields=True 调 /data-sets/search：server.py:396-399；brain_client.py:1137-1143 | 小项：文档说"跨所有 region"未经实测（server.py:382） |
+| SIM-1 | UNVERIFIABLE | 已按目录发 settings.instrumentType/region/delay 和 limit：brain_client.py:884-889 | 实测 region=CHN 时 results[].settings.region |
+| SIM-2 | FIXED | 只接受裸 id 或 https://BRAIN 主机/simulations/id：brain_client.py:756-767；默认监听 127.0.0.1：server.py:29 | |
+| SIM-3 | FIXED | child 的 429/5xx/网络错误记 UNKNOWN，非法 child id 记 ERROR：brain_client.py:780-789, 826-834 | |
+| SIM-4 | FIXED | 非 201 抛 BrainAPIError，带错误原因和 Retry-After；429 结构化返回：brain_client.py:741-748 | |
+| SIM-5 | FIXED | 保留 status/alpha_id/message/detail/details；拉 alpha 时检查状态码：brain_client.py:769-776, 815-824 | |
+| SIM-6 | FIXED | 父任务仍在运行时按其 Retry-After 返回 RUNNING，不查 child：brain_client.py:793-798 | |
+| SIM-7 | FIXED | 完成时返回精简 alpha 摘要，可关 include_alpha：brain_client.py:769-776；server.py:197 | |
+| SIM-8 | FIXED | 文档改为预览会选中哪些 alpha，limit/selection_limit 含义写清：server.py:230-243；brain_client.py:881-896 | |
+| SIM-9 | FIXED | 单一 build_settings + create_simulations 处理 1..10 条：brain_client.py:670-702, 733-754 | |
+| SIM-10 | FIXED | 未传字段用 /users/{uid}/settings/simulation 补齐（language 除外），回显 settings_used：brain_client.py:658-683 | |
+| SIM-11 | REMOVED | lookINTO_SimError_message 已删，由 get_simulation（多 id 并发）替代：brain_client.py:836-860 | |
+| SIM-12 | FIXED | 单个模拟与 child 都读取 message/detail/details：brain_client.py:817-819 | |
+| SIM-13 | FIXED | 按 key 匹配（label 兜底），输出枚举/范围，缓存 1 小时，缺键给 note：brain_client.py:1446-1485, 867-879 | |
+| SIM-14 | FIXED | 按端点设 Accept，OPTIONS 用 3.0，解析失败回退到无版本：brain_client.py:188-211, 872-877 | 实测带版本头的响应结构；可用 WQMCP_ACCEPT_VERSIONS=0 回退 |
+| SIM-15 | FIXED | decay 限整数 0..512 等范围/枚举校验，testPeriod 默认 P0Y0M0D：brain_client.py:428-434, 704-723 | |
+| SIM-17 | UNVERIFIABLE | 现按目录"2xx 带 Retry-After（任意值）即进行中"：brain_client.py:112-114, 619, 793 | 实测完成响应是否带 Retry-After: 0 |
+| SIM-18 | FIXED | 429/5xx 记 UNKNOWN 并带 retry_after，在等待预算内重查：brain_client.py:786-789, 854 | |
+| SIM-19 | REMOVED | manage_config 与配置文件已删，由 brain_status 替代：server.py:108-123 | |
+| SIM-20 | REMOVED | 配置文件相关代码全部删除；.gitignore 忽略遗留的 user_config.json | |
+| SIM-M1 | FIXED | cancel_simulation 调 DELETE /simulations/{id}，标注 destructive：server.py:215-219；brain_client.py:862-865 | |
+| SIM-M2 | FIXED | _alpha_summary 遇非 2xx 返回 {id,error}：brain_client.py:769-776 | |
+| ALPHA-1 | FIXED | check_alpha 轮询 GET /alphas/{id}/check，all_passed=无 FAIL/PENDING：brain_client.py:967-993, 339-346 | |
+| ALPHA-2 | FIXED | POST 后按 Retry-After 轮询 GET /submit，FAIL 判 REJECTED，空报告时核对 stage：brain_client.py:1013-1053 | |
+| ALPHA-3 | FIXED | 返回结构化 {alpha_id,status,checks,failed,pending}：brain_client.py:1041-1053 | |
+| ALPHA-4 | FIXED | 429 返回 RATE_LIMITED；4xx 带 checks 判 REJECTED，否则抛含响应体的错误：brain_client.py:1021-1030, 1055-1063 | |
+| ALPHA-5 | FIXED | /check 与相关性并发，共用 Retry-After 轮询器，超预算返回 PENDING：brain_client.py:585-626, 973-975 | |
+| ALPHA-6 | FIXED | 只读顶层 max/min，按 correlation 列取 top，null 安全：brain_client.py:954-965 | |
+| ALPHA-7 | FIXED | 类型为 Literal self/prod/power-pool，服务端再校验：server.py:297；brain_client.py:969-971 | |
+| ALPHA-8 | REMOVED | get_submission_check 并入精简的 check_alpha：server.py:294-304 | |
+| ALPHA-9 | FIXED | stage/status/alpha_type 均为可选 Literal，默认值统一：server.py:249-272 | |
+| ALPHA-10 | FIXED | listAlphas 用 Accept 4.0，其余 2.0：brain_client.py:192, 211 | 实测 v4.0 结构与 summarize_alpha 是否一致 |
+| ALPHA-11 | FIXED | 默认返回精简摘要，full=True 给原始对象，带分页信息：brain_client.py:918-921 | |
+| ALPHA-12 | UNVERIFIABLE | 文档已标注日期过滤与 hidden 未文档化，order 只推荐 ±dateCreated：server.py:256-268 | 实测这些过滤是否生效（对比 count） |
+| ALPHA-13 | UNVERIFIABLE | tags 仍为 List[str]（server.py:333）；osmosis_points 标注未文档化，范围 1..100000（server.py:337） | 实测 tags 元素格式与 osmosisPoints 可写性 |
+| ALPHA-14 | PARTIAL | ''/[] 可清空，空更新拒绝，favorite/hidden/color 批量走 PATCH /alphas：server.py:325-361；brain_client.py:1072-1080 | SUPER 描述需 ≥100 字符仍未说明（server.py:335-336） |
+| ALPHA-M1 | FIXED | 相关性未算完返回 status=PENDING 与 retry_after：brain_client.py:951-953 | |
+| ANLY-1 | FIXED | 未知类型报错；无检查项时 all_passed=False：brain_client.py:949-950, 346 | |
+| ANLY-2 | FIXED | 统一 poll() 遵守 Retry-After，未完成返回 PENDING 而非 {}：brain_client.py:585-626, 938-942 | |
+| ANLY-3 | FIXED | 其他 4xx 立即报错；429/5xx/网络错误在预算内按 Retry-After 或退避重试：brain_client.py:598-618 | |
+| ANLY-4 | FIXED | 直接读顶层 max，按 schema 名找 correlation 列：brain_client.py:954-965 | |
+| ANLY-5 | FIXED | 通过与否以 /check 的 result/limit 为准，无 0.7 阈值：brain_client.py:984-990 | |
+| ANLY-6 | FIXED | 改用 before-and-after-performance（本人/比赛），支持轮询和空体：brain_client.py:1086-1106 | |
+| ANLY-7 | FIXED | recordset 列表和数据都走 poll()，未完成返回 PENDING：brain_client.py:930-946 | |
+| ANLY-8 | FIXED | 合并为 get_alpha_recordset 与 correlation(kind)：server.py:282-291；brain_client.py:930-965 | |
+| ANLY-9 | FIXED | recordset 默认保留最近 300 行；相关性只给 max/min 与 top5：brain_client.py:396-412, 954-965 | 小项：无摘要/降采样，只截取尾部 |
+| ANLY-10 | FIXED | recordset/相关性/表现接口默认 Accept 2.0：brain_client.py:211 | |
+| ANLY-11 | FIXED | 相关性并发且 return_exceptions，单类失败只标 ERROR：brain_client.py:975-979 | |
+| ANLY-12 | REMOVED | expand_nested_data 已删；recordset 直接以列+行返回：brain_client.py:396-412 | |
+| ANLY-13 | FIXED | recordset 名经 seg() 校验，文档列出合法值：server.py:285；brain_client.py:932, 938 | |
+| MISC-1 | FIXED | 不再写盘；剥离 data URI 图片和长 base64，正文截断：brain_client.py:1489-1505 | |
+| MISC-2 | FIXED | 暴露 read/type/order/limit/offset，返回分页信息：server.py:549-559；brain_client.py:1348-1362 | |
+| MISC-3 | FIXED | 文档写明不含比赛；upcoming_only 用 start>=now，支持 type/language/分页：brain_client.py:1329-1346 | 小项：未暴露自定义 order/start_after |
+| MISC-4 | UNVERIFIABLE | include_agreement 尽力请求，404 时 agreement=None 并注明：brain_client.py:1300-1307 | 实测 /competitions/{id}/agreement 是否存在 |
+| MISC-5 | FIXED | 直接请求 /users/self/competitions：brain_client.py:1311-1315 | |
+| MISC-6 | FIXED | 默认 Accept 2.0：brain_client.py:205-211 | |
+| MISC-7 | FIXED | competition_id/page_id 经 seg() 校验与编码：brain_client.py:1297, 1368 | |
+| MISC-8 | FIXED | page_id 说明取 results[].pages[].id（server.py:564）；页面按块精简：brain_client.py:1508-1521 | |
+| MISC-9 | FIXED | 教程列表可传 limit（≤200），不再返回无法使用的 next_offset，有更多时提示加大 limit；scope='mine' 不再伪造分页：brain_client.py documentation()、competitions() | |
+| FORUM-1 | UNVERIFIABLE | 注入 cookie 后走 /access/sso，识别登录/未授权页并报 auth_required：forum_functions.py:1336-1365, 405-421 | 实测 SSO 能回到 /hc、未授权标记与真实页面一致 |
+| FORUM-2 | FIXED | 块元素与 <br> 转为换行，<pre>/<code> 原样保留：forum_functions.py:257-356 | |
+| FORUM-3 | FIXED | 等待用 state='attached' 且只等 3 秒，末页按"下一页"链接判断：forum_functions.py:1280-1293, 1088, 1144 | |
+| FORUM-4 | FIXED | 查询串用 urlencode 编码，locale 可传：forum_functions.py:137-143；server.py:579 | |
+| FORUM-5 | FIXED | 参数改为 post，裸 id 依次试 posts/articles，检查状态码，报 not_found：forum_functions.py:160-192, 1113-1124 | |
+| FORUM-6 | FIXED | 不强制刷新 credd、不调 /authentication，只取当前 cookie；术语表可匿名：forum_functions.py:1309-1320, 1175 | |
+| FORUM-7 | FIXED | 共享浏览器、信号量限流、wait_for 总超时、术语表缓存、评论页上限、chrome 回退：forum_functions.py:1237-1278, 1041-1047 | |
+| FORUM-8 | FIXED | HTML 解析放入 asyncio.to_thread，评论去重用 set：forum_functions.py:922, 1352, 587-604 | |
+| FORUM-9 | FIXED | 论坛工具无 email/password，ForumClient 只注入 cookie_provider：server.py:575-601；forum_functions.py:943-956 | |
+| FORUM-10 | PARTIAL | max_results≤50（默认 20）、max_comments≤500、正文 20k/评论 4k 截断、has_more：forum_functions.py:77-83, 996, 1010 | 无 comment_offset 续读；read_forum_post 默认 max_comments 已降为 30 |
+| FORUM-11 | FIXED | 按表格→标题/dt/粗体→逐行启发式解析，ago 按词边界匹配，0 条时报错：forum_functions.py:611-816, 1179-1182 | 小项：解析规则未用真实页面核对 |
+| FORUM-12 | FIXED | 中途失败返回 complete=False 与 warning；术语表返回 dict，出错抛 ForumError：forum_functions.py:1069-1074, 1161-1164 | |
+| FORUM-13 | FIXED | 按"下一页"链接翻页，评论按元素 id 去重，识别越界钳位：forum_functions.py:551-604, 1137-1165 | |
+| FORUM-14 | FIXED | cookie 显式 secure=True，httpOnly 取字典值，不读 _rest，只转发本域：forum_functions.py:195-221 | 实测 SSO 链路后再决定是否收窄 domain |
+| FORUM-15 | FIXED | 无 session 与无用 import；工具直接调 ForumClient 并透传 locale：server.py:583, 594-595, 601 | |
+| FORUM-16 | PARTIAL | 已补上 SSO、attached、未授权检测、末页判据：forum_functions.py:1336-1365, 1292 | 仍与 wq-doc-forum 各自维护，未优先读本地同步语料 |
+| FORUM-17 | PARTIAL | get_documentation 标为官方文档，论坛搜索提示优先 rag_search：server.py:567-568, 581-582 | 未写明"概念用法优先 get_documentation"；未接入 GET /search |
+| FORUM-18 | FIXED | 论坛不再调用 BRAIN API（forum_functions.py:6）；Accept 全局按端点设置：brain_client.py:205-211 | |
+| FORUM-19 | FIXED | search/read 都可传 locale 并校验：server.py:579, 591；forum_functions.py:118-124 | |
+| FORUM-M1 | PARTIAL | 只接受支持站的 posts/articles 地址，导航后校验仍在本站：forum_functions.py:178-192, 1367-1371 | 默认仍 --no-sandbox，需设 WQMCP_FORUM_CHROMIUM_SANDBOX=1（952-961） |
+| RED-1 | FIXED | 同 AUTH-3/4/6：brain_client.py:1185-1267 | |
+| RED-2 | FIXED | 合并为 get_alpha_recordset，共用轮询器：server.py:282-291；brain_client.py:930-946 | |
+| RED-3 | FIXED | check_alpha 基于 /check，可选并发拉相关性：brain_client.py:967-993 | |
+| RED-4 | REMOVED | lookINTO 已删，由 get_simulation（多 id）替代：server.py:193-212 | |
+| RED-5 | FIXED | 严格解析 id/URL（brain_client.py:756-767）；默认监听 127.0.0.1（server.py:29） | credd 侧：CREDD_TOKEN 仍可为空（brain_client.py:36） |
+| RED-6 | FIXED | 共用 build_settings/create_simulations：brain_client.py:670-754 | |
+| RED-7 | FIXED | 只剩 brain_status；user id 缓存；直接用 self 路径：brain_client.py:630-654, 1312 | |
+| RED-8 | FIXED | server.py、brain_client.py、forum_functions.py 均无 email/password 参数 | |
+| RED-9 | REMOVED | manage_config/load_config/save_config 已删，论坛也不再读 credentials | |
+| RED-10 | FIXED | brain_client.py 独立成模块；论坛经依赖注入拿 cookie 并延迟导入：server.py:74-79 | |
+| RED-11 | FIXED | 论坛共享浏览器并用信号量限流，不强制刷新 credd：forum_functions.py:1205-1259, 1309-1320 | |
+| RED-12 | PARTIAL | 文档合并为 get_documentation(page_id)：server.py:562-569；论坛搜索提示 rag_search：server.py:582 | 论坛 3 个工具未合并为 1 个 |
+| RED-13 | REMOVED | expand_nested_data 与 pandas 依赖已删（requirements.txt） | |
+| RED-14 | FIXED | 集中 request/_parse/call，工具出错直接抛出：brain_client.py:519-583 | |
+| RED-15 | FIXED | 同 ALPHA-2/3/4：brain_client.py:995-1063 | |
+| RED-16 | FIXED | get_activity(kind 为 Literal)，按 kind 设 Accept：server.py:467-501；brain_client.py:1156-1179 | |
+| RED-17 | FIXED | 同 AUTH-14：brain_client.py:1161-1164 | |
+| RED-18 | FIXED | 三个模块均无未使用 import 或不可达分支 | |
+| RED-19 | FIXED | 统一动宾命名：get_simulation、list_alphas、check_alpha、get_alpha_performance、preview_super_selection 等 | |
+| RED-20 | FIXED | 工具 40→25，docstring 约 4.7k 字符，枚举用 Literal：server.py | 小项：参数共 145 个（create_simulation 占 23） |
+| RED-21 | FIXED | 榜单类型与分页已暴露，相关性并发，lookINTO 已删：brain_client.py:1269-1283, 973-975 | |
+| RED-M1 | FIXED | 默认监听 127.0.0.1 并开 DNS rebinding 防护，非本机监听时告警：server.py:29, 41-53 | 小项：监听 0.0.0.0 时服务本身仍无 Bearer 校验 |
+| CRIT-1 | FIXED | 所有路径参数经 seg()：brain_client.py:90-99；kind/board/相关性类型走枚举校验 | |
+| CRIT-2 | FIXED | 有 Read/Write/Destructive/Idempotent 注解，submit 默认 dry-run，有 READ_ONLY/ALLOW_SUBMIT 开关：server.py:31-38, 82-86 | |
+| CRIT-3 | PARTIAL | Location 在工作线程记录，可由 get_simulation() 找回；提交标记在 on_response 写入并加锁：brain_client.py:725-731, 1003-1020 | 创建模拟无去重、无总截止时间；recent_simulations 只在内存 |
+| CRIT-4 | FIXED | cookie 设 secure（brain_client.py:298），校验 https+host（762），401 刷新只限 BRAIN 主机（310） | |
+| CRIT-5 | FIXED | 工具抛异常即 isError；credd 细节只写日志，不回传地址：brain_client.py:248-266 | |
+| CRIT-6 | FIXED | 账户级 429 冷却 + 在途请求信号量（默认 16）：brain_client.py:472-474, 525-533, 547-549 | |
+| CRIT-7 | PARTIAL | 支持 1..10 条，单条以对象发送：brain_client.py:733-738 | multi 不支持 SUPER（server.py:173-178）；PYTHON 仍去掉 unitHandling/nanHandling |
+
+### 遗留事项（PARTIAL / UNVERIFIABLE）
+
+没有 NOT_FIXED。
+
+**PARTIAL**
+
+- ALPHA-14：在 `selection_desc`、`combo_desc` 的 Field 说明里写明"SUPER 提交前 selection 描述需不少于 100 字符"，并可在本地校验长度。
+- FORUM-10：`read_forum_post` 增加 `comment_offset`（或起始页），让调用方能续读 `has_more_comments` 之后的评论。
+- FORUM-16：把浏览器、SSO 和解析逻辑抽成与 `wq-rag/wq-doc-forum` 共用的包；搜索和读帖先查本地同步 JSON（或 brain-rag），查不到再在线抓取。
+- FORUM-17：在 `search_forum_posts`、`get_glossary_terms` 的文档里写明"官方概念和用法优先用 get_documentation"；实测 `GET /search` 的 `type` 取值和覆盖范围后，再决定是否新增 `search_platform` 工具。
+- FORUM-M1：非 root、非容器环境默认开启 Chromium 沙箱，只在检测到 root 或容器时关闭（README 已说明 `WQMCP_FORUM_CHROMIUM_SANDBOX`）。
+- RED-12：把 3 个论坛工具合并成一个（例如 `forum(query=None, post=None, glossary=False)`），文档写明优先用 brain-rag 的 `rag_search`。
+- CRIT-3：`create_simulation` 按（表达式 + settings）哈希做短时间去重，命中时直接返回已有的 `simulation_id`；`recent_simulations` 可落盘持久化；给整次工具调用加总截止时间。
+- CRIT-7：允许 multi 数组里放 SUPER 项（combo + selection）；实测 PYTHON 请求保留 `unitHandling`/`nanHandling` 是否会被接受，再据此调整 `_FASTEXPR_ONLY`（brain_client.py:443, 694-696）。
+
+**UNVERIFIABLE（需在真实平台实测）**
+
+- SIM-1：对 super-selection 分别用 `settings.region=CHN` 和扁平的 `region=CHN` 请求，核对 `results[].settings.region`，确认哪种参数名生效。
+- SIM-17：观察模拟、`/check`、recordset 和 `/submit` 完成时的响应头，确认 BRAIN 是省略 Retry-After 还是返回 `Retry-After: 0`。如果会返回 0，把 `in_progress` 改为 ra>0 才算进行中。
+- ALPHA-12：用已知时间窗和 `hidden=True` 调 `list_alphas`，与不加过滤时的 `count` 对比，确认 `dateCreated>`/`<`、`dateSubmitted>`/`<`、`hidden` 是否生效，以及 `>` 是否包含边界。
+- ALPHA-13：对一个测试 alpha 调 `update_alpha(tags=["x"])` 和 `osmosis_points=…`，再用 `get_alpha(full=True)` 核对是否写入、tags 元素是字符串还是对象；据此确定类型和范围。
+- MISC-4：对一个进行中的比赛请求 `/competitions/{id}/agreement`，确认端点是否存在、返回什么结构。不存在就删除 `include_agreement`，并提示规则在 `description/faq/helpText` 字段里。
+- FORUM-1：用 credd 提供的 cookie 读一篇顾问区帖子，并做一次搜索。确认三点：`/access/sso` 能跳回 `/hc` 且 `signed_in=True`；未授权页会被识别为 `auth_required`；搜索、帖子、评论、术语表的选择器与真实页面一致（现有 fixture 是手写的，不是真实页面）。

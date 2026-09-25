@@ -587,7 +587,7 @@ async def search_forum_posts(
 async def read_forum_post(
     post: Annotated[str, Field(description="Post/article id (e.g. 32984819083415), 'posts/<id>', 'articles/<id>' or a support.worldquantbrain.com URL")],
     include_comments: bool = True,
-    max_comments: Annotated[int, Field(ge=0, le=500)] = 100,
+    max_comments: Annotated[int, Field(ge=0, le=500)] = 30,
     locale: Annotated[str, Field(description="Used to build URLs from bare ids, e.g. zh-cn, en-us")] = "zh-cn",
 ) -> Dict[str, Any]:
     """Read one forum post or article (body keeps line breaks and code) with its comments."""
