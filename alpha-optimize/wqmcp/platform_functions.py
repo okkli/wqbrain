@@ -693,9 +693,7 @@ class BrainApiClient:
         if compact:
             return {"status": "COMPLETE", "progress_url": location,
                     "alpha": _compact_alpha_row(alpha.json()), "note": _COMPACT_NOTE}
-        result = alpha.json()
-        result['note'] = _FLIP_NOTE
-        return result
+        return {"status": "COMPLETE", "progress_url": location, "alpha": alpha.json(), "note": _FLIP_NOTE}
 
     async def _check_multi_children(self, location: str, children: List[str],
                                     compact: bool = True) -> Dict[str, Any]:
@@ -757,14 +755,22 @@ class BrainApiClient:
                 return {**s, "error": f"failed to fetch alpha details: {e}"}
 
         full = list(await asyncio.gather(*[with_details(s) for s in states]))
-        return {
-            "status": "COMPLETE",
+        failed = [s for s in full if s.get("status") != "COMPLETE" or s.get("error")]
+        result = {
+            # BRAIN cancels the whole batch when a child fails: never call that COMPLETE.
+            "status": "FINISHED_WITH_ERRORS" if failed else "COMPLETE",
             "type": "MULTI",
             "total_children": len(full),
+            "failed_children": len(failed),
             "alpha_results": full,
             "progress_url": location,
             "note": _COMPACT_NOTE if compact else _FLIP_NOTE,
         }
+        if failed:
+            result["note"] = ("Some children did not finish (see alpha_results[].status / message); "
+                              "BRAIN cancels the rest of a multi-simulation when one child fails. "
+                              + result["note"])
+        return result
 
     async def authenticate(self, email: str = "", password: str = "") -> Dict[str, Any]:
         """Refresh login state from credd. Credentials live only in the
@@ -924,7 +930,6 @@ class BrainApiClient:
         self._remember_simulation(simulation_id, "multi", payloads[0].get("type", "REGULAR"), len(payloads))
         return {
             "status": "SUBMITTED",
-            "type": "MULTI",
             "simulation_id": simulation_id,
             "multisimulation_id": simulation_id,
             "expected_children": len(payloads),
@@ -1194,8 +1199,8 @@ class BrainApiClient:
             if r["status"] == "PENDING":
                 return {"success": False, "alpha_id": alpha_id, "status": "PENDING",
                         "retry_after_seconds": r["retry_after_seconds"],
-                        "note": "Submission is being processed. Call submit_alpha again to keep "
-                                "polling; it will not submit twice."}
+                        "note": "Submission is being processed. Call submit_alpha(alpha_id, "
+                                "confirm=True) again to keep polling; it will not submit twice."}
             if r["status"] == "ERROR":
                 self._pending_submits.discard(alpha_id)  # a fixed alpha can be resubmitted
                 return self._submit_verdict(alpha_id, r.get("json"), None, r)
@@ -2310,10 +2315,13 @@ def _lint_expression(expr: str) -> List[str]:
 def _check_raa_settings(settings: Dict[str, Any], prefix: str) -> None:
     """Platform rules for REGION_AGNOSTIC (violations fail the simulation outright)."""
     for key, fixed in _RAA_FIXED.items():
-        if str(settings.get(key)).strip().upper() != str(fixed):
-            raise ValueError(f"{prefix}an RAA simulation always runs with {key}={fixed!r}, "
-                             f"got {settings.get(key)!r}")
+        value = settings.get(key)
+        same = (_finite(value) == fixed if isinstance(fixed, int)
+                else str(value).strip().upper() == fixed)
+        if not same:
+            raise ValueError(f"{prefix}an RAA simulation always runs with {key}={fixed!r}, got {value!r}")
         settings[key] = fixed
+    settings["testPeriod"] = None  # the RAA payload carries no testPeriod
     universe = str(settings.get("universe") or "").strip().upper()
     if universe not in RAA_UNIVERSES:
         raise ValueError(f"{prefix}RAA universe must be one of {list(RAA_UNIVERSES)}, "
@@ -2398,6 +2406,8 @@ WRITE_IDEMPOTENT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, id
 DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
 LOCAL_READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 LOCAL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
+# Reads BRAIN, writes only the local ProdMemo database (never destructively).
+PRODMEMO_BRAIN = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
 
 
 def _tool(annotations: ToolAnnotations):
@@ -2542,9 +2552,11 @@ async def create_simulation(
 
     Returns:
         {"status": "SUBMITTED", "mode", "type", "simulation_id" (single / multi) or
-        "simulation_ids" (concurrent), "settings_used", "next": the get_simulation
-        call}; "RATE_LIMITED" with retry_after_seconds when the account's slots are
-        full; "PARTIAL" when only some concurrent items were accepted.
+        "simulation_ids" (concurrent), "settings_used" (the base settings; per-item
+        overrides are listed in children), "next": the get_simulation call};
+        "RATE_LIMITED" with retry_after_seconds when the account's slots are full.
+        Concurrent: "PARTIAL" when only some items were accepted, per-item status
+        in simulations[] (RATE_LIMITED items can be resubmitted as they are).
     """
     guard = _write_guard("create_simulation")
     if guard:
@@ -2559,8 +2571,8 @@ async def create_simulation(
     is_python = language == "PYTHON"
     if is_python and lookback is None:
         raise ValueError("lookback is required when language='PYTHON'")
-    if is_python and sim_type == "REGION_AGNOSTIC":
-        raise ValueError("REGION_AGNOSTIC simulations take a FASTEXPR expression (language='FASTEXPR')")
+    if is_python and sim_type != "REGULAR":
+        raise ValueError(f"language='PYTHON' is for REGULAR alphas; {sim_type} takes FASTEXPR")
 
     # 1. The code of each simulation.
     if sim_type == "SUPER":
@@ -2614,7 +2626,7 @@ async def create_simulation(
                 "truncation": truncation, "visualization": visualization}
     base: Dict[str, Any] = {**_TYPE_DEFAULTS[sim_type], **{k: v for k, v in explicit.items() if v is not None}}
     base.update(pasteurization=pasteurization, unitHandling=unit_handling, nanHandling=nan_handling,
-                testPeriod=None if sim_type == "REGION_AGNOSTIC" else test_period,  # RAA carries none
+                testPeriod=test_period,  # dropped for RAA by _check_raa_settings
                 maxTrade=max_trade, maxPosition=max_position, language=language,
                 lookback=lookback if is_python else None, simulationMode=simulation_mode,
                 selectionHandling=selection_handling, selectionLimit=selection_limit,
@@ -2642,17 +2654,18 @@ async def create_simulation(
                 "note": "Fix the expressions, pass validate_expressions=False to send anyway, or use "
                         "mode='concurrent' so each alpha runs on its own."}
 
-    payloads = [brain_client.simulation_payload(item) for item in items]
-    if mode == "single":
-        result = await brain_client.create_simulation(items[0])
-        ids = [result["simulation_id"]] if result.get("simulation_id") else []
-    elif mode == "multi":
-        result = await brain_client.create_multi_simulation(payloads)
-        ids = [result["simulation_id"]] if result.get("simulation_id") else []
-    else:
-        result = await _submit_concurrently(items, children)
-        ids = result.get("simulation_ids") or []
-    result = {"mode": mode, "type": sim_type, **result}
+    try:
+        if mode == "single":
+            result = await brain_client.create_simulation(items[0])
+        elif mode == "multi":
+            result = await brain_client.create_multi_simulation(
+                [brain_client.simulation_payload(item) for item in items])
+        else:
+            result = await _submit_concurrently(items, children)
+    except Exception as e:  # BRAIN rejected it: keep the lint warnings next to its reason
+        result = {"error": str(e) or repr(e)}
+    ids = result.get("simulation_ids") or ([result["simulation_id"]] if result.get("simulation_id") else [])
+    result = {**result, "mode": mode, "type": sim_type}
     if mode == "multi" or (mode == "concurrent" and overrides_list):
         result["children"] = children
     try:  # the settings of an item without overrides (all of them when there are none)
@@ -2680,22 +2693,31 @@ async def _submit_concurrently(items: List[SimulationData], children: List[Dict[
 
     rows = list(await asyncio.gather(*(submit(i, item) for i, item in enumerate(items))))
     ids = [r["simulation_id"] for r in rows if r.get("status") == "SUBMITTED"]
+    limited = [r for r in rows if r.get("status") == "RATE_LIMITED"]
+    failed = [r for r in rows if r.get("status") not in ("SUBMITTED", "RATE_LIMITED")]
     if len(ids) == len(rows):
         status = "SUBMITTED"
     elif ids:
         status = "PARTIAL"
-    elif all(r.get("status") == "RATE_LIMITED" for r in rows):
-        status = "RATE_LIMITED"
+    elif limited:
+        status = "RATE_LIMITED"  # nothing accepted, but the limited items can simply be retried
     else:
         status = "ERROR"
-    out: Dict[str, Any] = {"status": status, "submitted": len(ids), "total": len(rows),
-                           "simulation_ids": ids, "simulations": rows}
+    out: Dict[str, Any] = {"status": status, "submitted": len(ids), "rate_limited": len(limited),
+                           "failed": len(failed), "total": len(rows), "simulation_ids": ids,
+                           "simulations": rows}
+    notes = []
+    if limited:
+        out["retry_after_seconds"] = max((r.get("retry_after_seconds") or 0) for r in limited) or 30.0
+        notes.append("RATE_LIMITED items hit the account's concurrent-simulation limit (an RAA takes "
+                      "4 slots): resubmit just those once running simulations finish.")
+    if failed:
+        notes.append("Failed items were rejected by BRAIN (see simulations[].error); fix them before "
+                      "resubmitting.")
     if status == "ERROR":
         out["error"] = "no simulation was accepted; see simulations[].error"
-    elif status != "SUBMITTED":
-        out["retry_after_seconds"] = max((r.get("retry_after_seconds") or 0) for r in rows) or 30.0
-        out["note"] = ("Items with status RATE_LIMITED hit the account's concurrent-simulation limit "
-                       "(an RAA takes 4 slots): resubmit just those once running simulations finish.")
+    if notes:
+        out["note"] = " ".join(notes)
     return out
 
 
@@ -2719,9 +2741,10 @@ async def get_simulation(simulation_ids: Union[str, List[str], None] = None, wai
     Returns:
         For one id: RUNNING with progress (multi: completed_children / children)
         and retry_after_seconds; COMPLETE with the alpha (multi: alpha_results, one
-        row per child; RAA: parent_alpha_id plus one metric row per region child);
-        or the failure status with BRAIN's own error message. For several ids:
-        {"status": RUNNING / COMPLETE / FINISHED_WITH_ERRORS, "simulations": [...]}.
+        row per child — FINISHED_WITH_ERRORS when a child failed, which makes BRAIN
+        cancel the rest; RAA: parent_alpha_id plus one metric row per region
+        child); or the failure status with BRAIN's own error message. For several
+        ids: {"status": RUNNING / COMPLETE / FINISHED_WITH_ERRORS, "simulations": [...]}.
     """
     refs = _as_list(simulation_ids, "simulation_ids")
     if not refs:
@@ -2747,10 +2770,6 @@ async def get_simulation(simulation_ids: Union[str, List[str], None] = None, wai
             state = await brain_client.check_simulation_progress(url, wait_seconds, compact)
         except Exception as e:  # e.g. a network error after the wait ran out: not a verdict
             state = {"status": "UNKNOWN", "error": str(e)}
-        if "progress_url" not in state and state.get("id"):
-            # compact=False on a finished single: the raw alpha, whose own
-            # "status" (UNSUBMITTED, ACTIVE...) is not the simulation's.
-            state = {"status": "COMPLETE", "progress_url": url, "alpha": state}
         return {"simulation_id": url.rsplit("/", 1)[-1], **state}
 
     states = list(await asyncio.gather(*(one(r) for r in dict.fromkeys(refs))))
@@ -2882,7 +2901,10 @@ async def get_alpha(alpha_id: str, full: bool = False) -> Dict[str, Any]:
         full: Return the raw BRAIN object (for an RA parent: added as "parent")
     """
     alpha = await brain_client.get_alpha_details(alpha_id)
-    if alpha.get("type") in ("RA_PARENT", "REGION_AGNOSTIC") or alpha.get("children"):
+    if alpha.get("type") in ("RA_PARENT", "REGION_AGNOSTIC") and not alpha.get("children"):
+        out = alpha if full else _alpha_summary(alpha)
+        return {**out, "note": "RA parent with no child alphas yet (still simulating, or it failed)."}
+    if alpha.get("children"):
         summary = await brain_client.get_raa_alpha(alpha_id, parent=alpha)
         if full:
             summary["parent"] = alpha
@@ -2912,6 +2934,7 @@ async def get_alpha_recordset(alpha_id: str, recordset: Optional[str] = None,
     if not recordset:
         data = await brain_client.get_record_sets(alpha_id, wait_seconds)
         return {"alpha_id": alpha_id, **(data if isinstance(data, dict) else {"results": data})}
+    max_rows = max(0, int(max_rows or 0))
     data = await brain_client.get_record_set_data(alpha_id, recordset, wait_seconds)
     data = data if isinstance(data, dict) else {"result": data}
     records = data.get("records")
@@ -3305,7 +3328,10 @@ async def get_glossary_terms() -> Dict[str, Any]:
 # --- ProdMemo: local Self / Pool / Prod correlation memory ----------------------
 # Thin wrappers over prodmemo_service (see docs/PRODMEMO_IMPLEMENTATION.md).
 
-@_tool(LOCAL_WRITE)
+_PRODMEMO_SYNC_MODES = ("incremental", "full", "stop", "status")
+
+
+@_tool(PRODMEMO_BRAIN)
 async def prodmemo_sync(mode: str = "incremental") -> Dict[str, Any]:
     """
     Sync submitted alphas and their PnL into the local ProdMemo database.
@@ -3317,12 +3343,15 @@ async def prodmemo_sync(mode: str = "incremental") -> Dict[str, Any]:
             what is missing), "full" (re-walks every alpha), "stop" (cancels a run
             in progress) or "status" (progress / final state of the latest run)
     """
-    if str(mode or "").strip().lower() == "status":
+    mode = str(mode or "incremental").strip().lower()
+    if mode not in _PRODMEMO_SYNC_MODES:
+        raise ValueError(f"mode must be one of {list(_PRODMEMO_SYNC_MODES)}, got {mode!r}")
+    if mode == "status":
         return await prodmemo_client.sync_status()
     return await prodmemo_client.start_sync(mode)
 
 
-@_tool(LOCAL_READ)
+@_tool(PRODMEMO_BRAIN)
 async def prodmemo_check(alpha_id: str = "", alpha_ids: Optional[List[str]] = None,
                          run_platform_check: bool = False, verbose: bool = False) -> Dict[str, Any]:
     """
