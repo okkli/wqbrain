@@ -203,18 +203,18 @@ def _sim_settings(fb, q, body) -> Response:
 @route("POST", r"/simulations")
 def _create_sim(fb: FakeBrain, q, body) -> Response:
     st = fb.state
-    if st.sim_slots_full:
-        return 429, {"Retry-After": "30"}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
-    if st.sim_post_limit and st.tick("sim_posts") > st.sim_post_limit:
-        return 429, {"Retry-After": "30"}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
     items = body if isinstance(body, list) else [body]
-    for it in items:
+    for it in items:  # the body is validated before the slot check
         decay = it.get("settings", {}).get("decay")
         # Like DRF's IntegerField: 4 and 4.0 are fine, 4.5 is not.
         if not isinstance(decay, (int, float)) or float(decay) != int(decay):
             return 400, {}, {"settings": {"decay": ["A valid integer is required."]}}
         if it.get("regular") == "bad(":
             return 400, {}, {"detail": "Invalid expression: unexpected end"}
+    if st.sim_slots_full:
+        return 429, {"Retry-After": "30"}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
+    if st.sim_post_limit and st.tick("sim_posts") > st.sim_post_limit:
+        return 429, {"Retry-After": "30"}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
     sid = f"S{st.next_sim}"
     st.next_sim += 1
     if isinstance(body, list):
@@ -316,6 +316,8 @@ def _get_alpha(fb, q, body, aid) -> Response:
         extra = {"is": {}} if fb.state.raa_children_pending else {}
         return 200, {}, alpha(aid, type="RA_CHILD", settings={"region": child.group(1), "universe": "TOP2000"},
                               **extra)
+    if aid == "RAPEMPTY":
+        return 200, {}, alpha(aid, type="RA_PARENT", children=[])
     if aid.startswith("RAP"):
         return 200, {}, alpha(aid, type="RA_PARENT", children=[f"{aid}C{r}" for r in ("USA", "EUR", "ASI", "GLB")])
     return 200, {}, alpha(aid)

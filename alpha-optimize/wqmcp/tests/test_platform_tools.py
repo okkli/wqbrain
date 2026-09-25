@@ -72,6 +72,7 @@ async def test_tool_surface(mcp_session):
     assert by_name["get_alpha"].annotations.readOnlyHint is True
     assert by_name["submit_alpha"].annotations.destructiveHint is True
     assert by_name["prodmemo_stats"].annotations.openWorldHint is False
+    assert by_name["prodmemo_check"].annotations.openWorldHint is True  # reads BRAIN
 
 
 def test_server_binds_loopback_by_default():
@@ -155,7 +156,7 @@ async def test_multi_regular_parent_retry_after_and_busy_child(mcp_session, fake
     fake.state.child_polls_needed = 1
     async with mcp_session() as s:
         sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)", "rank(c)"])
-        assert sub["mode"] == "multi" and sub["type"] == "MULTI" and sub["expected_children"] == 3
+        assert sub["mode"] == "multi" and sub["type"] == "REGULAR" and sub["expected_children"] == 3
         fake.state.child_429_times = 3  # outlasts _request's two GET retries
         body = posted(fake)[0]
         assert isinstance(body, list) and len(body) == 3
@@ -253,7 +254,7 @@ async def test_raa_single_concurrent_and_rules(mcp_session, fake):
                           ({"region": "USA"}, "region='ALL'"),
                           ({"delay": 0}, "delay=1"),
                           ({"max_trade": "ON", "max_position": "ON"}, "cannot both be ON"),
-                          ({"language": "PYTHON", "lookback": 5}, "FASTEXPR expression"),
+                          ({"language": "PYTHON", "lookback": 5}, "REGION_AGNOSTIC takes FASTEXPR"),
                           ({"mode": "multi", "expressions": ["a", "b"]}, "REGULAR alphas only")):
             res = await call(s, "create_simulation", **{"expressions": "rank(x)", "type": "RAA", **args})
             assert msg in res["error"], (args, res)
@@ -337,6 +338,57 @@ async def test_preview_super_selection(mcp_session, fake):
     assert res["results"][0]["id"] == "A900" and "researchNotes" not in json.dumps(res)
 
 
+async def test_multi_with_a_failed_child_is_not_complete(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        multi = await call(s, "create_simulation", expressions=["rank(a)", "fail()"])
+        single = await call(s, "create_simulation", expressions="rank(b)")
+        one = await call(s, "get_simulation", simulation_ids=multi["simulation_id"], wait_seconds=10)
+        assert one["status"] == "FINISHED_WITH_ERRORS" and one["failed_children"] == 1
+        both = await call(s, "get_simulation", simulation_ids=[multi["simulation_id"], single["simulation_id"]],
+                          wait_seconds=10)
+        assert both["status"] == "FINISHED_WITH_ERRORS"
+        assert both["counts"] == {"FINISHED_WITH_ERRORS": 1, "COMPLETE": 1}
+
+
+async def test_single_full_result_reports_complete(mcp_session, fake):
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions="rank(a)")
+        done = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10,
+                          compact=False)
+    assert done["status"] == "COMPLETE" and done["alpha"]["status"] == "UNSUBMITTED"
+    assert "researchNotes" in done["alpha"]
+
+
+async def test_concurrent_status_counts(mcp_session, fake):
+    fake.state.sim_slots_full = True
+    async with mcp_session() as s:
+        mixed = await call(s, "create_simulation", expressions=["bad(", "rank(a)"], mode="concurrent",
+                           validate_expressions=False)
+        assert mixed["status"] == "RATE_LIMITED" and "error" not in mixed
+        assert (mixed["rate_limited"], mixed["failed"]) == (1, 1) and mixed["retry_after_seconds"] == 30
+        fake.state.sim_slots_full = False
+        some = await call(s, "create_simulation", expressions=["bad(", "rank(a)"], mode="concurrent",
+                          validate_expressions=False)
+        assert some["status"] == "PARTIAL" and "retry_after_seconds" not in some
+        assert "rejected by BRAIN" in some["note"] and "RATE_LIMITED" not in some["note"]
+
+
+async def test_create_simulation_edge_rules(mcp_session, fake):
+    async with mcp_session() as s:
+        raa = await call(s, "create_simulation", expressions="rank(x)", type="RAA",
+                         per_alpha_settings=[{"delay": 1.0, "test_period": "P1Y0M"}, {"delay": "1"}])
+        assert raa["status"] == "SUBMITTED"
+        assert all("testPeriod" not in b["settings"] and b["settings"]["delay"] == 1 for b in posted(fake))
+        sa_py = await call(s, "create_simulation", type="SA", combo="c", selection="s", language="PYTHON",
+                           lookback=5)
+        assert "is for REGULAR alphas" in sa_py["error"]
+        rejected = await call(s, "create_simulation", expressions="bad(")
+        assert "Invalid expression" in rejected["error"]
+        assert rejected["lint_warnings"][0]["issues"] == ["unbalanced parentheses"]
+        assert rejected["mode"] == "single" and "next" not in rejected
+
+
 # ----------------------------------------------------------------- alphas
 
 
@@ -365,6 +417,8 @@ async def test_get_alpha_summary_full_and_raa(mcp_session, fake):
         assert "researchNotes" in full
         raa = await call(s, "get_alpha", alpha_id="RAPX")
         assert raa["type"] == "REGION_AGNOSTIC" and len(raa["children"]) == 4 and "parent" not in raa
+        empty = await call(s, "get_alpha", alpha_id="RAPEMPTY")
+        assert empty["id"] == "RAPEMPTY" and empty["type"] == "RA_PARENT" and "no child alphas" in empty["note"]
     assert len(fake.state.calls("GET", "/alphas/RAPX")) == 1  # the parent is not fetched twice
 
 
@@ -376,6 +430,8 @@ async def test_recordsets(mcp_session, fake):
         assert len(tail["records"]) == 10 and "last 10 of 500" in tail["truncated"]
         listed = await call(s, "get_alpha_recordset", alpha_id="A1")
         assert [r["name"] for r in listed["results"]] == ["pnl", "yearly-stats"]
+        negative = await call(s, "get_alpha_recordset", alpha_id="A1", recordset="pnl", max_rows=-1)
+        assert len(negative["records"]) == 500 and "truncated" not in negative
         pending = await call(s, "get_alpha_recordset", alpha_id="A2", recordset="turnover", wait_seconds=0)
         assert pending["status"] == "PENDING"
 
@@ -429,6 +485,7 @@ async def test_submit_dry_run_then_confirm(mcp_session, fake):
 async def test_submit_pending_resumes_without_second_post(client, fake):
     first = await client.submit_alpha("A2", wait_seconds=0)
     assert first["status"] == "PENDING" and first["success"] is False
+    assert "confirm=True" in first["note"]
     second = await client.submit_alpha("A2", wait_seconds=10)
     assert second["status"] == "SUBMITTED"
     assert len(fake.state.calls("POST", "/alphas/A2/submit")) == 1
@@ -563,7 +620,10 @@ async def test_prodmemo_sync_status_mode(mcp_session, monkeypatch):
     async with mcp_session() as s:
         assert (await call(s, "prodmemo_sync", mode="status")) == {"state": "idle"}
         assert (await call(s, "prodmemo_sync"))["started"] is True
-    assert seen == ["status", "incremental"]
+        assert (await call(s, "prodmemo_sync", mode=" STOP "))["started"] is True
+        bad = await call(s, "prodmemo_sync", mode="Fulll")
+        assert "mode must be one of" in bad["error"]
+    assert seen == ["status", "incremental", "stop"]
 
 
 # ------------------------------------------------------------------ credd

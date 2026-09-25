@@ -1587,7 +1587,7 @@ v2 分支（`claude/wqmcp-review-refactor`）曾经独立重写了客户端，�
   - `update_alpha` 的批量 favorite / hidden / color（PATCH /alphas）。
   - `check_alpha(check="power-pool")`。
   - `list_alphas` 的 status / type 过滤。
-- **提交安全**：`submit_alpha` 默认只做预检，`confirm=True` 才真正提交；`WQMCP_READ_ONLY`、`WQMCP_ALLOW_SUBMIT` 覆盖所有写操作。
+- **提交安全**：`submit_alpha` 默认只做预检，`confirm=True` 才真正提交。`WQMCP_READ_ONLY` 和 `WQMCP_ALLOW_SUBMIT` 覆盖所有写 BRAIN 的操作；本地 ProdMemo 数据库的维护（`prodmemo_manage`）不受这两个开关控制。
 - **仍需实测**（`scripts/live_regression.py`）：
   - SIM-1：super-selection 参数名，用 `--selection`。
   - SIM-17：完成时 Retry-After 的取值，用 `--writes`。

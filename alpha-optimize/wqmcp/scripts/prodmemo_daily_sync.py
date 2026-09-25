@@ -100,6 +100,10 @@ class McpClient:
         except json.JSONDecodeError:
             return {'raw': text}
 
+    def tool_names(self):
+        response = self._post({'jsonrpc': '2.0', 'id': self._new_id(), 'method': 'tools/list'})
+        return {t.get('name') for t in ((response or {}).get('result') or {}).get('tools') or []}
+
     def close(self):
         """End the server-side MCP session (otherwise one leaks per run)."""
         if not self.session_id:
@@ -121,6 +125,10 @@ def main():
         return 2
 
     try:
+        # A server not yet restarted on the new code still has prodmemo_sync_status;
+        # there prodmemo_sync(mode='status') would start another sync on every poll.
+        status_call = (('prodmemo_sync_status',) if 'prodmemo_sync_status' in client.tool_names()
+                       else ('prodmemo_sync', {'mode': 'status'}))
         before = client.call('prodmemo_stats')
         log(f"before: alphas={before.get('submitted_alpha_count')} "
             f"pnls={before.get('pnl_count')} "
@@ -151,7 +159,7 @@ def main():
         state = {}
         while time.time() < deadline:
             time.sleep(POLL_SECONDS)
-            state = client.call('prodmemo_sync', {'mode': 'status'})
+            state = client.call(*status_call)
             if state.get('status') in TERMINAL and not state.get('running'):
                 break
             log(f"  ...{state.get('phase')} {state.get('current') or ''}"
