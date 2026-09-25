@@ -14,6 +14,7 @@ a single low-concurrency process.
 import json
 import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import psycopg2
@@ -158,6 +159,12 @@ class ProdMemoDao:
             'user': os.environ.get('PRODMEMO_PG_USER', 'postgres'),
             'password': os.environ.get('PRODMEMO_PG_PASSWORD', ''),
             'connect_timeout': int(os.environ.get('PRODMEMO_PG_CONNECT_TIMEOUT', '10')),
+            # A hung server or half-open socket must not freeze MCP tools that
+            # write back into ProdMemo: bound every statement and detect dead peers.
+            'options': '-c statement_timeout=%d' % int(
+                os.environ.get('PRODMEMO_PG_STATEMENT_TIMEOUT_MS', '15000')),
+            'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 10,
+            'keepalives_count': 3,
         })
 
     # --- connection -------------------------------------------------------
@@ -168,40 +175,47 @@ class ProdMemoDao:
                 self._conn = psycopg2.connect(**self._dsn)
             return self._conn
 
+    def _live_connection(self):
+        """The cached connection, or a new one if it died (server restart, idle
+        timeout): a closed socket only shows up on use, so ping it first."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as ping:
+                ping.execute("SELECT 1")
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            try:
+                conn.close()
+            except psycopg2.Error:
+                pass
+            self._conn = None
+            return self._connect()
+
+    @contextmanager
     def _cursor(self):
-        """Context manager yielding a cursor inside a transaction.
+        """Cursor inside one transaction, serialised on the DAO lock.
 
-        Reconnects once if the cached connection died (server restart, idle
-        timeout) so a long-lived MCP process recovers on its own.
+        The lock is always released (also when connecting fails), and a failing
+        rollback on a broken connection never masks the original error.
         """
-        dao = self
-
-        class _Ctx:
-            def __enter__(self):
-                dao._lock.acquire()
+        with self._lock:
+            conn = self._live_connection()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            try:
+                yield cur
+            except BaseException:
                 try:
-                    self.conn = dao._connect()
-                    self.cur = self.conn.cursor(
-                        cursor_factory=psycopg2.extras.RealDictCursor)
+                    conn.rollback()
                 except psycopg2.Error:
-                    dao._conn = None
-                    self.conn = dao._connect()
-                    self.cur = self.conn.cursor(
-                        cursor_factory=psycopg2.extras.RealDictCursor)
-                return self.cur
-
-            def __exit__(self, exc_type, exc, tb):
+                    self._conn = None
+                raise
+            else:
+                conn.commit()
+            finally:
                 try:
-                    if exc_type is None:
-                        self.conn.commit()
-                    else:
-                        self.conn.rollback()
-                    self.cur.close()
-                finally:
-                    dao._lock.release()
-                return False
-
-        return _Ctx()
+                    cur.close()
+                except psycopg2.Error:
+                    pass
 
     def ensure_schema(self):
         """Idempotent migration; safe to call on every startup."""
@@ -310,10 +324,18 @@ class ProdMemoDao:
                 SELECT alpha_id, date, value FROM prodmemo_pnl_points
                 WHERE alpha_id = ANY(%s) ORDER BY alpha_id, date
             """, (ids,))
-            for row in cur.fetchall():
-                out.setdefault(row['alpha_id'], {'alphaId': row['alpha_id'], 'records': []})
-                out[row['alpha_id']]['records'].append(
-                    [row['date'].strftime('%Y-%m-%d'), row['value']])
+            # Stream in chunks as plain tuples: a RealDictCursor fetchall() of every
+            # candidate's full history costs hundreds of MB per check.
+            while True:
+                rows = cur.fetchmany(5000)
+                if not rows:
+                    break
+                for row in rows:
+                    alpha_id, day, value = row['alpha_id'], row['date'], row['value']
+                    entry = out.get(alpha_id)
+                    if entry is None:
+                        entry = out[alpha_id] = {'alphaId': alpha_id, 'records': []}
+                    entry['records'].append([day.strftime('%Y-%m-%d'), value])
         return out
 
     def get_alpha(self, alpha_id):
@@ -457,7 +479,7 @@ class ProdMemoDao:
                     classifications = EXCLUDED.classifications,
                     is_metrics = EXCLUDED.is_metrics,
                     submitted = prodmemo_alphas.submitted OR EXCLUDED.submitted,
-                    no_longer_submitted = false,
+                    no_longer_submitted = prodmemo_alphas.no_longer_submitted AND NOT EXCLUDED.submitted,
                     group_key = EXCLUDED.group_key,
                     synced_at = now()
             """, rows, template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())")

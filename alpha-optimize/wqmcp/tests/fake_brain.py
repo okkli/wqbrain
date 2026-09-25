@@ -63,6 +63,7 @@ class FakeState:
     corr_412: bool = False
     check_ra_zero_once: bool = False
     saved_language: str = "FASTEXPR"
+    raa_children_pending: bool = False
 
     def tick(self, key: str) -> int:
         with self.lock:
@@ -309,7 +310,9 @@ def _get_alpha(fb, q, body, aid) -> Response:
         return 404, {}, {"detail": "Not found."}
     child = re.fullmatch(r"RAP.+C(USA|EUR|ASI|GLB)", aid)
     if child:
-        return 200, {}, alpha(aid, type="RA_CHILD", settings={"region": child.group(1), "universe": "TOP2000"})
+        extra = {"is": {}} if fb.state.raa_children_pending else {}
+        return 200, {}, alpha(aid, type="RA_CHILD", settings={"region": child.group(1), "universe": "TOP2000"},
+                              **extra)
     if aid.startswith("RAP"):
         return 200, {}, alpha(aid, type="RA_PARENT", children=[f"{aid}C{r}" for r in ("USA", "EUR", "ASI", "GLB")])
     return 200, {}, alpha(aid)

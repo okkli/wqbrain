@@ -17,6 +17,7 @@ machines without the ``mcp`` package installed.
 import math
 import re
 import sys
+from decimal import Decimal
 from datetime import datetime, timezone
 
 PROD_MEMO_ALGORITHM_VERSION = 2
@@ -48,16 +49,35 @@ def clamp_correlation(value):
 
 
 def js_number_str(value):
-    """Stringify a number the way a JS template literal does.
+    """Stringify a number exactly like JS ``String(x)`` / a template literal.
 
-    Integer-valued floats print without a trailing ``.0`` (JS ``${6}`` -> "6").
-    Other floats use repr(), which is shortest-roundtrip in both languages.
-    Only used inside fingerprints, where inputs are ordinary PnL/corr magnitudes.
+    ECMAScript Number::toString: shortest round-trip digits (Python's repr gives
+    the same digits), positional notation for 1e-7 < |x| < 1e21, otherwise an
+    exponent without zero padding ("1e-7", "1.5e+21"). Fingerprints must match
+    the browser extension byte for byte, including tiny PnL values.
     """
     number = float(value)
-    if math.isfinite(number) and number == int(number) and abs(number) < 1e21:
-        return str(int(number))
-    return repr(number)
+    if number != number:
+        return 'NaN'
+    if math.isinf(number):
+        return 'Infinity' if number > 0 else '-Infinity'
+    if number == 0:
+        return '0'
+    if number < 0:
+        return '-' + js_number_str(-number)
+    _, digit_tuple, exponent = Decimal(repr(number)).normalize().as_tuple()
+    digits = ''.join(map(str, digit_tuple))
+    k = len(digits)
+    n = exponent + k  # position of the decimal point relative to the digits
+    if k <= n <= 21:
+        return digits + '0' * (n - k)
+    if 0 < n <= 21:
+        return digits[:n] + '.' + digits[n:]
+    if -6 < n <= 0:
+        return '0.' + '0' * (-n) + digits
+    e = n - 1
+    mantissa = digits if k == 1 else digits[0] + '.' + digits[1:]
+    return f"{mantissa}e{'+' if e >= 0 else '-'}{abs(e)}"
 
 
 def _normalize_text(value):
@@ -469,7 +489,7 @@ def _extract_correlation_values(data):
     if rows is None:
         rows = []
     correlation_index = 5
-    properties = data.get('schema', {}).get('properties') if isinstance(data, dict) else None
+    properties = (data.get('schema') or {}).get('properties') if isinstance(data, dict) else None
     if isinstance(properties, list):
         for index, prop in enumerate(properties):
             if isinstance(prop, dict) and prop.get('name') == 'correlation':

@@ -40,6 +40,9 @@ PNL_BATCH_SIZE = 100
 PNL_CONCURRENCY = 3
 BACKFILL_CONCURRENCY = 2
 RETRY_DELAYS = (1, 2, 4)
+# "Never skip a page" still needs an end: after this long the sync fails loudly
+# (cron exits non-zero) instead of retrying for days.
+PAGE_RETRY_BUDGET_SECONDS = 1800
 PROGRESS_EVERY = 25
 PROD_THRESHOLD = 0.7
 # IS alpha 的 PnL 是懒生成: 首次 GET 返回 204/空并触发平台生成, 实测 10-60s
@@ -83,15 +86,28 @@ class FatalSyncError(Exception):
     """Auth failures (401/403) — retrying is pointless."""
 
 
-def _is_fatal(exc):
+def _status_of(exc):
     status = getattr(getattr(exc, 'response', None), 'status_code', None)
-    if status is None:
-        status = getattr(exc, 'status_code', None)
+    return status if status is not None else getattr(exc, 'status_code', None)
+
+
+def _is_fatal(exc):
+    """Errors retrying cannot fix: auth failures, other client errors on list
+    pages, and credd being unavailable (down / backoff / pending biometric)."""
+    if type(exc).__name__ == 'CreddUnavailable':
+        return True
+    status = _status_of(exc)
     if status in (401, 403):
         return True
     if status is not None and 400 <= status < 500 and status not in (408, 429):
         return True
     return False
+
+
+def _is_fatal_for_pnl(exc):
+    """For one alpha's PnL only auth/credd problems are fatal: a 404/410 on a
+    single alpha (e.g. no PnL for it) must not abort the whole sync."""
+    return type(exc).__name__ == 'CreddUnavailable' or _status_of(exc) in (401, 403)
 
 
 def _oldest_submitted_at(results):
@@ -174,6 +190,7 @@ class ProdMemoService:
         self.fetcher = fetcher
         self._sync_task = None
         self._stop_event = asyncio.Event()
+        self._start_lock = asyncio.Lock()
         self._schema_lock = asyncio.Lock()
         self._schema_ready = False
 
@@ -225,6 +242,7 @@ class ProdMemoService:
         skipping (prodmemoMain.js:55-69 withPersistentRetries).
         """
         attempt = 0
+        give_up_at = time.monotonic() + PAGE_RETRY_BUDGET_SECONDS
         while True:
             self._check_stopped()
             try:
@@ -234,6 +252,10 @@ class ProdMemoService:
             except Exception as exc:
                 if _is_fatal(exc):
                     raise FatalSyncError(str(exc)) from exc
+                if time.monotonic() > give_up_at:
+                    raise FatalSyncError(
+                        f'alpha page offset={offset} still failing after '
+                        f'{PAGE_RETRY_BUDGET_SECONDS // 60} minutes: {exc}') from exc
                 delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                 attempt += 1
                 logger.warning('alpha page offset=%s failed (attempt %s), retrying in %ss: %s',
@@ -248,7 +270,7 @@ class ProdMemoService:
         try:
             payload = await self.fetcher.get_alpha_pnl(alpha_id)
         except Exception as exc:
-            if _is_fatal(exc):
+            if _is_fatal_for_pnl(exc):
                 raise FatalSyncError(str(exc)) from exc
             logger.warning('pnl fetch failed for %s: %s', alpha_id, exc)
             return None, 'failed'
@@ -562,16 +584,19 @@ class ProdMemoService:
                 return {'started': False, 'stopping': False, 'reason': 'not_running'}
             self._stop_event.set()
             return {'started': False, 'stopping': True}
-        if self.is_running:
-            return {'started': False, 'reason': 'already_running',
-                    'sync': await self._db(self.dao.get_sync_meta)}
-        if self.fetcher is None:
-            raise RuntimeError('ProdMemo fetcher 未注入（应由 platform_functions.py 设置）。')
-        self._stop_event = asyncio.Event()
-        await self._progress(status='running', phase='starting', mode=mode,
-                             startedAt=datetime.now(timezone.utc).isoformat(),
-                             message='同步任务已启动。')
-        self._sync_task = asyncio.create_task(self._run_sync(mode))
+        async with self._start_lock:  # two concurrent calls must not start two syncs
+            if self.is_running:
+                return {'started': False, 'reason': 'already_running',
+                        'sync': await self._db(self.dao.get_sync_meta)}
+            if self.fetcher is None:
+                raise RuntimeError('ProdMemo fetcher 未注入（应由 platform_functions.py 设置）。')
+            self._stop_event = asyncio.Event()
+            # Reset run-scoped keys so a finished run never shows an old error.
+            await self._progress(status='running', phase='starting', mode=mode,
+                                 startedAt=datetime.now(timezone.utc).isoformat(),
+                                 error=None, current=None, total=None, success=None,
+                                 message='同步任务已启动。')
+            self._sync_task = asyncio.create_task(self._run_sync(mode))
         return {'started': True, 'mode': mode}
 
     @property
@@ -630,23 +655,28 @@ class ProdMemoService:
         if alpha_id not in snapshot['pnlStubs']:
             return {'available': False, 'reason': f'本地没有 Alpha {alpha_id} 的 PnL，请先同步。'}
 
-        stub_map = self._stub_pnl_map(snapshot)
-        existing = {(r['alphaId'], r['corrType']): r for r in snapshot['localCorrs']}
+        def describe():
+            stub_map = self._stub_pnl_map(snapshot)
+            existing = {(r['alphaId'], r['corrType']): r for r in snapshot['localCorrs']}
+            out = []
+            for corr_type in CORR_TYPES:
+                context = self._build_context(snapshot, target, corr_type)
+                fingerprint = calculation_fingerprint(
+                    corr_type=corr_type, target_alpha=target, target_pnl=stub_map[alpha_id],
+                    pnl_by_id=stub_map, candidates=context['candidates'],
+                    references=context['references'])
+                record = existing.get((alpha_id, corr_type))
+                fresh = (not force and record
+                         and record['algorithmVersion'] == PROD_MEMO_ALGORITHM_VERSION
+                         and record['inputFingerprint'] == fingerprint)
+                out.append({'corrType': corr_type, 'context': context,
+                            'fingerprint': fingerprint, 'record': record,
+                            'fresh': bool(fresh)})
+            return out
 
-        descriptors = []
-        for corr_type in CORR_TYPES:
-            context = self._build_context(snapshot, target, corr_type)
-            fingerprint = calculation_fingerprint(
-                corr_type=corr_type, target_alpha=target, target_pnl=stub_map[alpha_id],
-                pnl_by_id=stub_map, candidates=context['candidates'],
-                references=context['references'])
-            record = existing.get((alpha_id, corr_type))
-            fresh = (not force and record
-                     and record['algorithmVersion'] == PROD_MEMO_ALGORITHM_VERSION
-                     and record['inputFingerprint'] == fingerprint)
-            descriptors.append({'corrType': corr_type, 'context': context,
-                                'fingerprint': fingerprint, 'record': record,
-                                'fresh': bool(fresh)})
+        # Pure CPU work (hundreds of alphas x thousands of PnL points): keep it off
+        # the event loop so other MCP clients are not stalled.
+        descriptors = await asyncio.to_thread(describe)
 
         if all(d['fresh'] for d in descriptors):
             return {'available': True, 'reused': True, 'alphaId': alpha_id,
@@ -661,25 +691,30 @@ class ProdMemoService:
         pnl_by_id = await self._db(self.dao.load_pnl_points, sorted(needed))
 
         group_key = alpha_group_key(target)
-        rows, results = [], {}
-        for descriptor in descriptors:
-            corr_type = descriptor['corrType']
-            if descriptor['fresh']:
-                results[corr_type] = descriptor['record']['result']
-                continue
-            if corr_type == 'PROD_LOWER_BOUND':
-                result = calculate_prod_lower_bound(
-                    target_alpha=target, target_pnl=pnl_by_id.get(alpha_id),
-                    references=descriptor['context']['references'], pnl_by_id=pnl_by_id)
-            else:
-                result = calculate_local_correlation(
-                    target_alpha=target, target_pnl=pnl_by_id.get(alpha_id),
-                    candidates=descriptor['context']['candidates'],
-                    pnl_by_id=pnl_by_id, corr_type=corr_type)
-            results[corr_type] = result
-            rows.append({'alphaId': alpha_id, 'corrType': corr_type, 'groupKey': group_key,
-                         'result': result, 'algorithmVersion': PROD_MEMO_ALGORITHM_VERSION,
-                         'inputFingerprint': descriptor['fingerprint']})
+
+        def compute():
+            rows, results = [], {}
+            for descriptor in descriptors:
+                corr_type = descriptor['corrType']
+                if descriptor['fresh']:
+                    results[corr_type] = descriptor['record']['result']
+                    continue
+                if corr_type == 'PROD_LOWER_BOUND':
+                    result = calculate_prod_lower_bound(
+                        target_alpha=target, target_pnl=pnl_by_id.get(alpha_id),
+                        references=descriptor['context']['references'], pnl_by_id=pnl_by_id)
+                else:
+                    result = calculate_local_correlation(
+                        target_alpha=target, target_pnl=pnl_by_id.get(alpha_id),
+                        candidates=descriptor['context']['candidates'],
+                        pnl_by_id=pnl_by_id, corr_type=corr_type)
+                results[corr_type] = result
+                rows.append({'alphaId': alpha_id, 'corrType': corr_type, 'groupKey': group_key,
+                             'result': result, 'algorithmVersion': PROD_MEMO_ALGORITHM_VERSION,
+                             'inputFingerprint': descriptor['fingerprint']})
+            return rows, results
+
+        rows, results = await asyncio.to_thread(compute)
         if rows:
             await self._db(self.dao.save_local_corrs, rows)
         return {'available': True, 'reused': False, 'alphaId': alpha_id, 'results': results}
@@ -956,8 +991,12 @@ class ProdMemoService:
             if alpha_id not in alpha_by_id and alpha_id not in snapshot['platformCorrs']:
                 return {'found': False, 'alpha_id': alpha_id,
                         'reason': '本地没有该 Alpha 的任何记录，请先同步或执行 prodmemo_check。'}
-            return {'found': True, **card(alpha_id)}
+            return {'found': True, **await asyncio.to_thread(card, alpha_id)}
+        return await asyncio.to_thread(self._list_cards, snapshot, alpha_by_id, card,
+                                       stale_only, above, group_key, limit)
 
+    @staticmethod
+    def _list_cards(snapshot, alpha_by_id, card, stale_only, above, group_key, limit):
         candidate_ids = sorted(
             set(alpha_by_id) | set(snapshot['platformCorrs']),
             key=lambda i: (alpha_by_id.get(i, {}).get('dateSubmitted') or '', i),

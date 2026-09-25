@@ -48,8 +48,20 @@ from pathlib import Path
 # Forum client (support.worldquantbrain.com, headless browser); created below
 # with this module's BRAIN session cookies injected.
 from forum_functions import ForumClient
-from prodmemo_service import prodmemo_client
 from prodmemo_calc import extract_platform_correlation_stats
+try:
+    from prodmemo_service import prodmemo_client
+except ImportError as _prodmemo_import_error:  # psycopg2 missing: keep the other tools working
+    class _ProdMemoUnavailable:
+        fetcher = None
+        _reason = f"ProdMemo is unavailable ({_prodmemo_import_error}); pip install psycopg2-binary"
+
+        def __getattr__(self, name):
+            async def unavailable(*args, **kwargs):
+                raise RuntimeError(self._reason)
+            return unavailable
+
+    prodmemo_client = _ProdMemoUnavailable()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -472,6 +484,8 @@ class BrainApiClient:
         self._submit_locks: Dict[str, asyncio.Lock] = {}
         self._pending_submits: set = set()
         self._submit_results: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        # Fire-and-forget work (ProdMemo write-backs) kept alive until done.
+        self._background: set = set()
     
     def log(self, message: str, level: str = "INFO"):
         """Log messages to stderr to avoid MCP protocol interference."""
@@ -540,8 +554,9 @@ class BrainApiClient:
                 await asyncio.sleep(min(cooldown, 30.0))  # cooldown itself is capped at 30s
             try:
                 resp = await loop.run_in_executor(self._executor, lambda: func(url, **kwargs))
-            except requests.RequestException:
-                if last:
+            except (requests.ConnectionError, requests.Timeout):
+                # Transient; anything else (bad URL, TLS config...) will not heal.
+                if last or not is_get:
                     raise
                 await asyncio.sleep(2.0 * (attempt + 1))
                 continue
@@ -626,10 +641,14 @@ class BrainApiClient:
         # `children` simulations. Handle it before the generic multi branch, which
         # would report the children and silently drop the parent (the submittable id).
         if str(body.get("type") or "").upper() in ("REGION_AGNOSTIC", "RA_PARENT") or (children and body.get("alpha")):
-            if body.get("alpha"):
-                return {**await self.get_raa_alpha(body["alpha"]),
-                        "status": "COMPLETE", "progress_url": location}
-            if "Retry-After" in resp.headers or str(body.get("status") or "").upper() in ("RUNNING", "PENDING"):
+            running = ("Retry-After" in resp.headers
+                       or str(body.get("status") or "").upper() in ("RUNNING", "PENDING"))
+            if body.get("alpha") and not running:
+                summary = await self.get_raa_alpha(body["alpha"])
+                status = "ERROR" if summary.get("error") else (
+                    "RUNNING" if summary.get("children_pending") else "COMPLETE")
+                return {**summary, "status": status, "progress_url": location}
+            if running or body.get("alpha"):
                 return {
                     "status": "RUNNING",
                     "type": "REGION_AGNOSTIC",
@@ -961,7 +980,12 @@ class BrainApiClient:
 
         rows = list(await asyncio.gather(*[child_row(c) for c in child_ids]))
         settings = parent.get("settings") or {}
-        ok = [r for r in rows if not r.get("error")]
+        # A child without checks yet has not finished computing: it must not count
+        # as "no FAIL" (that would suggest the RAA is ready to submit).
+        pending = [r for r in rows if not r.get("error") and r.get("sharpe") is None and not r.get("fails")]
+        for r in pending:
+            r["pending"] = True
+        ok = [r for r in rows if not r.get("error") and not r.get("pending")]
         no_fail = [r for r in ok if not r.get("fails")]
         clean = [r for r in no_fail if not r.get("warnings")]
         return {
@@ -974,6 +998,7 @@ class BrainApiClient:
             "children": rows,
             "children_without_fails": len(no_fail),
             "children_without_warnings": len(clean),
+            "children_pending": len(pending),
             "note": ("Submission needs >=2 children with no FAIL. Then run "
                      "check_correlation on those children: one child passing PROD "
                      "correlation lets all passing children be submitted together "
@@ -1599,12 +1624,18 @@ class BrainApiClient:
             try:
                 resp = await self._request('get', url)
             except requests.RequestException as e:
-                return {"status": "ERROR", "error": f"network error: {e}"}
-            if resp.status_code >= 400:
+                resp, net_error = None, str(e)
+            busy = resp is None or resp.status_code in (429, 503) or resp.status_code >= 500
+            if resp is not None and resp.status_code >= 400 and not busy:
                 return {"status": "ERROR", "http_status": resp.status_code,
                         "error": _http_error_detail(resp)}
-            ra = _retry_after_seconds(resp)
-            text = (resp.text or "").strip()
+            ra = _retry_after_seconds(resp) if resp is not None else 0.0
+            text = "" if busy else (resp.text or "").strip()
+            if busy and deadline - time.monotonic() <= 0:
+                # Throttled (the catalog lists 429/503 for this polling endpoint):
+                # report "not ready yet", not a failure.
+                return {"status": "PENDING", "retry_after_seconds": ra or 10.0,
+                        "busy": net_error if resp is None else f"HTTP {resp.status_code}"}
             if text and "Retry-After" not in resp.headers:
                 try:
                     data = resp.json()
@@ -1642,12 +1673,21 @@ class BrainApiClient:
     async def _record_platform_corr(self, alpha_id: str, kind: str, max_v: Any,
                                     min_v: Any = None, source: str = "platform") -> None:
         """Write an officially measured correlation back into ProdMemo, so it becomes
-        a reference point. Best effort: ProdMemo's database being down must never
-        break the platform tool that measured the value."""
-        try:
-            await prodmemo_client.record_platform_corr(alpha_id, kind, max_v, min_v, source)
-        except Exception as e:
-            self.log(f"ProdMemo write-back skipped for {alpha_id} ({kind}): {e}", "WARNING")
+        a reference point. Best effort and in the background: for a Prod value the
+        write-back also backfills the alpha's metadata + PnL (minutes for a PnL that
+        is still generating), and a slow or down database must never delay or break
+        the platform tool that measured the value."""
+        async def write_back() -> None:
+            try:
+                await asyncio.wait_for(
+                    prodmemo_client.record_platform_corr(alpha_id, kind, max_v, min_v, source),
+                    timeout=float(os.environ.get("PRODMEMO_WRITEBACK_TIMEOUT", "300")))
+            except Exception as e:  # includes TimeoutError
+                self.log(f"ProdMemo write-back skipped for {alpha_id} ({kind}): {e!r}", "WARNING")
+
+        task = asyncio.create_task(write_back())
+        self._background.add(task)  # keep a reference until it finishes
+        task.add_done_callback(self._background.discard)
 
     async def check_correlation(self, alpha_id: str, correlation_type: str = "both",
                                 threshold: float = 0.7, max_wait: float = 60,
@@ -3117,9 +3157,32 @@ _KWONLY_OPERATORS = {
 }
 
 
+def _strip_strings_and_comments(expr: str) -> str:
+    """Blank out quoted strings ('..' or "..") and # comments, keeping offsets."""
+    out, quote_char, in_comment = [], None, False
+    for ch in expr:
+        if in_comment:
+            in_comment = ch != "\n"
+            out.append(ch if ch == "\n" else " ")
+        elif quote_char:
+            if ch == quote_char:
+                quote_char = None
+            out.append(" ")
+        elif ch in ("'", '"'):
+            quote_char = ch
+            out.append(" ")
+        elif ch == "#":
+            in_comment = True
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _lint_expression(expr: str) -> List[str]:
     """Cheap pre-flight check: unbalanced parentheses and optional operator
     arguments passed positionally. Returns a list of problems (empty = OK)."""
+    expr = _strip_strings_and_comments(expr)
     if expr.count("(") != expr.count(")"):
         return ["unbalanced parentheses"]
     problems = []
