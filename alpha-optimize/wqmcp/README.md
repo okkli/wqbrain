@@ -144,3 +144,29 @@ claude mcp add --transport http brain-platform http://127.0.0.1:8761/mcp
 pip install -r requirements-dev.txt
 python -m pytest            # fake BRAIN + credd 在进程内运行，不访问真实平台
 ```
+
+## 真实平台回归（live regression）
+
+`scripts/live_regression.py` 用 credd 提供的登录，通过一个真实的 MCP 会话逐个调用工具，并对
+审计里标记为 UNVERIFIABLE 的项目做探测：super-selection 参数名、完成时的 Retry-After、
+list_alphas 的未文档化过滤、tags 格式、比赛协议端点、论坛 SSO。
+
+```bash
+export CREDD_URL=http://127.0.0.1:8762      # credd 地址
+export CREDD_TOKEN=...                      # credd 要求令牌时才需要
+python scripts/live_regression.py                          # 只读（默认）
+python scripts/live_regression.py --writes                 # 另建 2 个模拟，并对产出 alpha 的元数据改完再还原
+python scripts/live_regression.py --forum                  # 另测论坛工具（需要 Playwright）
+python scripts/live_regression.py --selection "<表达式>"   # 另测 super-selection 参数名
+```
+
+脚本**从不提交 alpha**，`submit_alpha` 只以 `confirm=False` 调用。结果打印成表格，同时写入
+`live_regression_report.json`：FAIL 表示回归失败，INFO 是给人看的实测结论（例如 Retry-After
+的实际取值）。退出码 0 表示没有 FAIL。
+
+MCP 服务进程和这个脚本都从**自身的环境变量**读取 `CREDD_URL` / `CREDD_TOKEN`：
+
+- HTTP 方式：在启动 `python server.py` 的 shell 或 systemd unit 里设置。
+- stdio 方式：由 MCP 客户端拉起进程，在客户端配置里传入，例如
+  `claude mcp add -e CREDD_URL=http://127.0.0.1:8762 -e CREDD_TOKEN=... -e WQMCP_TRANSPORT=stdio brain-platform -- python /path/to/wqmcp/server.py`，
+  或者在 `.mcp.json` 的 `env` 字段里写 `"CREDD_TOKEN": "${CREDD_TOKEN}"`，引用外部环境变量，避免把令牌写进仓库。
