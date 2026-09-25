@@ -16,6 +16,7 @@ import json
 import asyncio
 import logging
 from typing import Dict, List, Optional, Any, Union, Tuple
+from urllib.parse import quote, urlsplit
 import re
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, asdict
@@ -44,8 +45,9 @@ from pydantic import BaseModel
 
 from pathlib import Path
 
-# Import the new forum client
-from forum_functions import forum_client
+# Forum client (support.worldquantbrain.com, headless browser); created below
+# with this module's BRAIN session cookies injected.
+from forum_functions import ForumClient
 from prodmemo_service import prodmemo_client
 from prodmemo_calc import extract_platform_correlation_stats
 
@@ -65,6 +67,75 @@ def _retry_after_seconds(response: requests.Response) -> float:
 
 # Transient statuses a GET may retry (BRAIN's rate limit and gateway hiccups).
 _RETRYABLE_STATUS = (429, 502, 503, 504)
+
+# --- Deployment switches (see README.md) -------------------------------------
+BRAIN_BASE_URL = os.environ.get("WQMCP_BASE_URL", "https://api.worldquantbrain.com").rstrip("/")
+_BRAIN_PARTS = urlsplit(BRAIN_BASE_URL)
+# Kill switches: READ_ONLY blocks every write tool; ALLOW_SUBMIT=0 blocks submissions.
+READ_ONLY = os.environ.get("WQMCP_READ_ONLY", "0") == "1"
+ALLOW_SUBMIT = os.environ.get("WQMCP_ALLOW_SUBMIT", "1") != "0"
+# Versioned Accept headers from the API catalog. Off by default: the unversioned
+# requests are what has been verified in production; turn on after a live check.
+SEND_ACCEPT_VERSIONS = os.environ.get("WQMCP_ACCEPT_VERSIONS", "0") == "1"
+
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
+
+
+def _seg(value: Any, name: str) -> str:
+    """Validate + percent-encode one URL path segment taken from a tool argument.
+
+    Rejects '/', '..', '?', '#', whitespace etc., so an id can never make a request
+    address another BRAIN endpoint (e.g. alpha_id='../users/self')."""
+    text = str(value).strip() if value is not None else ""
+    if not _SEGMENT_RE.match(text) or ".." in text:
+        raise ValueError(f"invalid {name}: {value!r}")
+    return quote(text, safe="")
+
+
+def _simulation_url(ref: Any) -> str:
+    """Normalise a simulation id or progress URL to the canonical BRAIN URL.
+
+    Only the BRAIN API host and the /simulations/<id> path are accepted, so a
+    tool argument cannot make this server fetch arbitrary URLs (SSRF)."""
+    text = str(ref or "").strip()
+    if "://" in text:
+        parts = urlsplit(text)
+        m = re.fullmatch(r"/simulations/([^/]+)/?", parts.path or "")
+        if (parts.scheme != _BRAIN_PARTS.scheme or parts.hostname != _BRAIN_PARTS.hostname
+                or parts.port != _BRAIN_PARTS.port or not m or parts.query or parts.fragment):
+            raise ValueError(f"not a BRAIN simulation URL: {text!r}")
+        text = m.group(1)
+    return f"{BRAIN_BASE_URL}/simulations/{_seg(text, 'simulation id')}"
+
+
+_ACCEPT_RULES = tuple((m, re.compile(p), v) for m, p, v in (
+    ("OPTIONS", r"^/simulations$", "3.0"),
+    ("GET", r"^/users/self/alphas$", "4.0"),
+    ("GET", r"^/users/self/alphas/summary$", "4.0"),
+    ("GET", r"^/alphas/[^/]+/alphas$", "4.0"),
+    ("GET", r"^/tags/[^/]+/alphas$", "4.0"),
+    ("GET", r"^/suggest/fields$", "4.0"),
+    ("GET", r"^/data-fields/summary$", "3.0"),
+    ("GET", r"^/users/self/activities/base-payment$", "3.0"),
+))
+
+
+def _accept_header(method: str, url: str) -> Optional[str]:
+    """The catalog's versioned Accept header for a BRAIN URL (None when disabled)."""
+    if not SEND_ACCEPT_VERSIONS or not str(url).startswith(BRAIN_BASE_URL):
+        return None
+    path = urlsplit(str(url)).path
+    for m, pattern, version in _ACCEPT_RULES:
+        if m == method.upper() and pattern.match(path):
+            return f"application/json;version={version}"
+    return "application/json;version=2.0"
+
+
+def _json_or_none(response: requests.Response) -> Any:
+    try:
+        return response.json() if (response.text or "").strip() else None
+    except ValueError:
+        return None
 
 
 def _http_error_detail(response: requests.Response, context: str = "") -> str:
@@ -162,6 +233,23 @@ def _compact_alpha_row(alpha: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _pyramid_key(p: Dict[str, Any]) -> str:
+    """Same key for an alpha's pyramid entry and a pyramid-multipliers row."""
+    if p.get("name"):
+        return str(p["name"])
+    cat = p.get("category") or {}
+    cat_name = (cat.get("name") or cat.get("id")) if isinstance(cat, dict) else cat
+    return f"{p.get('region')}/D{p.get('delay')}/{cat_name}"
+
+
+def _alpha_pyramid_keys(alpha: Dict[str, Any]) -> List[str]:
+    ps = alpha.get("pyramids")
+    if not isinstance(ps, list):
+        pt = alpha.get("pyramidThemes") or {}
+        ps = pt.get("pyramids") if isinstance(pt, dict) else None
+    return [_pyramid_key(p) for p in ps or [] if isinstance(p, dict)]
+
+
 def _finite(value: Any) -> Optional[float]:
     try:
         f = float(value)
@@ -200,7 +288,9 @@ def _correlation_top_rows(data: Dict[str, Any], n: int) -> List[Dict[str, Any]]:
 # no login of its own. See brain-serve/creds-daemon/README.md for the contract.
 CREDD_URL = os.environ.get("CREDD_URL", "http://127.0.0.1:8762").rstrip("/")
 CREDD_TOKEN = os.environ.get("CREDD_TOKEN", "")
-_BRAIN_COOKIE_DOMAIN = ".worldquantbrain.com"
+_BRAIN_HOST = _BRAIN_PARTS.hostname or ""
+_BRAIN_COOKIE_DOMAIN = (".worldquantbrain.com" if _BRAIN_HOST.endswith("worldquantbrain.com")
+                        else _BRAIN_HOST)
 
 
 class CreddUnavailable(RuntimeError):
@@ -224,6 +314,9 @@ class CreddSession(requests.Session):
         self._credd_timeout = credd_timeout
         self._refresh_lock = threading.Lock()
         self._cookie_version: Optional[str] = None
+        # (stale version, monotonic time) of the last refresh attempt: concurrent
+        # 401s while credd is in backoff must not each hit credd in turn.
+        self._last_attempt: Tuple[Optional[str], float] = (None, 0.0)
         self.refresh_cookies()
 
     def _fetch_from_credd(self) -> Tuple[Dict[str, str], Optional[str]]:
@@ -253,13 +346,27 @@ class CreddSession(requests.Session):
             raise CreddUnavailable(msg)
         return r.json(), r.headers.get("X-Cookie-Version")
 
-    def refresh_cookies(self) -> Optional[str]:
-        """Replace the whole cookie jar from credd; returns the cookie version."""
+    def refresh_cookies(self, stale_version: Optional[str] = None) -> Optional[str]:
+        """Replace the whole cookie jar from credd; returns the cookie version.
+
+        With stale_version (the version a failed request used): skip the fetch if
+        another thread already moved past it, or if the same stale version was
+        tried in the last 10s (credd in backoff hands out the same cookie)."""
         with self._refresh_lock:
-            cookies, version = self._fetch_from_credd()
+            if stale_version is not None:
+                if self._cookie_version != stale_version:
+                    return self._cookie_version
+                tried_version, tried_at = self._last_attempt
+                if tried_version == stale_version and time.monotonic() - tried_at < 10.0:
+                    return self._cookie_version
+            try:
+                cookies, version = self._fetch_from_credd()
+            finally:
+                self._last_attempt = (stale_version, time.monotonic())
             jar = requests.cookies.RequestsCookieJar()
+            secure = _BRAIN_PARTS.scheme == "https"
             for name, value in cookies.items():
-                jar.set(name, value, domain=_BRAIN_COOKIE_DOMAIN, path="/")
+                jar.set(name, value, domain=_BRAIN_COOKIE_DOMAIN, path="/", secure=secure)
             self.cookies = jar  # atomic rebind — never a partially-cleared jar
             self._cookie_version = version
             return version
@@ -271,10 +378,10 @@ class CreddSession(requests.Session):
         # our failed request never used the refreshed jar.
         version_used = self._cookie_version
         resp = super().request(method, url, *args, **kwargs)
-        if not (resp.status_code == 401 and "worldquantbrain.com" in str(url)):
+        if not (resp.status_code == 401 and urlsplit(str(url)).hostname == _BRAIN_HOST):
             return resp
         try:
-            new_version = self.refresh_cookies()
+            new_version = self.refresh_cookies(stale_version=version_used)
         except CreddUnavailable:
             return resp  # credd down → surface the original 401, don't mask it
         if version_used is not None and new_version == version_used:
@@ -340,7 +447,7 @@ class BrainApiClient:
     """WorldQuant BRAIN API client with comprehensive functionality."""
     
     def __init__(self):
-        self.base_url = "https://api.worldquantbrain.com"
+        self.base_url = BRAIN_BASE_URL
         # Login state lives in credd (creds-daemon). The session is a lazily
         # created CreddSession: cookies come from credd, a BRAIN 401 self-heals
         # by re-pulling cookies from credd (thread-safe, atomic jar swap).
@@ -361,6 +468,10 @@ class BrainApiClient:
         )
         # Monotonic deadline set by a GET 429; every GET waits it out first.
         self._cooldown_until = 0.0
+        # submit_alpha bookkeeping: one POST per alpha, resumable polling.
+        self._submit_locks: Dict[str, asyncio.Lock] = {}
+        self._pending_submits: set = set()
+        self._submit_results: Dict[str, Tuple[float, Dict[str, Any]]] = {}
     
     def log(self, message: str, level: str = "INFO"):
         """Log messages to stderr to avoid MCP protocol interference."""
@@ -386,8 +497,7 @@ class BrainApiClient:
             pool_connections=4,
             pool_maxsize=int(os.environ.get("WQMCP_POOL_MAXSIZE", "32")),
         )
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
+        session.mount(f"{_BRAIN_PARTS.scheme}://", adapter)
         session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
@@ -416,6 +526,9 @@ class BrainApiClient:
         """
         session = await self._ensure_session()
         kwargs.setdefault('timeout', self.request_timeout)
+        accept = _accept_header(method, url)
+        if accept:
+            kwargs['headers'] = {"Accept": accept, **(kwargs.get('headers') or {})}
         loop = asyncio.get_running_loop()
         func = getattr(session, method)
         is_get = method.lower() == 'get'
@@ -424,7 +537,7 @@ class BrainApiClient:
             last = attempt == attempts - 1
             cooldown = self._cooldown_until - time.monotonic()
             if is_get and cooldown > 0:
-                await asyncio.sleep(min(cooldown, 30.0))
+                await asyncio.sleep(min(cooldown, 30.0))  # cooldown itself is capped at 30s
             try:
                 resp = await loop.run_in_executor(self._executor, lambda: func(url, **kwargs))
             except requests.RequestException:
@@ -441,6 +554,47 @@ class BrainApiClient:
             await asyncio.sleep(min(wait, 15.0))
         return resp
 
+    async def cookie_list(self) -> List[Dict[str, Any]]:
+        """Current BRAIN session cookies (for the forum's headless browser)."""
+        session = await self._ensure_session()
+        return [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
+                 "secure": True, "httpOnly": True} for c in session.cookies]
+
+    async def _poll(self, url: str, max_wait: float) -> Dict[str, Any]:
+        """Follow BRAIN's Retry-After protocol on a GET until done or max_wait runs out.
+
+        Returns {"status": "DONE", "data": <json or None>} once a 2xx arrives without
+        Retry-After, {"status": "PENDING", "retry_after_seconds": s} while the
+        platform is still computing (or busy: 429/5xx after _request's retries),
+        and {"status": "ERROR", "http_status": n, "error": ...} on any other 4xx.
+        """
+        deadline = time.monotonic() + max(0.0, min(float(max_wait or 0), 300.0))
+        while True:
+            try:
+                resp = await self._request('get', url)
+            except requests.RequestException as e:
+                resp, net_error = None, str(e)
+            if resp is not None and 400 <= resp.status_code < 500 and resp.status_code != 429:
+                return {"status": "ERROR", "http_status": resp.status_code, "error": _http_error_detail(resp),
+                        "json": _json_or_none(resp)}
+            busy = resp is None or resp.status_code == 429 or resp.status_code >= 500
+            ra = _retry_after_seconds(resp) if resp is not None else 0.0
+            if not busy and "Retry-After" not in resp.headers:
+                text = (resp.text or "").strip()
+                if not text:
+                    return {"status": "DONE", "data": None}
+                try:
+                    return {"status": "DONE", "data": resp.json()}
+                except ValueError:
+                    return {"status": "ERROR", "error": "non-JSON body", "body": text[:300]}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                out = {"status": "PENDING", "retry_after_seconds": max(ra, 5.0 if busy else 1.0)}
+                if busy:
+                    out["busy"] = net_error if resp is None else f"HTTP {resp.status_code}"
+                return out
+            await asyncio.sleep(max(1.0, min(ra or 5.0, remaining)))
+
     async def _check_once(self, location: str, compact: bool = True) -> Dict[str, Any]:
         """One status check of a simulation location — single or multi.
 
@@ -449,7 +603,13 @@ class BrainApiClient:
         compact=True returns one _compact_alpha_row per finished alpha instead of
         the full alpha object.
         """
+        location = _simulation_url(location)
         resp = await self._request('get', location)
+        if resp.status_code == 429 or resp.status_code >= 500:
+            # Still busy after _request's own retries: not a verdict on the simulation.
+            return {"status": "RUNNING", "http_status": resp.status_code, "progress_url": location,
+                    "retry_after_seconds": _retry_after_seconds(resp) or 10.0,
+                    "note": "BRAIN is busy; check again after retry_after_seconds."}
         if resp.status_code >= 400:
             return {"status": "ERROR", "http_status": resp.status_code,
                     "progress_url": location, "body": (resp.text or "")[:500]}
@@ -482,6 +642,16 @@ class BrainApiClient:
             # Settled without a parent alpha → fall through so the per-child
             # simulation errors are surfaced instead of a bare status.
 
+        if children and "Retry-After" in resp.headers:
+            # Parent still running: honour its Retry-After instead of fanning out
+            # one request per child on every check.
+            return {
+                "status": "RUNNING", "type": "MULTI", "progress": body.get("progress"),
+                "total_children": len(children),
+                "retry_after_seconds": _retry_after_seconds(resp) or 5.0,
+                "progress_url": location,
+                "note": "Multi-simulation still running; check again after retry_after_seconds.",
+            }
         if children:
             return await self._check_multi_children(location, children, compact)
 
@@ -499,8 +669,9 @@ class BrainApiClient:
         if not alpha_id:
             # Failed simulation: surface BRAIN's own error message.
             return {"status": body.get("status", "ERROR"), "progress_url": location,
-                    "message": body.get("message"), "raw": body}
-        alpha = await self._request('get', f"{self.base_url}/alphas/{alpha_id}")
+                    "message": body.get("message") or body.get("detail") or body.get("details"),
+                    "raw": body}
+        alpha = await self._request('get', f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}")
         alpha.raise_for_status()
         if compact:
             return {"status": "COMPLETE", "progress_url": location,
@@ -512,16 +683,22 @@ class BrainApiClient:
     async def _check_multi_children(self, location: str, children: List[str],
                                     compact: bool = True) -> Dict[str, Any]:
         """Check all children of a multi-simulation concurrently."""
-        child_urls = [c if str(c).startswith('http') else f"{self.base_url}/simulations/{c}"
-                      for c in children]
-
-        async def child_state(url: str) -> Dict[str, Any]:
+        async def child_state(child: Any) -> Dict[str, Any]:
+            try:
+                url = _simulation_url(child)
+            except ValueError as e:
+                return {"location": str(child), "status": "ERROR", "error": str(e)}
             try:
                 r = await self._request('get', url)
             except Exception as e:
                 return {"location": url, "status": "UNKNOWN", "error": str(e)}
+            if r.status_code == 429 or r.status_code >= 500:
+                # Busy is not finished: counting it as settled would report the
+                # whole batch COMPLETE and silently drop this child's result.
+                return {"location": url, "status": "UNKNOWN", "http_status": r.status_code}
             if r.status_code >= 400:
-                return {"location": url, "status": "ERROR", "http_status": r.status_code}
+                return {"location": url, "status": "ERROR", "http_status": r.status_code,
+                        "error": (r.text or "")[:300]}
             try:
                 b = r.json() if (r.text or "").strip() else {}
             except ValueError:
@@ -531,10 +708,10 @@ class BrainApiClient:
             alpha_id = b.get("alpha")
             if not alpha_id:
                 return {"location": url, "status": b.get("status", "ERROR"),
-                        "message": b.get("message")}
+                        "message": b.get("message") or b.get("detail") or b.get("details")}
             return {"location": url, "status": "COMPLETE", "alpha_id": alpha_id}
 
-        states = list(await asyncio.gather(*[child_state(u) for u in child_urls]))
+        states = list(await asyncio.gather(*[child_state(c) for c in children]))
         unfinished = [s for s in states if s["status"] in ("RUNNING", "UNKNOWN")]
         if unfinished:
             done_n = len(states) - len(unfinished)
@@ -554,7 +731,7 @@ class BrainApiClient:
             if s["status"] != "COMPLETE":
                 return s
             try:
-                d = await self._request('get', f"{self.base_url}/alphas/{s['alpha_id']}")
+                d = await self._request('get', f"{self.base_url}/alphas/{_seg(s['alpha_id'], 'alpha id')}")
                 d.raise_for_status()
                 if compact:
                     return {"status": "COMPLETE", **_compact_alpha_row(d.json())}
@@ -630,11 +807,11 @@ class BrainApiClient:
         await self._ensure_session()
     
     async def get_authentication_status(self) -> Optional[Dict[str, Any]]:
-        """Get current authentication status and user info."""
+        """Current login as reported by GET /authentication (user id, expiry, permissions)."""
         try:
-            response = await self._request('get', f"{self.base_url}/users/self")
+            response = await self._request('get', f"{self.base_url}/authentication")
             response.raise_for_status()
-            return response.json()
+            return response.json() if (response.text or "").strip() else {}
         except Exception as e:
             self.log(f"Failed to get auth status: {str(e)}", "ERROR")
             return None
@@ -765,7 +942,7 @@ class BrainApiClient:
         lives on its RA_CHILD alphas, so they are fetched concurrently."""
         await self.ensure_authenticated()
 
-        parent_resp = await self._request('get', f"{self.base_url}/alphas/{parent_alpha_id}")
+        parent_resp = await self._request('get', f"{self.base_url}/alphas/{_seg(parent_alpha_id, 'alpha id')}")
         parent_resp.raise_for_status()
         parent = parent_resp.json()
         child_ids = parent.get("children") or []
@@ -776,7 +953,7 @@ class BrainApiClient:
 
         async def child_row(cid: str) -> Dict[str, Any]:
             try:
-                r = await self._request('get', f"{self.base_url}/alphas/{cid}")
+                r = await self._request('get', f"{self.base_url}/alphas/{_seg(cid, 'alpha id')}")
                 r.raise_for_status()
                 return _raa_child_row(r.json())
             except Exception as e:
@@ -810,7 +987,7 @@ class BrainApiClient:
         await self.ensure_authenticated()
         
         try:
-            response = await self._request('get', f"{self.base_url}/alphas/{alpha_id}")
+            response = await self._request('get', f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}")
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -818,7 +995,8 @@ class BrainApiClient:
             raise
     
     async def get_datasets(self, instrument_type: str = "EQUITY", region: str = "USA",
-                          delay: int = 1, universe: str = "TOP3000", theme: str = "false", search: Optional[str] = None) -> Dict[str, Any]:
+                          delay: int = 1, universe: str = "TOP3000", theme: str = "false", search: Optional[str] = None,
+                          limit: Optional[int] = None, offset: int = 0) -> Dict[str, Any]:
         """Get available datasets."""
         await self.ensure_authenticated()
         
@@ -833,6 +1011,10 @@ class BrainApiClient:
             
             if search:
                 params['search'] = search
+            if limit:
+                params['limit'] = max(1, min(int(limit), 50))
+            if offset:
+                params['offset'] = max(0, int(offset))
             
             response = await self._request('get', f"{self.base_url}/data-sets", params=params)
             response.raise_for_status()
@@ -846,8 +1028,9 @@ class BrainApiClient:
     async def get_datafields(self, instrument_type: str = "EQUITY", region: str = "USA",
                             delay: int = 1, universe: str = "TOP3000", theme: str = "false",
                             dataset_id: Optional[str] = None, data_type: str = "",
-                            search: Optional[str] = None) -> Dict[str, Any]:
-        """Get available data fields."""
+                            search: Optional[str] = None, limit: int = 50,
+                            offset: int = 0) -> Dict[str, Any]:
+        """Get available data fields (paged: limit <= 100, offset)."""
         await self.ensure_authenticated()
         
         try:
@@ -856,11 +1039,11 @@ class BrainApiClient:
                 'region': region,
                 'delay': delay,
                 'universe': universe,
-                'limit': '50',
-                'offset': '0'
+                'limit': max(1, min(int(limit or 50), 100)),
+                'offset': max(0, int(offset or 0)),
             }
             
-            if data_type != 'ALL':
+            if data_type and data_type != 'ALL':
                 params['type'] = data_type
             
             if dataset_id:
@@ -877,70 +1060,17 @@ class BrainApiClient:
             self.log(f"Failed to get datafields: {str(e)}", "ERROR")
             raise
     
-    async def get_alpha_pnl(self, alpha_id: str) -> Dict[str, Any]:
-        """Get PnL data for an alpha with retry logic."""
-        await self.ensure_authenticated()
-        
-        max_retries = 5
-        retry_delay = 2  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                self.log(f"Attempting to get PnL for alpha {alpha_id} (attempt {attempt + 1}/{max_retries})", "INFO")
-                
-                response = await self._request('get', f"{self.base_url}/alphas/{alpha_id}/recordsets/pnl")
-                response.raise_for_status()
+    async def get_alpha_pnl(self, alpha_id: str, max_wait: float = 30) -> Dict[str, Any]:
+        """PnL recordset, following BRAIN's Retry-After protocol.
 
-                # Some alphas may return 204 No Content or an empty body
-                text = (response.text or "").strip()
-                if not text:
-                    if attempt < max_retries - 1:
-                        self.log(f"Empty PnL response for {alpha_id}, retrying in {retry_delay} seconds...", "WARNING")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 1.5  # Exponential backoff
-                        continue
-                    else:
-                        self.log(f"Empty PnL response after {max_retries} attempts for {alpha_id}", "WARNING")
-                        return {}
-                
-                try:
-                    pnl_data = response.json()
-                    if pnl_data:
-                        self.log(f"Successfully retrieved PnL data for alpha {alpha_id}", "SUCCESS")
-                        return pnl_data
-                    else:
-                        if attempt < max_retries - 1:
-                            self.log(f"Empty PnL JSON for {alpha_id}, retrying in {retry_delay} seconds...", "WARNING")
-                            await asyncio.sleep(retry_delay)
-                            retry_delay *= 1.5
-                            continue
-                        else:
-                            self.log(f"Empty PnL JSON after {max_retries} attempts for {alpha_id}", "WARNING")
-                            return {}
-                            
-                except Exception as parse_err:
-                    if attempt < max_retries - 1:
-                        self.log(f"PnL JSON parse failed for {alpha_id} (attempt {attempt + 1}), retrying in {retry_delay} seconds...", "WARNING")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 1.5
-                        continue
-                    else:
-                        self.log(f"PnL JSON parse failed for {alpha_id} after {max_retries} attempts: {parse_err}", "WARNING")
-                        return {}
-                        
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    self.log(f"Failed to get alpha PnL for {alpha_id} (attempt {attempt + 1}), retrying in {retry_delay} seconds: {str(e)}", "WARNING")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 1.5
-                    continue
-                else:
-                    self.log(f"Failed to get alpha PnL for {alpha_id} after {max_retries} attempts: {str(e)}", "ERROR")
-                    raise
-        
-        # This should never be reached, but just in case
-        return {}
-    
+        Contract (ProdMemo relies on it): {} = still being generated, call again
+        later; raises on a real failure (4xx)."""
+        await self.ensure_authenticated()
+        r = await self._poll(f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/recordsets/pnl", max_wait)
+        if r["status"] == "ERROR":
+            raise Exception(f"PnL failed for {alpha_id}: {r.get('error')}")
+        return (r.get("data") or {}) if r["status"] == "DONE" else {}
+
     async def get_user_alphas(
         self,
         stage: str = "OS",
@@ -982,23 +1112,72 @@ class BrainApiClient:
             self.log(f"Failed to get user alphas: {str(e)}", "ERROR")
             raise
     
-    async def submit_alpha(self, alpha_id: str) -> bool:
-        """Submit an alpha for production."""
-        await self.ensure_authenticated()
-        
-        try:
-            self.log(f"📤 Submitting alpha {alpha_id} for production...", "INFO")
-            
-            response = await self._request('post', f"{self.base_url}/alphas/{alpha_id}/submit")
-            response.raise_for_status()
+    async def submit_alpha(self, alpha_id: str, wait_seconds: float = 60) -> Dict[str, Any]:
+        """Submit an alpha and follow BRAIN's asynchronous submission to its verdict.
 
-            self.log(f"Alpha {alpha_id} submitted successfully", "SUCCESS")
-            return response.__dict__
-            
-        except Exception as e:
-            self.log(f"❌ Failed to submit alpha: {str(e)}", "ERROR")
-            return False
-    
+        POST /alphas/{id}/submit starts it; GET on the same URL is polled while it
+        carries Retry-After, and the final body lists every check. Concurrent calls
+        for one alpha share one POST; a call after PENDING resumes polling instead of
+        submitting again. A 4xx carrying checks is reported as REJECTED."""
+        await self.ensure_authenticated()
+        url = f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/submit"
+        lock = self._submit_locks.setdefault(alpha_id, asyncio.Lock())
+        async with lock:
+            recent = self._submit_results.get(alpha_id)
+            if recent and time.monotonic() - recent[0] < 600:
+                return {**recent[1], "note": "Result of the submission made in the last 10 minutes."}
+            if alpha_id not in self._pending_submits:
+                self.log(f"📤 Submitting alpha {alpha_id}...", "INFO")
+                resp = await self._request('post', url)
+                if resp.status_code == 429:
+                    return {"success": False, "alpha_id": alpha_id, "status": "RATE_LIMITED",
+                            "retry_after_seconds": _retry_after_seconds(resp) or 30.0}
+                if resp.status_code >= 400:
+                    return self._submit_verdict(alpha_id, _json_or_none(resp), resp)
+                self._pending_submits.add(alpha_id)
+                if "Retry-After" not in resp.headers:
+                    return self._finish_submit(alpha_id, _json_or_none(resp))
+            r = await self._poll(url, wait_seconds)
+            if r["status"] == "PENDING":
+                return {"success": False, "alpha_id": alpha_id, "status": "PENDING",
+                        "retry_after_seconds": r["retry_after_seconds"],
+                        "note": "Submission is being processed. Call submit_alpha again to keep "
+                                "polling; it will not submit twice."}
+            if r["status"] == "ERROR":
+                self._pending_submits.discard(alpha_id)  # a fixed alpha can be resubmitted
+                return self._submit_verdict(alpha_id, r.get("json"), None, r)
+            return self._finish_submit(alpha_id, r.get("data"))
+
+    def _finish_submit(self, alpha_id: str, data: Any) -> Dict[str, Any]:
+        self._pending_submits.discard(alpha_id)
+        result = self._submit_verdict(alpha_id, data, None)
+        self._submit_results[alpha_id] = (time.monotonic(), result)
+        return result
+
+    @staticmethod
+    def _submit_verdict(alpha_id: str, body: Any, resp: Optional[requests.Response],
+                        poll_error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        checks = [c for c in (((body or {}).get("is") or {}).get("checks") or []) if isinstance(c, dict)] \
+            if isinstance(body, dict) else []
+        failed = [c.get("name") for c in checks if c.get("result") == "FAIL"]
+        pending = [c.get("name") for c in checks if c.get("result") == "PENDING"]
+        rows = [{k: c.get(k) for k in ("name", "result", "value", "limit") if c.get(k) is not None}
+                for c in checks]
+        http_status = resp.status_code if resp is not None else (poll_error or {}).get("http_status")
+        if resp is not None or poll_error:
+            if not checks:  # an error without a check report
+                detail = _http_error_detail(resp, "submit") if resp is not None else poll_error.get("error")
+                return {"success": False, "alpha_id": alpha_id, "status": "ERROR",
+                        "http_status": http_status, "error": detail}
+            return {"success": False, "alpha_id": alpha_id, "status": "REJECTED",
+                    "http_status": http_status, "failed": failed, "checks": rows}
+        if failed:
+            return {"success": False, "alpha_id": alpha_id, "status": "REJECTED",
+                    "failed": failed, "pending": pending, "checks": rows}
+        return {"success": True, "alpha_id": alpha_id,
+                "status": "SUBMITTED_WITH_PENDING_CHECKS" if pending else "SUBMITTED",
+                "pending": pending, "checks": rows}
+
     async def get_events(self) -> Dict[str, Any]:
         """Get available events and competitions."""
         await self.ensure_authenticated()
@@ -1021,11 +1200,10 @@ class BrainApiClient:
             if user_id:
                 params['user'] = user_id
             else:
-                # Get current user ID if not specified
-                user_response = await self._request('get', f"{self.base_url}/users/self")
-                if user_response.status_code == 200:
-                    user_data = user_response.json()
-                    params['user'] = user_data.get('id')
+                own_id = await self._self_id_or_none()
+                if not own_id:
+                    raise Exception("could not determine your user id from GET /authentication")
+                params['user'] = own_id
 
             response = await self._request('get', f"{self.base_url}/consultant/boards/leader", params=params)
             response.raise_for_status()
@@ -1052,6 +1230,7 @@ class BrainApiClient:
         tags = detail.get('tags') or []
         if isinstance(tags, list):
             for t in tags:
+                t = t.get('name') if isinstance(t, dict) else t
                 if isinstance(t, str) and t.strip().lower() == 'atom':
                     return True
 
@@ -1062,121 +1241,82 @@ class BrainApiClient:
 
         return False
 
-    async def value_factor_trendScore(self, start_date: str, end_date: str) -> Dict[str, Any]:
-        """Compute diversity score for regular alphas in a date range.
+    async def value_factor_trendScore(self, start_date: str, end_date: str,
+                                      max_alphas: int = 2000) -> Dict[str, Any]:
+        """Diversity score of the REGULAR alphas submitted in [start_date, end_date].
 
-        Description:
-        This function calculate the diversity of the users' submission, by checking the diversity, we can have a good understanding on the valuefactor's trend.
-        value factor of a user is defiend by This diversity score, which measures three key aspects of work output: the proportion of works
-        with the "Atom" tag (S_A), atom proportion, the breadth of pyramids covered (S_P), and how evenly works
-        are distributed across those pyramids (S_H). Calculated as their product, it rewards
-        strong performance across all three dimensions—encouraging more Atom-tagged works,
-        wider pyramid coverage, and balanced distribution—with weaknesses in any area lowering
-        the total score significantly.
+        S_A = share of Atom (single-data-set) alphas, S_P = pyramids covered /
+        pyramids available (pyramid-multipliers), S_H = normalised entropy of the
+        pyramid distribution; diversity_score = S_A * S_P * S_H. A client-side
+        estimate of the value-factor trend, not BRAIN's official valueFactor.
 
-        Inputs (hints for AI callers):
-        - start_date (str): ISO UTC start datetime, e.g. '2025-08-14T00:00:00Z'
-        - end_date (str): ISO UTC end datetime, e.g. '2025-08-18T23:59:59Z'
-        - Note: this tool always uses 'OS' (submission dates) to define the window; callers do not need to supply a stage.
-                - Note: P_max (total number of possible pyramids) is derived from the platform
-                    pyramid-multipliers endpoint and not supplied by callers.
-
-        Returns (compact JSON): {
-            'diversity_score': float,
-            'N': int,  # total regular alphas in window
-            'A': int,  # number of Atom-tagged works (is_single_data_set)
-            'P': int,  # pyramid coverage count in the sample
-            'P_max': int, # used max for normalization
-            'S_A': float, 'S_P': float, 'S_H': float,
-            'per_pyramid_counts': {pyramid_name: count}
-        }
+        listAlphas already returns classifications and pyramids, so this pages
+        through it (no per-alpha requests) and re-applies the date window, since
+        the dateSubmitted filters are not documented.
         """
-        # Fetch user alphas (always use OS / submission dates per product policy)
         await self.ensure_authenticated()
-        alphas_resp = await self.get_user_alphas(stage='OS', limit=500, submission_start_date=start_date, submission_end_date=end_date)
+        alphas: List[Dict[str, Any]] = []
+        offset, page, complete = 0, 100, True
+        while True:
+            resp = await self.get_user_alphas(stage='OS', limit=page, offset=offset,
+                                              submission_start_date=start_date,
+                                              submission_end_date=end_date)
+            batch = (resp or {}).get('results') or []
+            alphas.extend(batch)
+            offset += len(batch)
+            count = (resp or {}).get('count')
+            if not batch or (count is not None and offset >= count):
+                break
+            if len(alphas) >= max_alphas:
+                complete = False
+                break
 
-        if not isinstance(alphas_resp, dict) or 'results' not in alphas_resp:
-            return {'error': 'Unexpected response from get_user_alphas', 'raw': alphas_resp}
+        def in_window(a: Dict[str, Any]) -> bool:
+            ds = str(a.get('dateSubmitted') or '')
+            if not ds:
+                return True
+            return str(start_date)[:10] <= ds[:10] <= str(end_date)[:10]
 
-        alphas = alphas_resp['results']
-        regular = [a for a in alphas if a.get('type') == 'REGULAR']
-
-        # Fetch details for each regular alpha
-        pyramid_list = []
-        atom_count = 0
-        per_pyramid = {}
+        regular = [a for a in alphas if a.get('type', 'REGULAR') == 'REGULAR' and in_window(a)]
+        filtered_out = len([a for a in alphas if not in_window(a)])
+        atom_count = sum(1 for a in regular if self._is_atom(a))
+        per_pyramid: Dict[str, int] = {}
         for a in regular:
-            try:
-                detail = await self.get_alpha_details(a.get('id'))
-            except Exception:
-                continue
-
-            is_atom = self._is_atom(detail)
-            if is_atom:
-                atom_count += 1
-
-            # Extract pyramids
-            ps = []
-            if isinstance(detail.get('pyramids'), list):
-                ps = [p.get('name') for p in detail.get('pyramids') if p.get('name')]
-            else:
-                pt = detail.get('pyramidThemes') or {}
-                pss = pt.get('pyramids') if isinstance(pt, dict) else None
-                if pss and isinstance(pss, list):
-                    ps = [p.get('name') for p in pss if p.get('name')]
-
-            for p in ps:
-                pyramid_list.append(p)
+            for p in _alpha_pyramid_keys(a):
                 per_pyramid[p] = per_pyramid.get(p, 0) + 1
 
-        N = len(regular)
-        A = atom_count
-        P = len(per_pyramid)
-
-        # Determine P_max similarly to the script: use pyramid multipliers if available
+        N, A, P = len(regular), atom_count, len(per_pyramid)
         P_max = None
         try:
             pm = await self.get_pyramid_multipliers()
-            if isinstance(pm, dict) and 'pyramids' in pm:
-                pyramids_list = pm.get('pyramids') or []
-                P_max = len(pyramids_list)
-        except Exception:
-            P_max = None
-
-        if not P_max or P_max <= 0:
-            P_max = max(P, 1)
-
-        # Component scores
-        S_A = (A / N) if N > 0 else 0.0
-        S_P = (P / P_max) if P_max > 0 else 0.0
-
-        # Entropy
+            if isinstance(pm, dict):
+                P_max = len({_pyramid_key(x) for x in pm.get('pyramids') or [] if isinstance(x, dict)}) or None
+        except Exception as e:
+            self.log(f"pyramid multipliers unavailable: {e}", "WARNING")
+        S_A = (A / N) if N else 0.0
+        S_P = (P / P_max) if P_max else None
         S_H = 0.0
-        if P <= 1 or not per_pyramid:
-            S_H = 0.0
-        else:
-            total_occ = sum(per_pyramid.values())
-            H = 0.0
-            for cnt in per_pyramid.values():
-                q = cnt / total_occ if total_occ > 0 else 0
-                if q > 0:
-                    H -= q * math.log2(q)
-            max_H = math.log2(P) if P > 0 else 1
-            S_H = (H / max_H) if max_H > 0 else 0.0
-
-        diversity_score = S_A * S_P * S_H
-
-        return {
-            'diversity_score': diversity_score,
-            'N': N,
-            'A': A,
-            'P': P,
-            'P_max': P_max,
-            'S_A': S_A,
-            'S_P': S_P,
-            'S_H': S_H,
-            'per_pyramid_counts': per_pyramid
+        if P > 1:
+            total = sum(per_pyramid.values())
+            H = -sum((c / total) * math.log2(c / total) for c in per_pyramid.values() if c)
+            S_H = H / math.log2(P)
+        result = {
+            'diversity_score': (S_A * S_P * S_H) if S_P is not None else None,
+            'N': N, 'A': A, 'P': P, 'P_max': P_max,
+            'S_A': S_A, 'S_P': S_P, 'S_H': S_H,
+            'per_pyramid_counts': per_pyramid,
+            'complete': complete,
         }
+        notes = []
+        if filtered_out:
+            notes.append(f"{filtered_out} alphas outside the window were ignored")
+        if S_P is None:
+            notes.append("P_max unknown (pyramid-multipliers failed); diversity_score not computed")
+        if not complete:
+            notes.append(f"only the first {len(alphas)} alphas were counted")
+        if notes:
+            result['note'] = "; ".join(notes)
+        return result
 
     async def get_operators(self) -> Dict[str, Any]:
         """Get available operators for alpha creation."""
@@ -1203,19 +1343,26 @@ class BrainApiClient:
         region: str = "USA",
         delay: int = 1,
         selection_limit: int = 1000,
-        selection_handling: str = "POSITIVE"
+        selection_handling: str = "POSITIVE",
+        limit: int = 10,
     ) -> Dict[str, Any]:
-        """Run a selection query to filter instruments."""
+        """Preview which alphas a SuperAlpha selection expression picks."""
         await self.ensure_authenticated()
         
         try:
             selection_data = {
                 "selection": selection,
+                # The API catalog documents settings.* names; the flat ones are what
+                # v1 sent. Both are sent until a live check shows which is honoured.
+                "settings.instrumentType": instrument_type,
+                "settings.region": region,
+                "settings.delay": delay,
                 "instrumentType": instrument_type,
                 "region": region,
                 "delay": delay,
                 "selectionLimit": selection_limit,
-                "selectionHandling": selection_handling
+                "selectionHandling": selection_handling,
+                "limit": limit,
             }
             
             response = await self._request('get', f"{self.base_url}/simulations/super-selection", params=selection_data)
@@ -1228,17 +1375,18 @@ class BrainApiClient:
             raise
 
     async def get_user_profile(self, user_id: str = "self") -> Dict[str, Any]:
-        """Get user profile information."""
+        """Your own full record (user_id='self'), or another user's public profile.
+
+        GET /users/{id} answers 403 for anyone but yourself, so other ids use the
+        public GET /users/{id}/profile (id, country, university, genius level)."""
         await self.ensure_authenticated()
-        
-        try:
-            response = await self._request('get', f"{self.base_url}/users/{user_id}")
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            self.log(f"Failed to get user profile: {str(e)}", "ERROR")
-            raise
-            
+        uid = _seg(user_id or "self", "user id")
+        path = f"/users/{uid}" if uid == "self" else f"/users/{uid}/profile"
+        response = await self._request('get', f"{self.base_url}{path}")
+        if response.status_code >= 400:
+            raise Exception(_http_error_detail(response, "user profile"))
+        return response.json()
+
     async def get_documentations(self) -> Dict[str, Any]:
         """Get available documentations and learning materials."""
         await self.ensure_authenticated()
@@ -1271,7 +1419,9 @@ class BrainApiClient:
 
         import re, base64, pathlib
 
-        image_handling = os.environ.get("BRAIN_MESSAGE_IMAGE_MODE", "placeholder").lower()
+        # "ignore" (default) strips embedded images; "placeholder" saves them to the
+        # server's disk (only useful when the MCP client runs on the same machine).
+        image_handling = os.environ.get("BRAIN_MESSAGE_IMAGE_MODE", "ignore").lower()
         save_dir = pathlib.Path("message_images")
 
         from typing import Tuple
@@ -1394,10 +1544,11 @@ class BrainApiClient:
             self.log(f"Failed to get messages: {str(e)}", "ERROR")
             raise
 
-    async def get_glossary_terms(self, email: str, password: str) -> List[Dict[str, str]]:
-        """Get glossary terms from forum."""
+    async def get_glossary_terms(self, email: str = "", password: str = "") -> List[Dict[str, str]]:
+        """Glossary terms from the support site (email/password are ignored: the
+        browser reuses this session's cookies)."""
         try:
-            return await forum_client.get_glossary_terms(email, password)
+            return (await forum_client.get_glossary_terms())["terms"]
         except Exception as e:
             self.log(f"Failed to get glossary terms: {str(e)}", "ERROR")
             raise
@@ -1406,7 +1557,8 @@ class BrainApiClient:
                                  max_results: int = 50) -> Dict[str, Any]:
         """Search forum posts."""
         try:
-            return await forum_client.search_forum_posts(email, password, search_query, max_results)
+            res = await forum_client.search_posts(search_query, max_results=max_results)
+            return {**res, "success": True, "total_found": res.get("count")}
         except Exception as e:
             self.log(f"Failed to search forum posts: {str(e)}", "ERROR")
             raise
@@ -1415,75 +1567,21 @@ class BrainApiClient:
                               include_comments: bool = True) -> Dict[str, Any]:
         """Get forum post."""
         try:
-            return await forum_client.read_full_forum_post(email, password, article_id, include_comments)
+            res = await forum_client.read_post(article_id, include_comments=include_comments)
+            return {**res, "success": True}
         except Exception as e:
             self.log(f"Failed to read forum post: {str(e)}", "ERROR")
             raise
     
-    async def get_alpha_yearly_stats(self, alpha_id: str) -> Dict[str, Any]:
-        """Get yearly statistics for an alpha with retry logic."""
+    async def get_alpha_yearly_stats(self, alpha_id: str, max_wait: float = 30) -> Dict[str, Any]:
+        """Yearly-stats recordset; same contract as get_alpha_pnl ({} = still computing)."""
         await self.ensure_authenticated()
-        
-        max_retries = 5
-        retry_delay = 2  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                self.log(f"Attempting to get yearly stats for alpha {alpha_id} (attempt {attempt + 1}/{max_retries})", "INFO")
-                
-                response = await self._request('get', f"{self.base_url}/alphas/{alpha_id}/recordsets/yearly-stats")
-                response.raise_for_status()
+        r = await self._poll(f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/recordsets/yearly-stats",
+                             max_wait)
+        if r["status"] == "ERROR":
+            raise Exception(f"yearly stats failed for {alpha_id}: {r.get('error')}")
+        return (r.get("data") or {}) if r["status"] == "DONE" else {}
 
-                # Check if response has content
-                text = (response.text or "").strip()
-                if not text:
-                    if attempt < max_retries - 1:
-                        self.log(f"Empty yearly stats response for {alpha_id}, retrying in {retry_delay} seconds...", "WARNING")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 1.5  # Exponential backoff
-                        continue
-                    else:
-                        self.log(f"Empty yearly stats response after {max_retries} attempts for {alpha_id}", "WARNING")
-                        return {}
-                
-                try:
-                    yearly_stats = response.json()
-                    if yearly_stats:
-                        self.log(f"Successfully retrieved yearly stats for alpha {alpha_id}", "SUCCESS")
-                        return yearly_stats
-                    else:
-                        if attempt < max_retries - 1:
-                            self.log(f"Empty yearly stats JSON for {alpha_id}, retrying in {retry_delay} seconds...", "WARNING")
-                            await asyncio.sleep(retry_delay)
-                            retry_delay *= 1.5
-                            continue
-                        else:
-                            self.log(f"Empty yearly stats JSON after {max_retries} attempts for {alpha_id}", "WARNING")
-                            return {}
-                            
-                except Exception as parse_err:
-                    if attempt < max_retries - 1:
-                        self.log(f"Yearly stats JSON parse failed for {alpha_id} (attempt {attempt + 1}), retrying in {retry_delay} seconds...", "WARNING")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 1.5
-                        continue
-                    else:
-                        self.log(f"Yearly stats JSON parse failed for {alpha_id} after {max_retries} attempts: {parse_err}", "WARNING")
-                        return {}
-                        
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    self.log(f"Failed to get alpha yearly stats for {alpha_id} (attempt {attempt + 1}), retrying in {retry_delay} seconds: {str(e)}", "WARNING")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 1.5
-                    continue
-                else:
-                    self.log(f"Failed to get alpha yearly stats for {alpha_id} after {max_retries} attempts: {str(e)}", "ERROR")
-                    raise
-        
-        # This should never be reached, but just in case
-        return {}
-        
     async def _poll_correlation(self, alpha_id: str, kind: str, max_wait: float) -> Dict[str, Any]:
         """Poll GET /alphas/{id}/correlations/{kind} ("prod" or "self") until it
         settles or max_wait runs out, keeping the three outcomes apart:
@@ -1495,7 +1593,7 @@ class BrainApiClient:
         - ERROR: a 4xx/5xx (after _request's own retries), non-JSON body, or a
           body carrying only an error message.
         """
-        url = f"{self.base_url}/alphas/{alpha_id}/correlations/{kind}"
+        url = f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/correlations/{kind}"
         deadline = time.monotonic() + max(0.0, min(float(max_wait or 0), 300.0))
         while True:
             try:
@@ -1607,7 +1705,7 @@ class BrainApiClient:
         is not lost. A numeric PROD_CORRELATION is written back into ProdMemo.
         """
         await self.ensure_authenticated()
-        url = f"{self.base_url}/alphas/{alpha_id}/check"
+        url = f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/check"
         deadline = time.monotonic() + max(0.0, min(float(max_wait or 0), 300.0))
         data: Any = None
         while True:
@@ -1696,52 +1794,65 @@ class BrainApiClient:
             }
             data = {k: v for k, v in option_map.items() if v is not None}
 
-            response = await self._request('patch', f"{self.base_url}/alphas/{alpha_id}", json=data)
+            response = await self._request('patch', f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}", json=data)
             response.raise_for_status()
             return response.json()
         except Exception as e:
             self.log(f"Failed to set alpha properties: {str(e)}", "ERROR")
             raise
 
-    async def get_record_sets(self, alpha_id: str) -> Dict[str, Any]:
-        """List available record sets for an alpha."""
+    async def get_record_sets(self, alpha_id: str, max_wait: float = 20) -> Dict[str, Any]:
+        """List available record sets for an alpha (polls while BRAIN prepares them)."""
         await self.ensure_authenticated()
-        
-        try:
-            response = await self._request('get', f"{self.base_url}/alphas/{alpha_id}/recordsets")
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            self.log(f"Failed to get record sets: {str(e)}", "ERROR")
-            raise
+        r = await self._poll(f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/recordsets", max_wait)
+        if r["status"] == "ERROR":
+            raise Exception(r.get("error"))
+        if r["status"] == "PENDING":
+            return {"status": "PENDING", "retry_after_seconds": r["retry_after_seconds"],
+                    "note": "BRAIN is still preparing the record sets; call again later."}
+        return r.get("data") or {}
 
-    async def get_record_set_data(self, alpha_id: str, record_set_name: str) -> Dict[str, Any]:
-        """Get data from a specific record set."""
+    async def get_record_set_data(self, alpha_id: str, record_set_name: str,
+                                  max_wait: float = 30) -> Dict[str, Any]:
+        """One record set (pnl, sharpe, turnover, daily-pnl, yearly-stats, ...)."""
         await self.ensure_authenticated()
-        
-        try:
-            response = await self._request('get', f"{self.base_url}/alphas/{alpha_id}/recordsets/{record_set_name}")
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            self.log(f"Failed to get record set data: {str(e)}", "ERROR")
-            raise
+        url = (f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/recordsets/"
+               f"{_seg(record_set_name, 'record set name')}")
+        r = await self._poll(url, max_wait)
+        if r["status"] == "ERROR":
+            raise Exception(r.get("error"))
+        if r["status"] == "PENDING":
+            return {"status": "PENDING", "retry_after_seconds": r["retry_after_seconds"],
+                    "note": "BRAIN is still computing this record set; call again later."}
+        return r.get("data") or {}
 
     async def get_user_activities(self, user_id: str, grouping: Optional[str] = None) -> Dict[str, Any]:
-        """Get user activity diversity data."""
+        """Activity diversity: alpha counts and data-diversity PASS/FAIL per group.
+
+        GET /users/self/activities/diversity (grouping e.g. "region,delay" or
+        "dataCategory,region,delay"). The old /users/{id}/activities endpoint only
+        returns category names and ignored `grouping`. Only the current user is
+        supported by the platform."""
         await self.ensure_authenticated()
-        
+        if str(user_id or "self").strip() not in ("self", "", await self._self_id_or_none()):
+            raise ValueError("activity diversity is only available for the current user (user_id='self')")
+        params = {}
+        if grouping:
+            if not re.fullmatch(r"[A-Za-z]+(,[A-Za-z]+)*", grouping):
+                raise ValueError("grouping must be comma-separated field names, e.g. 'region,delay'")
+            params['grouping'] = grouping
+        response = await self._request('get', f"{self.base_url}/users/self/activities/diversity",
+                                       params=params)
+        if response.status_code >= 400:
+            raise Exception(_http_error_detail(response, "activity diversity"))
+        return response.json()
+
+    async def _self_id_or_none(self) -> Optional[str]:
         try:
-            params = {}
-            if grouping:
-                params['grouping'] = grouping
-            
-            response = await self._request('get', f"{self.base_url}/users/{user_id}/activities", params=params)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            self.log(f"Failed to get user activities: {str(e)}", "ERROR")
-            raise
+            status = await self.get_authentication_status() or {}
+            return (status.get("user") or {}).get("id")
+        except Exception:
+            return None
 
     async def get_pyramid_multipliers(self) -> Dict[str, Any]:
         """Get current pyramid multipliers showing BRAIN's encouragement levels."""
@@ -1756,63 +1867,30 @@ class BrainApiClient:
             raise
 
     async def get_pyramid_alphas(self, start_date: Optional[str] = None,
-                               end_date: Optional[str] = None) -> Dict[str, Any]:
-        """Get user's current alpha distribution across pyramid categories."""
+                                 end_date: Optional[str] = None) -> Dict[str, Any]:
+        """Your alpha distribution across pyramid categories (dates as YYYY-MM-DD)."""
         await self.ensure_authenticated()
-        
-        try:
-            params = {}
-            if start_date:
-                params['startDate'] = start_date
-            if end_date:
-                params['endDate'] = end_date
-            
-            # Try the user-specific activities endpoint first (like pyramid-multipliers)
-            response = await self._request('get', f"{self.base_url}/users/self/activities/pyramid-alphas", params=params)
+        params = {}
+        for key, value in (("startDate", start_date), ("endDate", end_date)):
+            if value:
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value[:10]):
+                    raise ValueError(f"{key} must start with YYYY-MM-DD, got {value!r}")
+                params[key] = value[:10]
+        response = await self._request('get', f"{self.base_url}/users/self/activities/pyramid-alphas",
+                                       params=params)
+        if response.status_code >= 400:
+            raise Exception(_http_error_detail(response, "pyramid alphas"))
+        return response.json()
 
-            # If that fails, try alternative endpoints
-            if response.status_code == 404:
-                # Try alternative endpoint structure
-                response = await self._request('get', f"{self.base_url}/users/self/pyramid/alphas", params=params)
-
-                if response.status_code == 404:
-                    # Try yet another alternative
-                    response = await self._request('get', f"{self.base_url}/activities/pyramid-alphas", params=params)
-                    
-                    if response.status_code == 404:
-                        # Return an informative error with what we tried
-                        return {
-                            "error": "Pyramid alphas endpoint not found",
-                            "tried_endpoints": [
-                                "/users/self/activities/pyramid-alphas",
-                                "/users/self/pyramid/alphas", 
-                                "/activities/pyramid-alphas",
-                                "/pyramid/alphas"
-                            ],
-                            "suggestion": "This endpoint may not be available in the current API version"
-                        }
-            
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            self.log(f"Failed to get pyramid alphas: {str(e)}", "ERROR")
-            raise
-            
     async def get_user_competitions(self, user_id: Optional[str] = None) -> Dict[str, Any]:
         """Get list of competitions that the user is participating in."""
         await self.ensure_authenticated()
         
         try:
             if not user_id:
-                # Get current user ID if not specified
-                user_response = await self._request('get', f"{self.base_url}/users/self")
-                if user_response.status_code == 200:
-                    user_data = user_response.json()
-                    user_id = user_data.get('id')
-                else:
-                    user_id = 'self'
+                user_id = 'self'  # the API accepts "self" directly
 
-            response = await self._request('get', f"{self.base_url}/users/{user_id}/competitions")
+            response = await self._request('get', f"{self.base_url}/users/{_seg(user_id, 'user id')}/competitions")
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -1824,7 +1902,7 @@ class BrainApiClient:
         await self.ensure_authenticated()
         
         try:
-            response = await self._request('get', f"{self.base_url}/competitions/{competition_id}")
+            response = await self._request('get', f"{self.base_url}/competitions/{_seg(competition_id, 'competition id')}")
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -1836,7 +1914,7 @@ class BrainApiClient:
         await self.ensure_authenticated()
         
         try:
-            response = await self._request('get', f"{self.base_url}/competitions/{competition_id}/agreement")
+            response = await self._request('get', f"{self.base_url}/competitions/{_seg(competition_id, 'competition id')}/agreement")
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -1911,24 +1989,33 @@ class BrainApiClient:
             self.log(f"Failed to get instrument options: {str(e)}", "ERROR")
             raise
             
-    async def performance_comparison(self, alpha_id: str, team_id: Optional[str] = None, 
-                                     competition: Optional[str] = None) -> Dict[str, Any]:
-        """Get performance comparison data for an alpha."""
+    async def performance_comparison(self, alpha_id: str, team_id: Optional[str] = None,
+                                     competition: Optional[str] = None,
+                                     max_wait: float = 30) -> Dict[str, Any]:
+        """Portfolio before/after adding this alpha (sharpe, fitness, turnover, ...).
+
+        Uses the catalogued before-and-after-performance endpoints (the competition
+        variant when `competition` is given). The old /performance-comparison path is
+        not a documented endpoint; team_id has no equivalent there and is ignored."""
         await self.ensure_authenticated()
-        
-        try:
-            params = {"teamId": team_id, "competition": competition}
-            params = {k: v for k, v in params.items() if v is not None}
-            
-            response = await self._request('get', f"{self.base_url}/alphas/{alpha_id}/performance-comparison", params=params)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            self.log(f"Failed to get performance comparison: {str(e)}", "ERROR")
-            raise
-            
-    # --- Helper function for data flattening ---
-    
+        aid = _seg(alpha_id, 'alpha id')
+        if competition:
+            url = (f"{self.base_url}/competitions/{_seg(competition, 'competition id')}/alphas/"
+                   f"{aid}/before-and-after-performance")
+        else:
+            url = f"{self.base_url}/users/self/alphas/{aid}/before-and-after-performance"
+        r = await self._poll(url, max_wait)
+        if r["status"] == "ERROR":
+            raise Exception(r.get("error"))
+        if r["status"] == "PENDING":
+            return {"status": "PENDING", "retry_after_seconds": r["retry_after_seconds"]}
+        out = r.get("data")
+        if out is None:
+            return {"status": "EMPTY", "note": "BRAIN returned no body for this alpha."}
+        if team_id and isinstance(out, dict):
+            out["note"] = "team_id is not supported by the before-and-after endpoint and was ignored."
+        return out
+
     async def expand_nested_data(self, data: List[Dict[str, Any]], preserve_original: bool = True) -> List[Dict[str, Any]]:
         """Flatten complex nested data structures into tabular format."""
         try:
@@ -1949,7 +2036,7 @@ class BrainApiClient:
         await self.ensure_authenticated()
         
         try:
-            response = await self._request('get', f"{self.base_url}/tutorial-pages/{page_id}")
+            response = await self._request('get', f"{self.base_url}/tutorial-pages/{_seg(page_id, 'page id')}")
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -1957,6 +2044,7 @@ class BrainApiClient:
             raise
 
 brain_client = BrainApiClient()
+forum_client = ForumClient(brain_client.cookie_list)
 
 # --- Configuration Management ---
 
@@ -2008,14 +2096,54 @@ def save_config(config: Dict[str, Any]):
     except IOError as e:
         logger.error(f"Error saving config file to {config_file}: {e}")
 
+def _redact(value: Any) -> Any:
+    """Mask secrets (passwords, tokens, cookies) before a config leaves the server."""
+    if isinstance(value, dict):
+        return {k: ("***" if re.search(r"pass|token|secret|cookie|key", str(k), re.I) and v else _redact(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
 # --- MCP Tool Definitions ---
+
+def _transport_security():
+    """DNS-rebinding protection: FastMCP enables it for loopback binds; extend it to
+    the host names a reverse proxy forwards (WQMCP_ALLOWED_HOSTS, comma-separated)."""
+    from mcp.server.transport_security import TransportSecuritySettings
+    extra = [h.strip() for h in os.environ.get("WQMCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    if not extra:
+        if WQMCP_HOST not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning("WQMCP_HOST=%s without WQMCP_ALLOWED_HOSTS: no DNS-rebinding protection "
+                           "and no authentication; put an authenticating reverse proxy in front.",
+                           WQMCP_HOST)
+        return None
+    return TransportSecuritySettings(
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *extra],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+                         *[f"https://{h}" for h in extra], *[f"http://{h}" for h in extra]])
+
+
+# Default to loopback: this server has no authentication of its own. Set
+# WQMCP_HOST=0.0.0.0 (behind an authenticating proxy) for remote clients.
+WQMCP_HOST = os.environ.get("WQMCP_HOST", "127.0.0.1")
+WQMCP_PORT = int(os.environ.get("WQMCP_PORT", "8761"))
 
 mcp = FastMCP(
     "brain-platform-mcp",
-    "A server for interacting with the WorldQuant BRAIN platform",
-    host="0.0.0.0",
-    port="8761"
+    instructions="A server for interacting with the WorldQuant BRAIN platform",
+    host=WQMCP_HOST,
+    port=WQMCP_PORT,
+    transport_security=_transport_security(),
 )
+
+
+def _write_guard(what: str) -> Optional[Dict[str, Any]]:
+    """Error payload when writes are disabled (WQMCP_READ_ONLY=1), else None."""
+    if READ_ONLY:
+        return {"error": f"{what} is disabled: this server runs with WQMCP_READ_ONLY=1"}
+    return None
 
 @mcp.tool()
 async def authenticate(email: Optional[str] = "", password: Optional[str] = "") -> Dict[str, Any]:
@@ -2052,7 +2180,7 @@ async def manage_config(action: str = "get", settings: Optional[Dict[str, Any]] 
         Current or updated configuration including authentication status
     """
     if action == "get":
-        config = load_config()
+        config = _redact(load_config())
         auth_status = await brain_client.get_authentication_status()
         
         return {
@@ -2064,11 +2192,13 @@ async def manage_config(action: str = "get", settings: Optional[Dict[str, Any]] 
     elif action == "set":
         if settings is None:
             return {"error": "Settings parameter is required when action='set'"}
-        
+        guard = _write_guard("manage_config(set)")
+        if guard:
+            return guard
         config = load_config()
         config.update(settings)
         save_config(config)
-        return config
+        return _redact(config)
     
     else:
         return {"error": f"Invalid action '{action}'. Use 'get' or 'set'."}
@@ -2141,6 +2271,9 @@ async def create_simulation(
         {"status": "SUBMITTED", "simulation_id": ..., "progress_url": ...} — poll
         check_simulation_progress(progress_url) for progress and the final result.
     """
+    guard = _write_guard("create_simulation")
+    if guard:
+        return guard
     try:
         if (language or "").upper() == "PYTHON" and lookback is None:
             return {"error": "lookback is required when language='PYTHON'"}
@@ -2219,8 +2352,10 @@ async def check_simulation_progress(progress_url: str, wait_seconds: float = 0,
         when finished; {"status": "ERROR"/..., "message": ...} on failure.
     """
     try:
-        if not progress_url or "worldquantbrain.com" not in str(progress_url):
-            return {"error": "progress_url must be the simulations URL returned by create_simulation"}
+        try:
+            progress_url = _simulation_url(progress_url)
+        except ValueError as e:
+            return {"error": f"{e}. Pass the progress_url (or simulation id) returned by create_simulation"}
         return await brain_client.check_simulation_progress(progress_url, wait_seconds, compact)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -2277,6 +2412,9 @@ async def create_raa_simulation(
         {"status": "SUBMITTED", "simulation_id": ..., "progress_url": ...} — poll
         check_simulation_progress(progress_url); or {"status": "RATE_LIMITED", ...}.
     """
+    guard = _write_guard("create_raa_simulation")
+    if guard:
+        return guard
     try:
         if (universe or "").upper() not in RAA_UNIVERSES:
             return {"error": f"RAA universe must be one of {RAA_UNIVERSES}, got '{universe}'"}
@@ -2358,6 +2496,8 @@ async def get_datasets(
     universe: str = "TOP3000",
     theme: str = "false",
     search: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     📚 Get available datasets for research.
@@ -2370,12 +2510,16 @@ async def get_datasets(
         delay: Data delay (0 or 1)
         universe: Universe of stocks (e.g., "TOP3000")
         theme: Theme filter
+        search: Free-text search
+        limit: Page size (1-50; default = BRAIN's 20). Response `count` is the total.
+        offset: Skip this many datasets (paging)
     
     Returns:
         Available datasets
     """
     try:
-        return await brain_client.get_datasets(instrument_type, region, delay, universe, theme, search)
+        return await brain_client.get_datasets(instrument_type, region, delay, universe, theme, search,
+                                               limit, offset)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -2389,6 +2533,8 @@ async def get_datafields(
     dataset_id: Optional[str] = None,
     data_type: str = "",
     search: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     🔍 Get available data fields for alpha construction.
@@ -2404,12 +2550,15 @@ async def get_datafields(
         dataset_id: Specific dataset ID to filter by
         data_type: Type of data (e.g., "MATRIX",'VECTOR','GROUP')
         search: Search term to filter fields
+        limit: Page size (1-100, default 50). Response `count` is the total.
+        offset: Skip this many fields (paging)
     
     Returns:
         Available data fields
     """
     try:
-        return await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id, data_type, search)
+        return await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id, data_type, search,
+                                                 limit, offset)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -2491,21 +2640,31 @@ async def get_user_alphas(
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def submit_alpha(alpha_id: str) -> Dict[str, Any]:
+async def submit_alpha(alpha_id: str, wait_seconds: float = 60) -> Dict[str, Any]:
     """
-    📤 Submit an alpha for production.
-    
-    Use this when your alpha is ready for production deployment.
-    
+    📤 Submit an alpha for production and wait for BRAIN's verdict.
+
+    Submission is asynchronous on BRAIN: this posts it, then follows the platform's
+    Retry-After polling until the final check report (up to wait_seconds, max 300).
+
+    Returns:
+        success (bool) and status: SUBMITTED, REJECTED (see failed / checks),
+        PENDING (still processing — call submit_alpha again; it resumes polling and
+        never submits twice), RATE_LIMITED or ERROR.
+    Run get_submission_check first if you only want to know whether it would pass.
+
     Args:
         alpha_id: The ID of the alpha to submit
-    
-    Returns:
-        Submission result
+        wait_seconds: How long to follow the submission before answering (default 60)
     """
+    guard = _write_guard("submit_alpha")
+    if guard:
+        return guard
+    if not ALLOW_SUBMIT:
+        return {"error": "submissions are disabled on this server (WQMCP_ALLOW_SUBMIT=0); "
+                         "use get_submission_check to see whether the alpha would pass"}
     try:
-        success = await brain_client.submit_alpha(alpha_id)
-        return {"success": success}
+        return await brain_client.submit_alpha(alpha_id, wait_seconds)
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
@@ -2585,6 +2744,7 @@ async def run_selection(
     delay: int = 1,
     selection_limit: int = 1000,
     selection_handling: str = "POSITIVE",
+    limit: int = 10,
 ) -> Dict[str, Any]:
     """
     🎯 Run a selection query to filter instruments.
@@ -2602,7 +2762,7 @@ async def run_selection(
     """
     try:
         return await brain_client.run_selection(
-            selection, instrument_type, region, delay, selection_limit, selection_handling
+            selection, instrument_type, region, delay, selection_limit, selection_handling, limit
         )
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -2672,10 +2832,6 @@ async def get_glossary_terms(email: str = "", password: str = "") -> List[Dict[s
     try:
         # Login is credd-backed: the browser context reuses brain_client's session
         # cookies, so email/password are legacy pass-throughs and may be empty.
-        config = load_config()
-        credentials = config.get("credentials", {})
-        email = email or credentials.get("email", "")
-        password = password or credentials.get("password", "")
 
         return await brain_client.get_glossary_terms(email, password)
     except Exception as e:
@@ -2701,10 +2857,6 @@ async def search_forum_posts(search_query: str, email: str = "", password: str =
     """
     try:
         # Login is credd-backed; email/password are legacy pass-throughs.
-        config = load_config()
-        credentials = config.get("credentials", {})
-        email = email or credentials.get("email", "")
-        password = password or credentials.get("password", "")
 
         return await brain_client.search_forum_posts(email, password, search_query, max_results)
     except Exception as e:
@@ -2728,10 +2880,6 @@ async def read_forum_post(article_id: str, email: str = "", password: str = "",
     """
     try:
         # Login is credd-backed; email/password are legacy pass-throughs.
-        config = load_config()
-        credentials = config.get("credentials", {})
-        email = email or credentials.get("email", "")
-        password = password or credentials.get("password", "")
 
         return await brain_client.read_forum_post(email, password, article_id, include_comments)
     except Exception as e:
@@ -2804,6 +2952,9 @@ async def set_alpha_properties(
     tags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Update alpha properties (name, color, tags, descriptions, category, osmosis points)."""
+    guard = _write_guard("set_alpha_properties")
+    if guard:
+        return guard
     try:
         return await brain_client.set_alpha_properties(
             alpha_id,
@@ -3085,6 +3236,9 @@ async def create_multi_simulation(
         check_simulation_progress(progress_url); or {"status": "RATE_LIMITED", ...}
         when the account's concurrent simulation slots are full.
     """
+    guard = _write_guard("create_multi_simulation")
+    if guard:
+        return guard
     try:
         exprs = list(alpha_expressions or [])
         overrides_list = list(per_alpha_settings or [])
@@ -3225,20 +3379,16 @@ async def get_daily_and_quarterly_payment(email: str = "", password: str = "") -
     """
     try:
         # Get base payments (login comes from credd via the session; no creds needed)
-        try:
-            base_response = await brain_client._request('get', f"{brain_client.base_url}/users/self/activities/base-payment")
-            base_response.raise_for_status()
-            base_payments = base_response.json()
-        except Exception:
-            base_payments = "no data"
+        async def fetch(kind: str) -> Any:
+            try:
+                resp = await brain_client._request('get', f"{brain_client.base_url}/users/self/activities/{kind}")
+                if resp.status_code >= 400:
+                    return {"error": _http_error_detail(resp, kind)}
+                return resp.json() if (resp.text or "").strip() else {}
+            except Exception as e:  # keep the other half of the answer
+                return {"error": f"{kind}: {e}"}
 
-        try:
-            # Get other payments
-            other_response = await brain_client._request('get', f"{brain_client.base_url}/users/self/activities/other-payment")
-            other_response.raise_for_status()
-            other_payments = other_response.json()
-        except Exception:
-            other_payments = "no data"
+        base_payments, other_payments = await asyncio.gather(fetch("base-payment"), fetch("other-payment"))
         return {
             "base_payments": base_payments,
             "other_payments": other_payments
@@ -3260,12 +3410,13 @@ async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
     results = []
     for loc in locations:
         try:
+            loc = _simulation_url(loc)  # BRAIN /simulations/<id> only (no arbitrary URLs)
             resp = await brain_client._request('get', loc)
             if resp.status_code != 200:
                 results.append({
                     "location": loc,
                     "error": f"HTTP {resp.status_code}",
-                    "raw": resp.text
+                    "raw": (resp.text or "")[:500]
                 })
                 continue
             data = resp.json() if resp.text else {}
@@ -3412,7 +3563,7 @@ async def prodmemo_manage(action: str, alpha_id: str = "", data: str = "") -> Di
 
 # --- Main entry point ---
 if __name__ == "__main__":
-    print("running the server")
-    mcp.run(
-         transport="streamable-http"
-    )
+    transport = os.environ.get("WQMCP_TRANSPORT", "streamable-http")
+    if transport != "stdio":  # stdout carries the protocol in stdio mode
+        print(f"running the server on http://{WQMCP_HOST}:{WQMCP_PORT}/mcp", file=sys.stderr)
+    mcp.run(transport=transport)
