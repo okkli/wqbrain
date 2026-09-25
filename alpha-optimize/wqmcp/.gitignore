@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+# v1 artefacts: plaintext config/credentials and extracted message images
+user_config.json
+message_images/
