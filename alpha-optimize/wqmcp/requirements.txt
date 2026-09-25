@@ -1,0 +1,9 @@
+# wqmcp runtime
+mcp>=1.10,<2          # 2.x removed mcp.server.fastmcp
+requests>=2.31
+pydantic>=2
+# forum tools (search_forum_posts / read_forum_post / get_glossary_terms)
+beautifulsoup4>=4.12
+playwright>=1.40      # needs a browser: `playwright install chromium` or a local Chrome
+# ProdMemo (prodmemo_* tools); the other tools still work without it
+psycopg2-binary>=2.9

@@ -151,7 +151,7 @@ def main():
         state = {}
         while time.time() < deadline:
             time.sleep(POLL_SECONDS)
-            state = client.call('prodmemo_sync_status')
+            state = client.call('prodmemo_sync', {'mode': 'status'})
             if state.get('status') in TERMINAL and not state.get('running'):
                 break
             log(f"  ...{state.get('phase')} {state.get('current') or ''}"

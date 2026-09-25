@@ -64,6 +64,7 @@ class FakeState:
     check_ra_zero_once: bool = False
     saved_language: str = "FASTEXPR"
     raa_children_pending: bool = False
+    sim_post_limit: int = 0  # >0: POST /simulations answers 429 after this many accepted
 
     def tick(self, key: str) -> int:
         with self.lock:
@@ -203,6 +204,8 @@ def _sim_settings(fb, q, body) -> Response:
 def _create_sim(fb: FakeBrain, q, body) -> Response:
     st = fb.state
     if st.sim_slots_full:
+        return 429, {"Retry-After": "30"}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
+    if st.sim_post_limit and st.tick("sim_posts") > st.sim_post_limit:
         return 429, {"Retry-After": "30"}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
     items = body if isinstance(body, list) else [body]
     for it in items:
@@ -490,6 +493,11 @@ def _competitions(fb, q, body) -> Response:
 @route("GET", r"/competitions/([^/]+)")
 def _competition(fb, q, body, cid) -> Response:
     return 200, {}, {"id": cid, "name": "GAC"}
+
+
+@route("GET", r"/competitions/([^/]+)/agreement")
+def _agreement(fb, q, body, cid) -> Response:
+    return 200, {}, {"id": cid, "content": "Rules"}
 
 
 @route("GET", r"/users/self/competitions")
