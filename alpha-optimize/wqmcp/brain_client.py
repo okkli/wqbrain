@@ -22,7 +22,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlsplit
 
@@ -66,12 +66,13 @@ class BrainAPIError(BrainError):
     """BRAIN answered with an HTTP error status."""
 
     def __init__(self, status: int, method: str, path: str, message: str,
-                 retry_after: Optional[float] = None) -> None:
+                 retry_after: Optional[float] = None, body: Any = None) -> None:
         self.status = status
         self.method = method
         self.path = path
         self.message = message
         self.retry_after = retry_after
+        self.body = body
         hint = f" (retry after ~{int(retry_after)}s)" if retry_after else ""
         super().__init__(f"BRAIN {method} {path} -> HTTP {status}: {message}{hint}")
 
@@ -106,6 +107,23 @@ def check_date(value: Optional[str], name: str, *, allow_time: bool = False) -> 
         fmt = "ISO 8601 date or date-time" if allow_time else "YYYY-MM-DD"
         raise InvalidArgument(f"{name} must be {fmt}, got {value!r}")
     return value
+
+
+def in_progress(response: requests.Response) -> bool:
+    """Catalog rule: a 2xx that still carries Retry-After (any value) means "not done yet"."""
+    return response.status_code < 300 and "Retry-After" in response.headers
+
+
+def json_body(response: requests.Response) -> Any:
+    try:
+        return response.json() if (response.text or "").strip() else None
+    except ValueError:
+        return None
+
+
+def api_error(response: requests.Response, method: str, path: str) -> "BrainAPIError":
+    return BrainAPIError(response.status_code, method, path, error_message(response),
+                         retry_after_seconds(response) or None, json_body(response))
 
 
 def retry_after_seconds(response: requests.Response) -> float:
@@ -220,6 +238,7 @@ class CreddSession(requests.Session):
         self._credd_timeout = credd_timeout
         self._refresh_lock = threading.Lock()
         self._cookie_version: Optional[str] = None
+        self._last_attempt: Tuple[Optional[str], float] = (None, 0.0)
         self.refresh_cookies()
 
     def _fetch_from_credd(self) -> Tuple[Dict[str, str], Optional[str]]:
@@ -264,9 +283,16 @@ class CreddSession(requests.Session):
         (another thread refreshed while we waited for the lock), skip the fetch.
         """
         with self._refresh_lock:
-            if stale_version is not None and self._cookie_version != stale_version:
-                return self._cookie_version
-            cookies, version = self._fetch_from_credd()
+            if stale_version is not None:
+                if self._cookie_version != stale_version:
+                    return self._cookie_version  # another thread already refreshed
+                tried_version, tried_at = self._last_attempt
+                if tried_version == stale_version and time.monotonic() - tried_at < 10.0:
+                    return self._cookie_version  # just tried; don't hammer credd
+            try:
+                cookies, version = self._fetch_from_credd()
+            finally:
+                self._last_attempt = (stale_version, time.monotonic())
             jar = requests.cookies.RequestsCookieJar()
             for name, value in cookies.items():
                 jar.set(name, str(value), domain=self._cookie_domain, path="/", secure=self._secure)
@@ -314,8 +340,8 @@ def summarize_checks(checks: Any) -> Dict[str, Any]:
     items = [c for c in (checks or []) if isinstance(c, dict)]
     compact = [{k: c.get(k) for k in ("name", "result", "limit", "value") if c.get(k) is not None}
                for c in items]
-    failed = [c["name"] for c in compact if c.get("result") == "FAIL"]
-    pending = [c["name"] for c in compact if c.get("result") == "PENDING"]
+    failed = [c.get("name", "?") for c in compact if c.get("result") == "FAIL"]
+    pending = [c.get("name", "?") for c in compact if c.get("result") == "PENDING"]
     return {"checks": compact, "failed": failed, "pending": pending,
             "all_passed": bool(compact) and not failed and not pending}
 
@@ -444,10 +470,13 @@ class BrainClient:
         # Account-wide cooldown after a 429 so concurrent callers back off together,
         # and a cap on in-flight BRAIN requests so tool fan-out can't burst.
         self._cooldown_until = 0.0
-        self._inflight = asyncio.Semaphore(int(os.environ.get("WQMCP_MAX_INFLIGHT", "16")))
+        # Held by the worker thread, so a cancelled MCP call can't free a slot early.
+        self._inflight = threading.BoundedSemaphore(int(os.environ.get("WQMCP_MAX_INFLIGHT", "16")))
         self._user_id: Optional[str] = None
         self._cache: Dict[str, Tuple[float, Any]] = {}
         self._pending_submits: Dict[str, float] = {}
+        self._submit_locks: Dict[str, asyncio.Lock] = {}
+        self._submit_results: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         # Every simulation this process created (even if the MCP call was cancelled).
         self.recent_simulations: deque = deque(maxlen=50)
 
@@ -495,24 +524,26 @@ class BrainClient:
         session = await self._ensure_session()
         wait = self._cooldown_until - time.monotonic()
         if wait > 0:
-            await asyncio.sleep(min(wait, 30.0))
+            await asyncio.sleep(min(wait, 60.0))
         headers = {"Accept": accept or accept_header(method, path)}
         url = self.base_url + path
         method_l = method.lower()
 
         def send() -> requests.Response:
-            resp = session.request(method_l, url, params=params, json=json, headers=headers,
-                                   timeout=self.request_timeout)
+            with self._inflight:
+                resp = session.request(method_l, url, params=params, json=json, headers=headers,
+                                       timeout=self.request_timeout)
             if on_response is not None:
                 on_response(resp)  # runs even if the awaiting task was cancelled
             return resp
 
         loop = asyncio.get_running_loop()
         try:
-            async with self._inflight:
-                resp = await loop.run_in_executor(self._executor, send)
+            resp = await loop.run_in_executor(self._executor, send)
         except requests.RequestException as exc:
-            raise BrainNetworkError(f"BRAIN {method.upper()} {path}: {type(exc).__name__}") from exc
+            logger.warning("network error on %s %s: %r", method.upper(), path, exc)
+            raise BrainNetworkError(f"BRAIN {method.upper()} {path}: {type(exc).__name__}: "
+                                    f"{str(exc)[:300]}") from exc
         if resp.status_code == 429 and not (method.upper() == "POST" and path == "/simulations"):
             ra = retry_after_seconds(resp) or 5.0
             self._cooldown_until = max(self._cooldown_until, time.monotonic() + min(ra, 60.0))
@@ -521,8 +552,7 @@ class BrainClient:
     @staticmethod
     def _parse(resp: requests.Response, method: str, path: str) -> Any:
         if resp.status_code >= 400:
-            raise BrainAPIError(resp.status_code, method, path, error_message(resp),
-                                retry_after_seconds(resp) or None)
+            raise api_error(resp, method, path)
         if not (resp.text or "").strip():
             return None
         try:
@@ -580,23 +610,16 @@ class BrainClient:
             ra = retry_after_seconds(resp)
             remaining = deadline - time.monotonic()
             if status == 429 or status >= 500:
-                if remaining <= 0:
-                    if status == 429:
-                        return PollResult(False, None, ra or 5.0, status)
-                    raise BrainAPIError(status, method, path, error_message(resp), ra or None)
+                if remaining <= 0:  # busy or failing: report "not done", let the caller retry
+                    return PollResult(False, None, ra or 5.0, status)
                 sleep_for = ra or backoff
                 backoff = min(backoff * 2, 30.0)
             elif status >= 400:
-                raise BrainAPIError(status, method, path, error_message(resp), ra or None)
-            elif ra > 0:
+                raise api_error(resp, method, path)
+            elif in_progress(resp):
                 if remaining <= 0:
-                    data = None
-                    try:
-                        data = resp.json() if (resp.text or "").strip() else None
-                    except ValueError:
-                        pass
-                    return PollResult(False, data, ra, status)
-                sleep_for = ra
+                    return PollResult(False, json_body(resp), max(ra, 1.0), status)
+                sleep_for = max(ra, 1.0)
             else:
                 return PollResult(True, self._parse(resp, method, path), 0.0, status)
             await asyncio.sleep(max(1.0, min(sleep_for, max(remaining, 1.0))))
@@ -649,7 +672,11 @@ class BrainClient:
         if USE_PLATFORM_DEFAULTS:
             platform = await self.platform_defaults() or {}
             for key, val in platform.items():
-                if key in settings and val is not None:
+                # language stays explicit: a saved PYTHON default must not turn
+                # FASTEXPR expressions into Python source.
+                if key == "language" or val is None:
+                    continue
+                if key in settings or (key == "lookback" and val):
                     settings[key] = val
         for key, val in overrides.items():
             if val is not None:
@@ -763,9 +790,9 @@ class BrainClient:
         body = self._parse(resp, "GET", path) or {}
         ra = retry_after_seconds(resp)
         children = body.get("children") or []
-        if ra > 0:  # still running: honour Retry-After before touching children
+        if in_progress(resp):  # still running: honour Retry-After before touching children
             out = {"simulation_id": sim_id, "status": "RUNNING", "progress": body.get("progress"),
-                   "retry_after_seconds": ra}
+                   "retry_after_seconds": max(ra, 1.0)}
             if children:
                 out.update(multi=True, total_children=len(children))
             return {k: v for k, v in out.items() if v is not None}
@@ -813,8 +840,15 @@ class BrainClient:
         deadline = time.monotonic() + budget
         results: Dict[str, Dict[str, Any]] = {}
         pending = list(dict.fromkeys(ids))
+        async def one(sim_id: str) -> Dict[str, Any]:
+            try:
+                return await self._simulation_once(sim_id, include_alpha)
+            except BrainAPIError as exc:  # e.g. an expired id must not hide the other results
+                return {"simulation_id": sim_id, "status": "ERROR", "http_status": exc.status,
+                        "message": exc.message}
+
         while True:
-            states = await asyncio.gather(*[self._simulation_once(i, include_alpha) for i in pending])
+            states = await asyncio.gather(*[one(i) for i in pending])
             for i, s in zip(pending, states):
                 results[i] = s
             pending = [i for i in pending if results[i]["status"] in ("RUNNING", "UNKNOWN")]
@@ -966,6 +1000,17 @@ class BrainClient:
             result["note"] = ("Not submitted. These are BRAIN's pre-submission checks; call "
                               "submit_alpha(alpha_id, confirm=True) to actually submit.")
             return result
+        lock = self._submit_locks.setdefault(alpha_id, asyncio.Lock())
+        async with lock:  # concurrent confirm=True calls for one alpha share one POST
+            recent = self._submit_results.get(alpha_id)
+            if recent and time.monotonic() - recent[0] < 600:
+                return {**recent[1], "note": "Result of the submission made in the last 10 minutes."}
+            result = await self._submit_locked(alpha_id, path, wait_seconds)
+            if result["status"] not in ("PENDING", "RATE_LIMITED", "BUSY"):
+                self._submit_results[alpha_id] = (time.monotonic(), result)
+            return result
+
+    async def _submit_locked(self, alpha_id: str, path: str, wait_seconds: float) -> Dict[str, Any]:
         started = self._pending_submits.get(alpha_id)
         first = None
         if not started or time.monotonic() - started > 3600:
@@ -977,10 +1022,18 @@ class BrainClient:
                 return {"alpha_id": alpha_id, "status": "RATE_LIMITED",
                         "retry_after_seconds": retry_after_seconds(first) or 30.0}
             if first.status_code >= 400:
-                raise BrainAPIError(first.status_code, "POST", path, error_message(first),
-                                    retry_after_seconds(first) or None)
-        res = await self.poll(path, wait_seconds, first=first, first_method="POST")
+                return self._submit_rejection(alpha_id, api_error(first, "POST", path))
+        try:
+            res = await self.poll(path, wait_seconds, first=first, first_method="POST")
+        except BrainAPIError as exc:
+            self._pending_submits.pop(alpha_id, None)
+            return self._submit_rejection(alpha_id, exc)
         if not res.done:
+            if res.status >= 429:
+                return {"alpha_id": alpha_id, "status": "BUSY", "http_status": res.status,
+                        "retry_after_seconds": res.retry_after,
+                        "note": "BRAIN is busy; call submit_alpha(alpha_id, confirm=True) again later "
+                                "(it resumes polling and will not submit twice)."}
             return {"alpha_id": alpha_id, "status": "PENDING", "retry_after_seconds": res.retry_after,
                     "note": "Submission is being processed. Call submit_alpha(alpha_id, confirm=True) "
                             "again to keep polling; it will not submit twice."}
@@ -990,9 +1043,24 @@ class BrainClient:
             state = "REJECTED"
         elif summary["pending"]:
             state = "SUBMITTED_WITH_PENDING_CHECKS"
+        elif summary["checks"]:
+            state = "SUBMITTED"
         else:
-            state = "SUBMITTED"  # includes an empty 2xx body (accepted without a report)
+            # A 2xx without a check report: confirm via the alpha's stage.
+            alpha = await self._alpha_summary(alpha_id)
+            state = "SUBMITTED" if alpha.get("stage") == "OS" else "UNKNOWN"
+            summary["stage"] = alpha.get("stage")
         return {"alpha_id": alpha_id, "status": state, **summary}
+
+    @staticmethod
+    def _submit_rejection(alpha_id: str, exc: BrainAPIError) -> Dict[str, Any]:
+        """A 4xx on submit usually carries the failing checks; report them as REJECTED."""
+        body = exc.body if isinstance(exc.body, dict) else {}
+        checks = (body.get("is") or {}).get("checks")
+        if checks:
+            return {"alpha_id": alpha_id, "status": "REJECTED", "http_status": exc.status,
+                    **summarize_checks(checks)}
+        raise exc
 
     async def update_alpha(self, alpha_ids: Sequence[str], fields: Dict[str, Any],
                            bulk_fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -1015,16 +1083,21 @@ class BrainClient:
             out["alpha"] = summarize_alpha(data or {})
         return out
 
-    async def alpha_performance(self, alpha_id: str, competition_id: Optional[str]) -> Any:
+    async def alpha_performance(self, alpha_id: str, competition_id: Optional[str],
+                                wait_seconds: float = 30) -> Any:
         if competition_id:
             path = (f"/competitions/{seg(competition_id, 'competition id')}/alphas/"
                     f"{seg(alpha_id, 'alpha id')}/before-and-after-performance")
         else:
             path = f"/users/self/alphas/{seg(alpha_id, 'alpha id')}/before-and-after-performance"
-        data = await self.call("GET", path)
+        # The catalog shows no polling here, but a Retry-After is honoured if BRAIN sends one.
+        res = await self.poll(path, wait_seconds)
+        if not res.done:
+            return {"alpha_id": alpha_id, "status": "PENDING", "http_status": res.status,
+                    "retry_after_seconds": res.retry_after}
+        data = res.data
         if data is None:
-            return {"alpha_id": alpha_id, "status": "EMPTY",
-                    "note": "BRAIN returned no body (the catalog marks the competition variant as empty)."}
+            return {"alpha_id": alpha_id, "status": "EMPTY", "note": "BRAIN returned an empty body."}
         if isinstance(data, dict):
             for key in ("yearlyStats", "pnl"):
                 block = data.get(key)
@@ -1118,12 +1191,18 @@ class BrainClient:
         """
         check_date(start, "start_date", allow_time=True)
         check_date(end, "end_date", allow_time=True)
+        try:
+            lo, hi = _as_utc(start, end_of_day=False), _as_utc(end, end_of_day=True)
+        except ValueError as exc:
+            raise InvalidArgument(f"bad date: {exc}") from exc
+        # BRAIN treats a date-only upper bound as exclusive midnight: send the next day.
+        end_param = (hi + timedelta(microseconds=1)).strftime("%Y-%m-%d") if _DATE_RE.match(end) else end
         alphas: List[Dict[str, Any]] = []
         offset, page, complete = 0, 100, True
         while True:
             data = await self.call("GET", "/users/self/alphas", params={
                 "stage": "OS", "type": "REGULAR", "limit": page, "offset": offset,
-                "dateSubmitted>": start, "dateSubmitted<": end}) or {}
+                "dateSubmitted>": start, "dateSubmitted<": end_param}) or {}
             batch = data.get("results") or []
             alphas.extend(batch)
             offset += len(batch)
@@ -1134,10 +1213,12 @@ class BrainClient:
                 complete = False
                 break
         # dateSubmitted>/< are not in the catalog: re-apply the window client-side.
-        lo, hi = _as_utc(start, end_of_day=False), _as_utc(end, end_of_day=True)
         in_window, filtered_out = [], 0
         for a in alphas:
-            submitted = _as_utc(a.get("dateSubmitted"), end_of_day=False) if a.get("dateSubmitted") else None
+            try:
+                submitted = _as_utc(a["dateSubmitted"], end_of_day=False) if a.get("dateSubmitted") else None
+            except (ValueError, TypeError):
+                submitted = None  # unparseable: keep it, BRAIN already filtered
             if submitted is not None and not (lo <= submitted <= hi):
                 filtered_out += 1
                 continue

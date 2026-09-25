@@ -76,17 +76,29 @@ async def test_single_simulation_uses_platform_defaults(client, fake):
 
 async def test_multi_simulation_child_rate_limit_is_not_completion(client, fake):
     fake.state.child_429_once = True
+    fake.state.child_polls_needed = 1  # C0/C2 finish on their first poll; only C1 is held back
     settings = await client.build_settings("REGULAR", {})
     items = [{"type": "REGULAR", "settings": settings, "regular": f"rank(x{i})"} for i in range(3)]
     res = await client.create_simulations(items)
     assert isinstance(fake.state.calls("POST", "/simulations")[0]["body"], list)
+    parent_running = (await client.simulations([res["simulation_id"]], wait_seconds=0))[0]
+    assert parent_running["status"] == "RUNNING" and "children" not in parent_running
+    assert not fake.state.calls("GET", r"/simulations/S\d+C\d")  # Retry-After honoured first
     state = (await client.simulations([res["simulation_id"]], wait_seconds=0))[0]
-    assert state["multi"] and state["status"] == "RUNNING"
+    assert state["multi"] and state["status"] == "RUNNING" and state["completed_children"] == 2
     child1 = [c for c in state["children"] if c["simulation_id"].endswith("C1")][0]
     assert child1["status"] == "UNKNOWN"
     final = (await client.simulations([res["simulation_id"]], wait_seconds=15))[0]
     assert final["status"] == "COMPLETE" and final["completed_children"] == 3
     assert all(c.get("alpha", {}).get("id") for c in final["children"])
+
+
+async def test_one_bad_id_does_not_sink_the_batch(client, fake):
+    settings = await client.build_settings("REGULAR", {})
+    res = await client.create_simulations([{"type": "REGULAR", "settings": settings, "regular": "rank(close)"}])
+    states = await client.simulations([res["simulation_id"], "EXPIRED1"], wait_seconds=10)
+    assert states[0]["status"] == "COMPLETE"
+    assert states[1] == {"simulation_id": "EXPIRED1", "status": "ERROR", "http_status": 404, "message": "Not found."}
 
 
 async def test_simulation_error_message_is_surfaced(client, fake):
@@ -113,6 +125,12 @@ async def test_simulation_slots_full(client, fake):
     t0 = time.monotonic()
     await client.get_alpha("A1")
     assert time.monotonic() - t0 < 1
+
+
+async def test_saved_python_language_is_not_inherited(client, fake):
+    fake.state.saved_language = "PYTHON"
+    settings = await client.build_settings("REGULAR", {})
+    assert settings["language"] == "FASTEXPR" and "lookback" not in settings
 
 
 async def test_settings_validation(client, fake):
@@ -173,6 +191,21 @@ async def test_correlation_failure_does_not_hide_checks(client, fake, monkeypatc
     assert res["status"] == "DONE" and res["correlations"][0]["status"] == "ERROR"
 
 
+async def test_retry_after_zero_still_means_running(client, fake):
+    fake.state.check_ra_zero_once = True
+    res = await client.check_alpha("A5", wait_seconds=0)
+    assert res["status"] == "PENDING"
+
+
+async def test_correlation_http_error_is_reported_per_type(client, fake):
+    fake.state.corr_412 = True
+    res = await client.check_alpha("A6", wait_seconds=10, correlations=["self", "power-pool"])
+    assert res["status"] == "DONE"
+    by_type = {c["type"]: c for c in res["correlations"]}
+    assert by_type["self"]["status"] == "DONE"
+    assert by_type["power-pool"]["status"] == "ERROR" and "412" in by_type["power-pool"]["error"]
+
+
 async def test_check_alpha_rejects_unknown_correlation(client, fake):
     with pytest.raises(InvalidArgument):
         await client.check_alpha("A1", 0, correlations=["production"])
@@ -190,6 +223,32 @@ async def test_submit_polls_until_final_and_never_posts_twice(client, fake):
     second = await client.submit("A1", confirm=True, wait_seconds=10)
     assert second["status"] == "SUBMITTED" and second["all_passed"]
     assert len(fake.state.calls("POST", r"/alphas/A1/submit")) == 1
+
+
+async def test_concurrent_submits_post_once(client, fake):
+    fake.state.submit_post_delay = 0.5
+    a, b = await asyncio.gather(client.submit("A3", True, 10), client.submit("A3", True, 10))
+    assert a["status"] == b["status"] == "SUBMITTED"
+    assert len(fake.state.calls("POST", "/alphas/A3/submit")) == 1
+
+
+async def test_submit_rejection_while_resuming_is_reported(client, fake):
+    fake.state.submit_get_403 = True
+    pending = await client.submit("A4", True, 0)
+    assert pending["status"] == "PENDING"
+    res = await client.submit("A4", True, 10)
+    assert res["status"] == "REJECTED" and res["failed"] == ["LOW_SUB_UNIVERSE_SHARPE"]
+    assert "A4" not in client._pending_submits  # a fixed alpha can be resubmitted
+    client._submit_results.clear()
+    fake.state.submit_get_403 = False
+    again = await client.submit("A4", True, 10)
+    assert again["status"] == "SUBMITTED" and len(fake.state.calls("POST", "/alphas/A4/submit")) == 2
+
+
+async def test_submit_without_report_checks_stage(client, fake):
+    fake.state.submit_empty_done = True
+    res = await client.submit("A8", True, 10)
+    assert res["status"] == "UNKNOWN" and res["stage"] == "IS"
 
 
 async def test_submit_rejected(client, fake):
@@ -315,6 +374,18 @@ async def test_401_refreshes_cookie_once_for_concurrent_requests(client, fake):
     assert fake.state.credd_calls == 2  # one refresh, not one per thread
 
 
+async def test_credd_backoff_does_not_stampede(client, fake):
+    await client.get_alpha("A1")
+    fake.state.valid_token = "tok-2"  # BRAIN rejects the old cookie...
+    fake.state.credd_same_version = True  # ...and credd keeps handing out the same one
+    fake.state.credd_delay = 0.3
+    t0 = time.monotonic()
+    results = await asyncio.gather(*[client.get_alpha(f"A{i}") for i in range(8)], return_exceptions=True)
+    assert all(isinstance(r, BrainAPIError) and r.status == 401 for r in results)
+    assert fake.state.credd_calls == 2  # bootstrap + one refresh attempt, not one per request
+    assert time.monotonic() - t0 < 3
+
+
 async def test_429_is_retried_then_surfaced(client, fake):
     fake.state.rate_limit_next_get = 1
     t0 = time.monotonic()
@@ -345,8 +416,11 @@ async def test_network_errors_are_typed(fake):
 
 async def test_diversity_score_refilters_window(client, fake):
     fake.state.alphas[0]["dateSubmitted"] = "2025-06-01T00:00:00Z"
+    fake.state.alphas[1]["dateSubmitted"] = "not-a-date"
     res = await client.diversity_score("2026-01-01", "2026-12-31")
     assert res["filtered_out"] == 1 and res["N"] == 249 and "outside the window" in res["note"]
+    q = fake.state.calls("GET", "/users/self/alphas")[0]["query"]
+    assert q["dateSubmitted<"] == "2027-01-01"  # date-only end is inclusive
 
 
 async def test_user_id_is_required_for_user_scoped_calls(client, fake, monkeypatch):

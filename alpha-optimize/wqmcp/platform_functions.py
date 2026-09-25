@@ -7,5 +7,7 @@ client); see README.md for the tool list and configuration.
 
 from server import brain, main, mcp  # noqa: F401  (re-exported for old imports)
 
+brain_client = brain  # v1 name of the client instance
+
 if __name__ == "__main__":
     main()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -50,8 +51,17 @@ class FakeState:
     next_sim: int = 1
     alphas: List[Dict[str, Any]] = field(default_factory=list)
     submit_fail: bool = False
+    submit_get_403: bool = False
+    submit_empty_done: bool = False
+    submit_post_delay: float = 0.0
     child_429_once: bool = False
+    child_polls_needed: int = 2
     rate_limit_next_get: int = 0
+    credd_same_version: bool = False
+    credd_delay: float = 0.0
+    corr_412: bool = False
+    check_ra_zero_once: bool = False
+    saved_language: str = "FASTEXPR"
 
     def tick(self, key: str) -> int:
         with self.lock:
@@ -145,6 +155,10 @@ class FakeBrain:
         st = self.state
         if path == "/cookies":
             st.credd_calls += 1
+            if st.credd_delay:
+                time.sleep(st.credd_delay)
+            if st.credd_same_version:  # credd in backoff: same stale cookie, same version
+                return 200, {"X-Cookie-Version": "v1"}, {"session": "tok-1"}
             return 200, {"X-Cookie-Version": f"v{st.cookie_version}"}, {"session": st.valid_token}
         if f"session={st.valid_token}" not in rec["cookie"]:
             return 401, {}, {"detail": "Incorrect authentication credentials."}
@@ -179,7 +193,7 @@ def _sim_settings(fb, q, body) -> Response:
     return 200, {}, {"instrumentType": "EQUITY", "region": "USA", "universe": "TOP3000", "delay": 1, "decay": 4,
                      "neutralization": "SUBINDUSTRY", "truncation": 0.08, "lookback": 0, "pasteurization": "ON",
                      "unitHandling": "VERIFY", "nanHandling": "OFF", "selectionHandling": "OFF",
-                     "selectionLimit": 1000, "maxTrade": "OFF", "maxPosition": "OFF", "language": "FASTEXPR",
+                     "selectionLimit": 1000, "maxTrade": "OFF", "maxPosition": "OFF", "language": fb.state.saved_language,
                      "visualization": False, "testPeriod": "P0Y0M0D", "componentActivation": "OFF"}
 
 
@@ -221,12 +235,15 @@ def _get_sim(fb: FakeBrain, q, body, sid: str) -> Response:
     if sim is None:
         return 404, {}, {"detail": "Not found."}
     if "children" in sim:
+        sim["polls"] = sim.get("polls", 0) + 1
+        if sim["polls"] < 2:
+            return 200, {"Retry-After": "1"}, {"progress": 0.3}
         return 200, {}, {"children": sim["children"], "status": "COMPLETE"}
     if st.child_429_once and "C1" in sid and not sim.get("rl"):
         sim["rl"] = True
         return 429, {"Retry-After": "1"}, {"detail": "slow down"}
     sim["polls"] += 1
-    if sim["polls"] < 2:
+    if sim["polls"] < st.child_polls_needed:
         return 200, {"Retry-After": "1"}, {"progress": 0.5}
     if sim.get("regular") == "fail()":
         return 200, {}, {"id": sid, "status": "ERROR", "message": "Attempted to use unknown variable \"foo\"",
@@ -291,7 +308,10 @@ def _bulk_patch(fb, q, body) -> Response:
 
 @route("GET", r"/alphas/([^/]+)/check")
 def _check(fb: FakeBrain, q, body, aid) -> Response:
-    if fb.state.tick(f"check:{aid}") < 2:
+    n = fb.state.tick(f"check:{aid}")
+    if fb.state.check_ra_zero_once and n == 1:
+        return 200, {"Retry-After": "0"}, None  # present-but-zero still means "running"
+    if n < 2:
         return 200, {"Retry-After": "1"}, None
     return 200, {}, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
                                        {"name": "SELF_CORRELATION", "result": "FAIL", "limit": 0.7, "value": 0.82}],
@@ -301,6 +321,8 @@ def _check(fb: FakeBrain, q, body, aid) -> Response:
 @route("POST", r"/alphas/([^/]+)/submit")
 def _submit(fb: FakeBrain, q, body, aid) -> Response:
     fb.state.tick(f"submit-post:{aid}")
+    if fb.state.submit_post_delay:
+        time.sleep(fb.state.submit_post_delay)
     return 201, {"Retry-After": "1"}, None
 
 
@@ -308,6 +330,11 @@ def _submit(fb: FakeBrain, q, body, aid) -> Response:
 def _submit_poll(fb: FakeBrain, q, body, aid) -> Response:
     if fb.state.tick(f"submit-get:{aid}") < 2:
         return 200, {"Retry-After": "1"}, None
+    if fb.state.submit_get_403:
+        return 403, {}, {"is": {"checks": [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL",
+                                            "limit": 0.5, "value": 0.3}]}}
+    if fb.state.submit_empty_done:
+        return 200, {}, None
     result = "FAIL" if fb.state.submit_fail else "PASS"
     return 200, {}, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
                                        {"name": "PROD_CORRELATION", "result": result, "limit": 0.7, "value": 0.5}]}}
@@ -315,6 +342,8 @@ def _submit_poll(fb: FakeBrain, q, body, aid) -> Response:
 
 @route("GET", r"/alphas/([^/]+)/correlations/(self|prod|power-pool)")
 def _corr(fb: FakeBrain, q, body, aid, kind) -> Response:
+    if fb.state.corr_412 and kind == "power-pool":
+        return 412, {}, {"detail": "Power pool correlation is not available for this alpha."}
     if fb.state.tick(f"corr:{aid}:{kind}") < 2:
         return 200, {"Retry-After": "1"}, None
     return 200, {}, {"schema": {"name": "correlation", "properties": [{"name": "id"}, {"name": "correlation"}]},
