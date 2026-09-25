@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 import urllib.error
 import urllib.request
 
@@ -42,6 +43,11 @@ class McpClient:
     def __init__(self, url):
         self.url = url
         self.session_id = None
+        self._next_id = 0
+
+    def _new_id(self):
+        self._next_id += 1
+        return self._next_id
 
     def _post(self, payload, expect_response=True):
         data = json.dumps(payload).encode()
@@ -56,15 +62,19 @@ class McpClient:
             body = response.read().decode()
         if not expect_response:
             return None
-        # streamable-http frames JSON as SSE "data:" lines
+        # streamable-http frames JSON as SSE "data:" lines; skip server
+        # notifications and pick the response to this request's id.
         for line in body.splitlines():
             line = line[5:].strip() if line.startswith('data:') else line.strip()
-            if line.startswith('{'):
-                return json.loads(line)
+            if not line.startswith('{'):
+                continue
+            message = json.loads(line)
+            if message.get('id') == payload.get('id'):
+                return message
         return None
 
     def connect(self):
-        self._post({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+        self._post({'jsonrpc': '2.0', 'id': self._new_id(), 'method': 'initialize',
                     'params': {'protocolVersion': '2024-11-05', 'capabilities': {},
                                'clientInfo': {'name': 'prodmemo-cron', 'version': '1'}}})
         if not self.session_id:
@@ -73,7 +83,7 @@ class McpClient:
                    expect_response=False)
 
     def call(self, name, arguments=None):
-        response = self._post({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+        response = self._post({'jsonrpc': '2.0', 'id': self._new_id(), 'method': 'tools/call',
                                'params': {'name': name, 'arguments': arguments or {}}})
         if not response:
             raise RuntimeError(f'empty response from tool {name}')
@@ -83,10 +93,23 @@ class McpClient:
         if not content:
             return {}
         text = content[0].get('text', '')
+        if response.get('result', {}).get('isError'):
+            raise RuntimeError(f'tool {name} failed: {text}')
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             return {'raw': text}
+
+    def close(self):
+        """End the server-side MCP session (otherwise one leaks per run)."""
+        if not self.session_id:
+            return
+        request = urllib.request.Request(self.url, method='DELETE')
+        request.add_header('mcp-session-id', self.session_id)
+        try:
+            urllib.request.urlopen(request, timeout=30).close()
+        except (urllib.error.URLError, OSError):
+            pass
 
 
 def main():
@@ -108,7 +131,21 @@ def main():
         if not started.get('started'):
             # Yesterday's run still going, or another client kicked one off.
             log(f'sync not started: {started}')
-            return 0 if started.get('reason') == 'already_running' else 1
+            if started.get('reason') != 'already_running':
+                return 1
+            # A run older than MAX_WAIT is stuck, not busy: make cron say so.
+            sync = started.get('sync') or {}
+            started_at = sync.get('startedAt')
+            try:
+                age = time.time() - datetime.fromisoformat(
+                    str(started_at).replace('Z', '+00:00')).timestamp()
+            except (TypeError, ValueError):
+                age = None
+            if age is not None and age > MAX_WAIT_SECONDS:
+                log(f'STUCK: a sync has been running since {started_at} ({int(age)}s); '
+                    f'stop it with prodmemo_sync(mode="stop") and check the server log')
+                return 1
+            return 0
 
         deadline = time.time() + MAX_WAIT_SECONDS
         state = {}
@@ -136,6 +173,8 @@ def main():
     except Exception as exc:  # noqa: BLE001 - cron needs the reason in the log
         log(f'FATAL: {type(exc).__name__}: {exc}')
         return 2
+    finally:
+        client.close()
 
 
 if __name__ == '__main__':
