@@ -40,10 +40,15 @@ claude mcp add --transport http brain-platform http://127.0.0.1:8761/mcp
 | `CREDD_URL` / `CREDD_TOKEN` | `http://127.0.0.1:8762` / 空 | credd 地址和令牌 |
 | `WQMCP_ACCEPT_VERSIONS` | `1` | 按目录发送版本化的 Accept 头（如 listAlphas 用 4.0）。设为 `0` 则只发 `application/json` |
 | `WQMCP_USE_PLATFORM_DEFAULTS` | `1` | `create_simulation` 没填的设置，用你在 BRAIN 网页上保存的默认设置补齐 |
+| `WQMCP_READ_ONLY` | `0` | 设为 `1` 时禁用所有写工具：建模拟、取消模拟、改 alpha、真正提交 |
+| `WQMCP_ALLOW_SUBMIT` | `1` | 设为 `0` 时禁止真正提交，`submit_alpha` 只能做 dry-run 检查 |
+| `WQMCP_MAX_INFLIGHT` | `16` | 同时发往 BRAIN 的请求数上限（整个账户共享） |
 | `WQMCP_HTTP_WORKERS` / `WQMCP_POOL_MAXSIZE` | `32` / `32` | HTTP 线程池大小和连接池大小 |
 | `WQMCP_CONNECT_TIMEOUT` / `WQMCP_READ_TIMEOUT` | `10` / `60` | 单次请求的连接超时和读超时（秒） |
 | `WQMCP_FORUM_CONCURRENCY` / `WQMCP_FORUM_TIMEOUT` | `2` / `90` | 论坛工具的并发页数上限和单次操作超时（秒） |
 | `WQMCP_FORUM_BROWSER_CHANNEL` | `chrome` | 先尝试本机 Chrome，失败时退回 Playwright 自带的 Chromium |
+| `WQMCP_FORUM_CHROMIUM_SANDBOX` | `0` | 设为 `1` 时启用 Chromium 沙箱（Playwright 默认关闭） |
+| `WQMCP_GLOSSARY_TTL` | `86400` | 术语表缓存时间（秒） |
 | `WQMCP_LOG_LEVEL` | `INFO` | 日志只输出到 stderr |
 
 ## 工具一览
@@ -75,7 +80,12 @@ claude mcp add --transport http brain-platform http://127.0.0.1:8761/mcp
 | 论坛 | `search_forum_posts` / `read_forum_post` / `get_glossary_terms` | 用 Playwright 抓取 support 站点。已入库的内容用 brain-rag 的 `rag_search` 查更快 |
 
 所有工具出错时都会抛异常，MCP 客户端收到的是 `isError: true` 和一条可读的错误信息。耗时任务
-返回 `RUNNING` 或 `PENDING` 以及 `retry_after_seconds`，稍后再调同一个工具即可。
+返回 `RUNNING` 或 `PENDING` 以及 `retry_after_seconds`，稍后再调同一个工具即可。读请求遇到
+429/502/503/504 或网络错误时，会按 Retry-After 自动重试两次；写请求从不自动重试。
+
+论坛工具需要浏览器：`pip install playwright` 之后运行 `playwright install chromium`，或者本机
+装有 Chrome。未安装 Playwright 时服务仍能启动，只是论坛工具会报错并提示安装方法。support 站点的
+登录走 `/access/sso`，和 `wq-rag/wq-doc-forum` 的做法一致，复用 credd 提供的 BRAIN cookie。
 
 ## 旧工具 → 新工具（v1 有 40 个工具，v2 有 25 个）
 

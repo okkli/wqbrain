@@ -28,6 +28,14 @@ logger = logging.getLogger("wqmcp")
 
 HOST = os.environ.get("WQMCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("WQMCP_PORT", "8761"))
+# Kill switches: READ_ONLY blocks every write tool, ALLOW_SUBMIT=0 blocks real submissions.
+READ_ONLY = os.environ.get("WQMCP_READ_ONLY", "0") == "1"
+ALLOW_SUBMIT = os.environ.get("WQMCP_ALLOW_SUBMIT", "1") != "0"
+
+
+def _require_writes(what: str) -> None:
+    if READ_ONLY:
+        raise InvalidArgument(f"{what} is disabled: this server runs with WQMCP_READ_ONLY=1")
 
 
 def _transport_security() -> Optional[TransportSecuritySettings]:
@@ -69,6 +77,8 @@ def _forum_client():
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
+WRITE_IDEMPOTENT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+                                   openWorldHint=True)
 DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
 
 Region = Annotated[Optional[str], Field(description="e.g. USA, CHN, EUR, ASI, GLB; valid combos: get_platform_setting_options")]
@@ -149,6 +159,7 @@ async def create_simulation(
         "selectionHandling": selection_handling, "selectionLimit": selection_limit,
         "componentActivation": component_activation,
     }
+    _require_writes("create_simulation")
     settings = await brain.build_settings(type, overrides)
     if type == "SUPER":
         if not combo or not selection:
@@ -195,6 +206,7 @@ async def get_simulation(
 @mcp.tool(annotations=DESTRUCTIVE)
 async def cancel_simulation(simulation_id: str) -> Dict[str, Any]:
     """Cancel (DELETE) a running simulation to free an account simulation slot."""
+    _require_writes("cancel_simulation")
     return await brain.cancel_simulation(simulation_id)
 
 
@@ -211,9 +223,9 @@ async def preview_super_selection(
     selection: Annotated[str, Field(description="SuperAlpha selection expression")],
     region: Region = None,
     delay: Delay = None,
-    selection_limit: Annotated[Optional[int], Field(ge=10, le=1000)] = None,
+    selection_limit: Annotated[Optional[int], Field(ge=10, le=1000, description="Max number of alphas the selection may pick")] = None,
     selection_handling: Optional[Literal["POSITIVE", "NON_ZERO", "NON_NAN"]] = None,
-    limit: Limit = 20,
+    limit: Annotated[int, Field(ge=1, le=100, description="How many selected alphas to return")] = 20,
 ) -> Dict[str, Any]:
     """Preview which of your alphas a SuperAlpha selection expression would pick
     (GET /simulations/super-selection). Returns compact alpha summaries."""
@@ -232,18 +244,18 @@ async def list_alphas(
     alpha_type: Optional[Literal["REGULAR", "SUPER", "RA_PARENT", "RA_CHILD"]] = None,
     limit: Limit = 20,
     offset: Offset = 0,
-    order: Annotated[Optional[str], Field(description="e.g. -dateCreated (default), dateCreated, -dateSubmitted")] = "-dateCreated",
-    created_after: Annotated[Optional[str], Field(description="ISO date/date-time")] = None,
+    order: Annotated[Optional[str], Field(description="-dateCreated (default) or dateCreated; other fields are unverified")] = "-dateCreated",
+    created_after: Annotated[Optional[str], Field(description="ISO date/date-time (undocumented filter)")] = None,
     created_before: Optional[str] = None,
     submitted_after: Optional[str] = None,
     submitted_before: Optional[str] = None,
-    hidden: Optional[bool] = None,
+    hidden: Annotated[Optional[bool], Field(description="undocumented filter")] = None,
     full: Annotated[bool, Field(description="Return raw alpha objects instead of compact summaries")] = False,
 ) -> Dict[str, Any]:
     """List your alphas with filters and pagination (returns count, has_more, next_offset).
 
     Results are compact summaries (settings, code, IS metrics, failed/pending checks) unless
-    full=True. Date filters are not in the documented API and are applied best-effort by BRAIN.
+    full=True. The date filters and `hidden` are not in the documented API (best effort).
     """
     return await brain.list_alphas(stage=stage, status=status, alpha_type=alpha_type, limit=limit,
                                    offset=offset, order=_none_if_blank(order), created_after=created_after,
@@ -294,10 +306,15 @@ async def submit_alpha(
     pre-submission checks. With confirm=True it submits and follows BRAIN's asynchronous
     submission until the final checks: status SUBMITTED, REJECTED (see failed) or PENDING
     (call again with confirm=True; it resumes polling and never submits twice)."""
+    if confirm:
+        _require_writes("submit_alpha")
+        if not ALLOW_SUBMIT:
+            raise InvalidArgument("real submissions are disabled (WQMCP_ALLOW_SUBMIT=0); "
+                                  "confirm=False still runs the pre-submission checks")
     return await brain.submit(alpha_id, confirm, wait_seconds)
 
 
-@mcp.tool(annotations=WRITE)
+@mcp.tool(annotations=WRITE_IDEMPOTENT)
 async def update_alpha(
     alpha_ids: Annotated[List[str], Field(min_length=1, max_length=100)],
     favorite: Optional[bool] = None,
@@ -313,6 +330,7 @@ async def update_alpha(
 ) -> Dict[str, Any]:
     """Update alpha metadata. favorite/hidden/color apply to all alpha_ids in one bulk request;
     name/category/tags/descriptions/osmosis_points apply to a single alpha."""
+    _require_writes("update_alpha")
     bulk: Dict[str, Any] = {}
     if favorite is not None:
         bulk["favorite"] = favorite
@@ -356,6 +374,10 @@ async def get_datasets(
     category: Annotated[Optional[str], Field(description="Category id, e.g. fundamental, analyst, model")] = None,
     subcategory: Optional[str] = None,
     theme: Optional[str] = None,
+    min_coverage: Annotated[Optional[float], Field(ge=0, le=1, description="coverage lower bound (0-1)")] = None,
+    min_value_score: Annotated[Optional[float], Field(ge=0)] = None,
+    min_alpha_count: Annotated[Optional[int], Field(ge=0)] = None,
+    max_alpha_count: Annotated[Optional[int], Field(ge=0, description="e.g. find under-used datasets")] = None,
     order: Annotated[Optional[str], Field(description="e.g. -valueScore, -alphaCount, coverage")] = None,
     limit: Annotated[int, Field(ge=1, le=50)] = 20,
     offset: Offset = 0,
@@ -368,7 +390,8 @@ async def get_datasets(
         return await brain.search_data(search, limit)
     params = {"instrumentType": "EQUITY", "region": region, "delay": delay, "universe": universe,
               "search": search, "category": category, "subcategory": subcategory, "theme": theme,
-              "order": order}
+              "coverage>": min_coverage, "valueScore>": min_value_score, "alphaCount>": min_alpha_count,
+              "alphaCount<": max_alpha_count, "order": order}
     return await brain.datasets(params, limit, offset)
 
 
@@ -381,6 +404,11 @@ async def get_datafields(
     search: Optional[str] = None,
     field_type: Optional[Literal["MATRIX", "VECTOR", "GROUP", "UNIVERSE", "SYMBOL"]] = None,
     category: Optional[str] = None,
+    subcategory: Optional[str] = None,
+    theme: Optional[str] = None,
+    min_coverage: Annotated[Optional[float], Field(ge=0, le=1, description="coverage lower bound (0-1)")] = None,
+    min_alpha_count: Annotated[Optional[int], Field(ge=0)] = None,
+    max_alpha_count: Annotated[Optional[int], Field(ge=0)] = None,
     order: Annotated[Optional[str], Field(description="e.g. -alphaCount, coverage, -userCount")] = None,
     limit: Limit = 50,
     offset: Offset = 0,
@@ -392,7 +420,8 @@ async def get_datafields(
         return await brain.datafield(field_id)
     params = {"instrumentType": "EQUITY", "region": region, "delay": delay, "universe": universe,
               "dataset.id": dataset_id, "search": search, "type": field_type, "category": category,
-              "order": order}
+              "subcategory": subcategory, "theme": theme, "coverage>": min_coverage,
+              "alphaCount>": min_alpha_count, "alphaCount<": max_alpha_count, "order": order}
     return await brain.datafields(params, limit, offset)
 
 
@@ -550,10 +579,11 @@ async def read_forum_post(
     post: Annotated[str, Field(description="Post/article id (e.g. 32984819083415), 'posts/<id>', 'articles/<id>' or a support.worldquantbrain.com URL")],
     include_comments: bool = True,
     max_comments: Annotated[int, Field(ge=0, le=500)] = 100,
+    locale: Annotated[str, Field(description="Used to build URLs from bare ids, e.g. zh-cn, en-us")] = "zh-cn",
 ) -> Dict[str, Any]:
     """Read one forum post or article (body keeps line breaks and code) with its comments."""
     return await _forum_client().read_post(post, include_comments=include_comments,
-                                           max_comments=max_comments)
+                                           max_comments=max_comments, locale=locale)
 
 
 @mcp.tool(annotations=READ)

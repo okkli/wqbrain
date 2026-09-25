@@ -128,3 +128,20 @@ async def test_read_tools(mcp_session, fake):
         assert comp["competition"]["id"] == "GAC2026" and comp["agreement"] is None
         is_error, docs = await call(session, "get_documentation", page_id="P1")
         assert docs["content"][2] == {"type": "EQUATION", "value": "rank(close)"}
+
+
+async def test_write_kill_switches(mcp_session, fake, monkeypatch):
+    monkeypatch.setattr(server, "ALLOW_SUBMIT", False)
+    async with mcp_session() as session:
+        is_error, text = await call(session, "submit_alpha", alpha_id="A1", confirm=True)
+        assert is_error and "WQMCP_ALLOW_SUBMIT=0" in text
+        is_error, dry = await call(session, "submit_alpha", alpha_id="A1", wait_seconds=10)
+        assert not is_error and dry["dry_run"]
+    monkeypatch.setattr(server, "READ_ONLY", True)
+    async with mcp_session() as session:
+        for tool, args in (("create_simulation", {"expressions": ["rank(close)"]}),
+                           ("cancel_simulation", {"simulation_id": "S1"}),
+                           ("update_alpha", {"alpha_ids": ["A1"], "favorite": True})):
+            is_error, text = await call(session, tool, **args)
+            assert is_error and "WQMCP_READ_ONLY=1" in text, tool
+    assert not fake.state.calls("POST", "/simulations") and not fake.state.calls("POST", "/alphas/A1/submit")

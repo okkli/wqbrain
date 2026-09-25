@@ -22,7 +22,8 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlsplit
 
 import requests
@@ -55,6 +56,10 @@ class InvalidArgument(BrainError, ValueError):
 
 class CreddUnavailable(BrainError):
     """credd itself is unreachable or returned an error (distinct from a BRAIN 401)."""
+
+
+class BrainNetworkError(BrainError):
+    """Timeout / connection failure talking to BRAIN (no HTTP status)."""
 
 
 class BrainAPIError(BrainError):
@@ -222,20 +227,23 @@ class CreddSession(requests.Session):
         try:
             r = requests.get(f"{CREDD_URL}/cookies", headers=headers, timeout=self._credd_timeout)
         except requests.RequestException as exc:
-            raise CreddUnavailable(f"credd unreachable (is creds-daemon running?): {exc}") from exc
+            logger.warning("credd request failed: %s", exc)
+            raise CreddUnavailable("credd (login daemon) is unreachable; is creds-daemon running? "
+                                   "Details are in the wqmcp log.") from exc
         if r.status_code >= 400:
             try:
                 body = r.json()
             except ValueError:
                 body = {"error": "error", "detail": r.text[:200]}
             code = body.get("error")
-            msg = f"credd returned {r.status_code}: {code} - {body.get('detail')}"
+            logger.warning("credd returned %s: %s", r.status_code, body)
+            msg = f"credd refused to provide a BRAIN cookie (HTTP {r.status_code}, {code})"
             if code == "biometric_required":
-                msg += ". Complete the biometric check in credd (see its /status), then retry"
+                msg += "; complete the pending biometric check in credd, then retry"
             elif code == "unauthorized":
-                msg += ". CREDD_TOKEN does not match credd's token"
+                msg += "; CREDD_TOKEN does not match credd's token"
             elif code in ("backoff", "rate_limited"):
-                msg += f". Retry after ~{body.get('retry_after', '?')}s"
+                msg += f"; retry after ~{body.get('retry_after', '?')}s"
             raise CreddUnavailable(msg)
         try:
             cookies = r.json()
@@ -394,7 +402,7 @@ class PollResult:
 _HARD_SIM_DEFAULTS: Dict[str, Any] = {
     "instrumentType": "EQUITY", "region": "USA", "universe": "TOP3000", "delay": 1, "decay": 0,
     "neutralization": "NONE", "truncation": 0.0, "pasteurization": "ON", "unitHandling": "VERIFY",
-    "nanHandling": "OFF", "language": "FASTEXPR", "visualization": False, "testPeriod": "P0Y0M",
+    "nanHandling": "OFF", "language": "FASTEXPR", "visualization": False, "testPeriod": "P0Y0M0D",
     "maxTrade": "OFF", "maxPosition": "OFF", "selectionHandling": "POSITIVE", "selectionLimit": 1000,
     "componentActivation": "IS",
 }
@@ -433,8 +441,10 @@ class BrainClient:
             float(os.environ.get("WQMCP_CONNECT_TIMEOUT", "10")),
             float(os.environ.get("WQMCP_READ_TIMEOUT", "60")),
         )
-        # Account-wide cooldown after a 429 so concurrent callers back off together.
+        # Account-wide cooldown after a 429 so concurrent callers back off together,
+        # and a cap on in-flight BRAIN requests so tool fan-out can't burst.
         self._cooldown_until = 0.0
+        self._inflight = asyncio.Semaphore(int(os.environ.get("WQMCP_MAX_INFLIGHT", "16")))
         self._user_id: Optional[str] = None
         self._cache: Dict[str, Tuple[float, Any]] = {}
         self._pending_submits: Dict[str, float] = {}
@@ -498,7 +508,11 @@ class BrainClient:
             return resp
 
         loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(self._executor, send)
+        try:
+            async with self._inflight:
+                resp = await loop.run_in_executor(self._executor, send)
+        except requests.RequestException as exc:
+            raise BrainNetworkError(f"BRAIN {method.upper()} {path}: {type(exc).__name__}") from exc
         if resp.status_code == 429 and not (method.upper() == "POST" and path == "/simulations"):
             ra = retry_after_seconds(resp) or 5.0
             self._cooldown_until = max(self._cooldown_until, time.monotonic() + min(ra, 60.0))
@@ -518,9 +532,25 @@ class BrainClient:
 
     async def call(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
                    json: Any = None) -> Any:
-        """Request + raise on HTTP error + parse JSON (None for an empty body)."""
-        resp = await self.request(method, path, params=params, json=json)
-        return self._parse(resp, method.upper(), path)
+        """Request + raise on HTTP error + parse JSON (None for an empty body).
+
+        GETs are retried twice on 429/502/503/504 and network errors (bounded sleeps,
+        honouring Retry-After); writes are never retried.
+        """
+        attempts = 3 if method.upper() == "GET" else 1
+        for attempt in range(attempts):
+            last = attempt == attempts - 1
+            try:
+                resp = await self.request(method, path, params=params, json=json)
+            except BrainNetworkError:
+                if last:
+                    raise
+                await asyncio.sleep(2.0 * (attempt + 1))
+                continue
+            if resp.status_code in (429, 502, 503, 504) and not last:
+                await asyncio.sleep(min(retry_after_seconds(resp) or 2.0 * (attempt + 1), 10.0))
+                continue
+            return self._parse(resp, method.upper(), path)
 
     async def poll(self, path: str, wait_seconds: float, *, first: Optional[requests.Response] = None,
                    first_method: str = "GET") -> PollResult:
@@ -537,7 +567,14 @@ class BrainClient:
         backoff = 2.0
         while True:
             if resp is None:
-                resp = await self.request("GET", path)
+                try:
+                    resp = await self.request("GET", path)
+                except BrainNetworkError:
+                    if deadline - time.monotonic() <= 0:
+                        raise
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
                 method = "GET"
             status = resp.status_code
             ra = retry_after_seconds(resp)
@@ -568,8 +605,9 @@ class BrainClient:
     # ------------------------------------------------------------------ auth
 
     async def status(self, refresh: bool = False) -> Dict[str, Any]:
+        cold = self.session is None
         session = await self._ensure_session()
-        if refresh:
+        if refresh and not cold:  # a cold session has just pulled fresh cookies
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, session.refresh_cookies)
         resp = await self.request("GET", "/authentication")
@@ -586,13 +624,11 @@ class BrainClient:
                 "permissions": data.get("permissions")}
 
     async def user_id(self) -> str:
-        if self._user_id:
-            return self._user_id
-        try:
-            await self.status()
-        except BrainError:
-            pass
-        return self._user_id or "self"
+        if not self._user_id:
+            st = await self.status()
+            if not self._user_id:
+                raise BrainError(f"could not determine the BRAIN user id from GET /authentication: {st}")
+        return self._user_id
 
     # ------------------------------------------------------------ simulation
 
@@ -600,8 +636,8 @@ class BrainClient:
         cached = self._cached("sim_defaults", 600)
         if cached is not None:
             return cached
-        uid = await self.user_id()
         try:
+            uid = await self.user_id()
             data = await self.call("GET", f"/users/{seg(uid, 'user id')}/settings/simulation")
         except BrainError as exc:
             logger.warning("could not read platform simulation defaults: %s", exc)
@@ -714,7 +750,11 @@ class BrainClient:
 
     async def _simulation_once(self, sim_id: str, include_alpha: bool) -> Dict[str, Any]:
         path = f"/simulations/{seg(sim_id, 'simulation id')}"
-        resp = await self.request("GET", path)
+        try:
+            resp = await self.request("GET", path)
+        except BrainNetworkError as exc:
+            return {"simulation_id": sim_id, "status": "UNKNOWN", "retry_after_seconds": 5.0,
+                    "note": f"network error ({exc}); check again"}
         status = resp.status_code
         if status == 429 or status >= 500:
             return {"simulation_id": sim_id, "status": "UNKNOWN", "http_status": status,
@@ -723,6 +763,12 @@ class BrainClient:
         body = self._parse(resp, "GET", path) or {}
         ra = retry_after_seconds(resp)
         children = body.get("children") or []
+        if ra > 0:  # still running: honour Retry-After before touching children
+            out = {"simulation_id": sim_id, "status": "RUNNING", "progress": body.get("progress"),
+                   "retry_after_seconds": ra}
+            if children:
+                out.update(multi=True, total_children=len(children))
+            return {k: v for k, v in out.items() if v is not None}
         if children:
             states = await asyncio.gather(*[self._child_state(str(c)) for c in children])
             unfinished = [s for s in states if s["status"] in ("RUNNING", "UNKNOWN")]
@@ -739,9 +785,6 @@ class BrainClient:
             if unfinished:
                 out["retry_after_seconds"] = max([ra] + [s.get("retry_after_seconds", 0) for s in unfinished]) or 5.0
             return out
-        if ra > 0:
-            return {"simulation_id": sim_id, "status": "RUNNING", "progress": body.get("progress"),
-                    "retry_after_seconds": ra}
         out = {"simulation_id": sim_id, "status": body.get("status") or ("COMPLETE" if body.get("alpha") else "ERROR"),
                "alpha_id": body.get("alpha")}
         for key in ("message", "detail", "details"):
@@ -760,6 +803,8 @@ class BrainClient:
         except BrainAPIError as exc:
             return {"simulation_id": child_id, "status": "ERROR", "http_status": exc.status,
                     "message": exc.message}
+        except InvalidArgument as exc:
+            return {"simulation_id": child_id, "status": "ERROR", "message": str(exc)}
 
     async def simulations(self, refs: Sequence[str], wait_seconds: float = 0,
                           include_alpha: bool = True) -> List[Dict[str, Any]]:
@@ -813,8 +858,8 @@ class BrainClient:
         if selection_handling:
             params["selectionHandling"] = selection_handling
         data = await self.call("GET", "/simulations/super-selection", params=params) or {}
-        return {**page_meta(data, params["limit"], 0),
-                "results": [summarize_alpha(a) for a in data.get("results") or []]}
+        results = [summarize_alpha(a) for a in data.get("results") or []]
+        return {"count": data.get("count"), "returned": len(results), "results": results}
 
     # ------------------------------------------------------------------ alphas
 
@@ -890,9 +935,14 @@ class BrainClient:
         for kind in correlations:
             if kind not in CORRELATION_TYPES:
                 raise InvalidArgument(f"correlation type must be one of {list(CORRELATION_TYPES)}")
+        kinds = list(dict.fromkeys(correlations))
         check_task = self.poll(f"/alphas/{seg(alpha_id, 'alpha id')}/check", wait_seconds)
-        corr_tasks = [self.correlation(alpha_id, k, wait_seconds) for k in dict.fromkeys(correlations)]
-        check, *corrs = await asyncio.gather(check_task, *corr_tasks)
+        corr_tasks = [self.correlation(alpha_id, k, wait_seconds) for k in kinds]
+        check, *corr_results = await asyncio.gather(check_task, *corr_tasks, return_exceptions=True)
+        if isinstance(check, BaseException):
+            raise check
+        corrs = [r if not isinstance(r, BaseException) else {"type": k, "status": "ERROR", "error": str(r)}
+                 for k, r in zip(kinds, corr_results)]
         out: Dict[str, Any] = {"alpha_id": alpha_id}
         if not check.done:
             out.update(status="PENDING", retry_after_seconds=check.retry_after,
@@ -919,14 +969,16 @@ class BrainClient:
         started = self._pending_submits.get(alpha_id)
         first = None
         if not started or time.monotonic() - started > 3600:
-            first = await self.request("POST", path)
+            def mark(resp: requests.Response) -> None:  # runs even if this call is cancelled
+                if resp.status_code < 300:
+                    self._pending_submits[alpha_id] = time.monotonic()
+            first = await self.request("POST", path, on_response=mark)
             if first.status_code == 429:
                 return {"alpha_id": alpha_id, "status": "RATE_LIMITED",
                         "retry_after_seconds": retry_after_seconds(first) or 30.0}
             if first.status_code >= 400:
                 raise BrainAPIError(first.status_code, "POST", path, error_message(first),
                                     retry_after_seconds(first) or None)
-            self._pending_submits[alpha_id] = time.monotonic()
         res = await self.poll(path, wait_seconds, first=first, first_method="POST")
         if not res.done:
             return {"alpha_id": alpha_id, "status": "PENDING", "retry_after_seconds": res.retry_after,
@@ -1081,7 +1133,16 @@ class BrainClient:
             if len(alphas) >= max_alphas:
                 complete = False
                 break
-        regular = [a for a in alphas if a.get("type", "REGULAR") == "REGULAR"]
+        # dateSubmitted>/< are not in the catalog: re-apply the window client-side.
+        lo, hi = _as_utc(start, end_of_day=False), _as_utc(end, end_of_day=True)
+        in_window, filtered_out = [], 0
+        for a in alphas:
+            submitted = _as_utc(a.get("dateSubmitted"), end_of_day=False) if a.get("dateSubmitted") else None
+            if submitted is not None and not (lo <= submitted <= hi):
+                filtered_out += 1
+                continue
+            in_window.append(a)
+        regular = [a for a in in_window if a.get("type", "REGULAR") == "REGULAR"]
         per_pyramid: Dict[str, int] = {}
         atoms = 0
         for a in regular:
@@ -1112,10 +1173,16 @@ class BrainClient:
             "diversity_score": None if s_p is None else round(s_a * s_p * s_h, 4),
             "per_pyramid_counts": per_pyramid, "complete": complete,
         }
+        notes = []
+        if filtered_out:
+            out["filtered_out"] = filtered_out
+            notes.append(f"{filtered_out} alphas returned by BRAIN were outside the window and ignored.")
         if s_p is None:
-            out["note"] = "P_max unknown (pyramid-multipliers failed); diversity_score not computed."
+            notes.append("P_max unknown (pyramid-multipliers failed); diversity_score not computed.")
         if not complete:
-            out["note"] = f"Only the first {len(alphas)} alphas in the window were counted."
+            notes.append(f"Only the first {len(alphas)} alphas in the window were counted.")
+        if notes:
+            out["note"] = " ".join(notes)
         return out
 
     async def leaderboard(self, board: str, *, limit: int, offset: int, order: Optional[str],
@@ -1162,6 +1229,9 @@ class BrainClient:
         offset = int(clamp(offset, 0, 10**9, 0))
         if scope == "mine":
             data = await self.call("GET", "/users/self/competitions") or {}
+            mine = [{k: c.get(k) for k in ("id", "name", "status", "startDate", "endDate", "teamBased",
+                                           "scoring", "submissions")} for c in data.get("results") or []]
+            return {"count": data.get("count", len(mine)), "results": mine}
         else:
             params: Dict[str, Any] = {"limit": limit, "offset": offset}
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1229,6 +1299,17 @@ class BrainClient:
 # --------------------------------------------------------------------------- #
 
 
+def _as_utc(value: str, *, end_of_day: bool) -> datetime:
+    """Parse an ISO date/date-time (Z or offset allowed) as an aware UTC datetime."""
+    text = value.strip().replace("Z", "+00:00")
+    if _DATE_RE.match(text):
+        text += "T23:59:59.999999" if end_of_day else "T00:00:00"
+    dt = datetime.fromisoformat(text.replace(" ", "T"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _is_atom(alpha: Dict[str, Any]) -> bool:
     for c in alpha.get("classifications") or []:
         cid = str((c.get("id") or c.get("name") or "") if isinstance(c, dict) else c)
@@ -1281,13 +1362,15 @@ def parse_setting_options(data: Dict[str, Any]) -> Dict[str, Any]:
         return {"instrument_options": [], "note": "OPTIONS /simulations returned no settings.children",
                 "raw_keys": sorted(post)}
 
-    by_label: Dict[str, Any] = {}
+    by_name: Dict[str, Any] = {}
     enums: Dict[str, Any] = {}
+    label_to_key = {"instrument type": "instrumentType", "region": "region", "delay": "delay",
+                    "universe": "universe", "neutralization": "neutralization"}
     for key, spec in children.items():
         if not isinstance(spec, dict):
             continue
-        label = spec.get("label") or key
-        by_label[label] = spec.get("choices")
+        name = key if key in label_to_key.values() else label_to_key.get(str(spec.get("label", "")).lower(), key)
+        by_name[name] = spec.get("choices")
         choices = spec.get("choices")
         if isinstance(choices, list):
             enums[key] = [c.get("value") for c in choices if isinstance(c, dict)]
@@ -1295,14 +1378,14 @@ def parse_setting_options(data: Dict[str, Any]) -> Dict[str, Any]:
             if bound in spec:
                 enums.setdefault(f"{key}_range", {})[bound] = spec[bound]
 
-    def nested(label: str) -> Dict[str, Any]:
-        val = by_label.get(label)
+    def nested(name: str) -> Dict[str, Any]:
+        val = by_name.get(name)
         return val.get("instrumentType", {}) if isinstance(val, dict) else {}
 
     rows: List[Dict[str, Any]] = []
-    instrument_types = by_label.get("Instrument type") or []
-    regions, delays, universes, neutralizations = (nested("Region"), nested("Delay"),
-                                                   nested("Universe"), nested("Neutralization"))
+    instrument_types = by_name.get("instrumentType") or []
+    regions, delays, universes, neutralizations = (nested("region"), nested("delay"),
+                                                   nested("universe"), nested("neutralization"))
     for it in instrument_types if isinstance(instrument_types, list) else []:
         itv = it.get("value") if isinstance(it, dict) else None
         for region in regions.get(itv) or []:
@@ -1315,7 +1398,11 @@ def parse_setting_options(data: Dict[str, Any]) -> Dict[str, Any]:
                     "neutralization": [n.get("value") for n in
                                        ((neutralizations.get(itv) or {}).get("region") or {}).get(rv) or []],
                 })
-    return {"instrument_options": rows, "total_combinations": len(rows), "enums": enums}
+    out: Dict[str, Any] = {"instrument_options": rows, "total_combinations": len(rows), "enums": enums}
+    missing = [n for n in ("instrumentType", "region", "delay", "universe") if n not in by_name]
+    if missing:
+        out["note"] = f"OPTIONS /simulations lacks {missing}; the response shape may have changed."
+    return out
 
 
 _IMG_RE = re.compile(r"<img[^>]+src=\"data:image/[^\"]+\"[^>]*>", re.IGNORECASE)
