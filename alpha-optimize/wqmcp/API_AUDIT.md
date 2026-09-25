@@ -1,7 +1,8 @@
 # wqmcp 接口使用与冗余审计（对照 WQ API Catalog 1.15.3）
 
-- 审计对象：`alpha-optimize/wqmcp/platform_functions.py`（40 个 `@mcp.tool`）、`alpha-optimize/wqmcp/forum_functions.py`
+- 审计对象（v1）：`alpha-optimize/wqmcp/platform_functions.py`（40 个 `@mcp.tool`）、`alpha-optimize/wqmcp/forum_functions.py`
 - 参照：`wqapi-visible-catalog-1.15.3.md`，93 个前端可见接口
+- 当前代码的状态：见第八节（main 与 v2 的合并版，30 个工具）。
 - 方法：7 个按接口域划分的审计 agent 和 1 个冗余分析 agent 独立审计，每组结果再由一个复核 agent 逐条对照代码行和目录行尝试推翻，最后由完整性 critic 补漏。138 条已确认或部分确认的发现中，高危问题我另外逐一对照代码和目录核对过。
 - 结果：共提出 127 条，推翻 1 条（SIM-16，见文末）；复核阶段补充 5 条，critic 补充 7 条。最终保留 **138 条：高 11、中 59、低 68**。
 - 局限：
@@ -1564,3 +1565,35 @@ return operators`。目录 5085：`"type": "array"`。
 
 - **SIM-16**：PYTHON 语言会删掉 unitHandling/nanHandling，而目录把这两个字段标为 required（无法核实）
   - 推翻理由：442 行注释 "PYTHON payload omits these FASTEXPR-only fields" 表明这是按已知的 PYTHON 请求体有意删掉的。目录的 required 列表来自 OPTIONS，而目录自己在 5961 行说明 "OPTIONS 将这些分支字段都标为 required，实际应按 type 选择对应分支"，可见 OPTIONS 的 required 不区分分支，不能作为 PYTHON 请求必须带 unitHandling/nanHandling 的依据。没有任何证据表明 PYTHON 请求因此被拒绝，finding 自己也承认只能算需要实测的风险。
+
+---
+
+## 八、当前代码的状态（main 与 v2 合并版）
+
+v2 分支（`claude/wqmcp-review-refactor`）曾经独立重写了客户端，并对照新代码把 138 条逐条复核了一遍。那份状态表留在该分支的历史提交 8d91167 里，行号指向 v2 的 `brain_client.py` / `server.py`。
+
+合并时以 main 的 `BrainApiClient` 为准，因为 main 上有新增功能：ProdMemo、RAA、simulationMode、表达式检查、per_alpha_settings、精简结果行。v2 的独立客户端没有保留，两套客户端并存本身就是冗余。v2 的修复已经逐项移植到 main 的客户端（提交 c198b13、4ee86ed），v2 的工具合并方案在这次合并中落地。
+
+- **冗余（第二节、RED 组）**：工具由 48 个合并为 30 个，新旧对照见 README.md。
+  - 三个建模拟工具合为 `create_simulation`，用 `type` × `mode` 区分：single / multi / concurrent × REGULAR / PYTHON / SUPER / REGION_AGNOSTIC。
+  - 进度查询与错误查询合为 `get_simulation`，支持一次查多个 id。
+  - 检查与相关性合为 `check_alpha`。
+  - 四个 recordset 工具合为 `get_alpha_recordset`。
+  - 六个账户活动工具合为 `get_activity`。
+  - 比赛、文档的列表和详情各合为一个工具。
+  - 删除了 `expand_nested_data`、`manage_config`，以及论坛工具里没有作用的 email / password 参数。
+- **新增能力**：
+  - `cancel_simulation`（DELETE /simulations/{id}）。
+  - `update_alpha` 的批量 favorite / hidden / color（PATCH /alphas）。
+  - `check_alpha(check="power-pool")`。
+  - `list_alphas` 的 status / type 过滤。
+- **提交安全**：`submit_alpha` 默认只做预检，`confirm=True` 才真正提交；`WQMCP_READ_ONLY`、`WQMCP_ALLOW_SUBMIT` 覆盖所有写操作。
+- **仍需实测**（`scripts/live_regression.py`）：
+  - SIM-1：super-selection 参数名，用 `--selection`。
+  - SIM-17：完成时 Retry-After 的取值，用 `--writes`。
+  - ALPHA-12：未记载的列表过滤，默认运行即覆盖。
+  - ALPHA-13：tags 格式和 osmosisPoints，用 `--writes`。
+  - MISC-4：比赛 agreement 接口，默认运行即覆盖。
+  - FORUM-1：SSO 和页面选择器，用 `--forum`。
+  - 合并新增：multi-simulation 能否包含 RAA 条目，用 `--probe-multi-raa`。
+- 这一节没有像 v2 那样把 138 条逐条重新复核。如果需要合并版的逐条状态表，需要再跑一轮复核。

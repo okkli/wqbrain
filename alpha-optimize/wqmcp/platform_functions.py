@@ -12,15 +12,13 @@ by re-pulling once (deduped via X-Cookie-Version). Safe for many concurrent MCP 
 timeouts; nothing blocks the shared event loop.
 """
 
-import json
 import asyncio
+import collections
+import functools
 import logging
 from typing import Dict, List, Optional, Any, Union, Tuple
 from urllib.parse import quote, urlsplit
 import re
-from bs4 import BeautifulSoup
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
 import os
 import sys
 import math
@@ -37,13 +35,11 @@ except Exception:
     pass
 
 import requests
-import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel
-
-from pathlib import Path
 
 # Forum client (support.worldquantbrain.com, headless browser); created below
 # with this module's BRAIN session cookies injected.
@@ -209,8 +205,8 @@ _FLIP_NOTE = ("if you got a negative alpha sharpe, you can just add a minus sign
               "the last line of the Alpha to flip then think the next step.")
 _COMPACT_NOTE = ("Compact rows: margin in bps; robust/sub/y2_sharpe and cluster are the "
                  "LOW_ROBUST_UNIVERSE / LOW_SUB_UNIVERSE / LOW_2Y / CLUSTER_TEST check values; "
-                 "fails lists failed checks. Call get_alpha_details(id) for the full object, or "
-                 "check_simulation_progress(compact=False). " + _FLIP_NOTE)
+                 "fails lists failed checks. Call get_alpha(id) for the full alpha, or "
+                 "get_simulation(compact=False). " + _FLIP_NOTE)
 
 
 # Settings echoed in a compact row, so children of a mixed-settings batch can be told apart.
@@ -486,6 +482,8 @@ class BrainApiClient:
         self._submit_results: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         # Fire-and-forget work (ProdMemo write-backs) kept alive until done.
         self._background: set = set()
+        # Simulations created by this process (newest first), for get_simulation().
+        self.recent_simulations: collections.deque = collections.deque(maxlen=50)
     
     def log(self, message: str, level: str = "INFO"):
         """Log messages to stderr to avoid MCP protocol interference."""
@@ -835,97 +833,117 @@ class BrainApiClient:
             self.log(f"Failed to get auth status: {str(e)}", "ERROR")
             return None
     
-    async def create_simulation(self, simulation_data: SimulationData) -> Dict[str, str]:
-        """Create a new simulation on BRAIN platform."""
+    @staticmethod
+    def simulation_payload(simulation_data: SimulationData) -> Dict[str, Any]:
+        """The POST /simulations item for one alpha: settings trimmed to what its
+        type and language carry, None values dropped."""
+        settings_dict = simulation_data.settings.model_dump()
+        if simulation_data.type in ("REGULAR", "REGION_AGNOSTIC"):
+            # SUPER-only fields
+            for k in ('selectionHandling', 'selectionLimit', 'componentActivation'):
+                settings_dict.pop(k, None)
+        if (settings_dict.get('language') or '').upper() == "PYTHON":
+            # PYTHON payload omits these FASTEXPR-only fields
+            for k in ('unitHandling', 'nanHandling', 'testPeriod'):
+                settings_dict.pop(k, None)
+        else:
+            settings_dict.pop('lookback', None)  # PYTHON-only
+        payload: Dict[str, Any] = {
+            'type': simulation_data.type,
+            'settings': {k: v for k, v in settings_dict.items() if v is not None},
+        }
+        if simulation_data.type in ("REGULAR", "REGION_AGNOSTIC"):
+            payload['regular'] = simulation_data.regular
+        elif simulation_data.type == "SUPER":
+            payload['combo'] = simulation_data.combo
+            payload['selection'] = simulation_data.selection
+        return {k: v for k, v in payload.items() if v is not None}
+
+    @staticmethod
+    def _rate_limited(response: requests.Response) -> Dict[str, Any]:
+        # Per-account concurrent simulation slots are full (e.g. other sessions'
+        # simulations still running): structured info so the client can back off.
+        retry_after = _retry_after_seconds(response) or 30.0
+        return {
+            "status": "RATE_LIMITED",
+            "retry_after_seconds": retry_after,
+            "note": ("BRAIN's per-account concurrent simulation limit is reached "
+                     "(other simulations are still running on this account). "
+                     f"Retry after ~{int(retry_after)}s, or first finish/check the running "
+                     "ones (get_simulation); you can do other work meanwhile."),
+        }
+
+    def _remember_simulation(self, simulation_id: str, kind: str, sim_type: str, count: int) -> None:
+        self.recent_simulations.appendleft({
+            "simulation_id": simulation_id, "kind": kind, "type": sim_type, "alphas": count,
+            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+
+    async def _post_simulation(self, body: Any, what: str) -> Any:
+        """POST /simulations; returns the RATE_LIMITED dict or (simulation_id, location)."""
         await self.ensure_authenticated()
-        
-        try:
-            self.log("🚀 Creating simulation...", "INFO")
-            
-            # Prepare settings based on simulation type
-            settings_dict = simulation_data.settings.model_dump()
+        response = await self._request('post', f"{self.base_url}/simulations", json=body)
+        if response.status_code == 429:
+            return self._rate_limited(response)
+        if response.status_code >= 400:
+            # Surface BRAIN's rejection reason (invalid settings choice, blank
+            # expression, per-item errors of a multi...) instead of a bare 400.
+            raise Exception(_http_error_detail(response, f"{what} rejected"))
+        location = response.headers.get('Location', '')
+        if not location:
+            raise Exception(f"BRAIN returned no Location header for the submitted {what}")
+        return location.rstrip('/').split('/')[-1], location
 
-            # Remove fields based on simulation type
-            if simulation_data.type in ("REGULAR", "REGION_AGNOSTIC"):
-                # Remove SUPER-specific fields for REGULAR / RAA
-                settings_dict.pop('selectionHandling', None)
-                settings_dict.pop('selectionLimit', None)
-                settings_dict.pop('componentActivation', None)
+    async def create_simulation(self, simulation_data: SimulationData) -> Dict[str, Any]:
+        """Submit one simulation (REGULAR, SUPER or REGION_AGNOSTIC) and return at once."""
+        self.log("🚀 Creating simulation...", "INFO")
+        posted = await self._post_simulation(self.simulation_payload(simulation_data), "simulation")
+        if isinstance(posted, dict):
+            return posted
+        simulation_id, location = posted
+        self._remember_simulation(simulation_id, "single", simulation_data.type, 1)
+        self.log(f"Simulation submitted with ID: {simulation_id}", "SUCCESS")
+        # Submit-only: the MCP client is never parked on a long-running HTTP call.
+        return {
+            "status": "SUBMITTED",
+            "simulation_id": simulation_id,
+            "progress_url": location,
+            "note": ("Simulation is running asynchronously (typically 1-5 minutes; RAA longer). "
+                     "Call get_simulation with this simulation_id to get progress and, once "
+                     "finished, the result. You can do other work between checks."),
+        }
 
-            # Remove fields based on expression language
-            language = (settings_dict.get('language') or '').upper()
-            if language == "PYTHON":
-                # PYTHON payload omits these FASTEXPR-only fields
-                for k in ('unitHandling', 'nanHandling', 'testPeriod'):
-                    settings_dict.pop(k, None)
-            else:
-                # Non-PYTHON languages don't carry lookback
-                settings_dict.pop('lookback', None)
+    async def create_multi_simulation(self, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Submit 2-10 simulation items as ONE multi-simulation (one POST, one parent id).
+        BRAIN cancels the whole batch when any child fails."""
+        self.log(f"🚀 Creating multi-simulation ({len(payloads)} alphas)...", "INFO")
+        posted = await self._post_simulation(payloads, "multi-simulation")
+        if isinstance(posted, dict):
+            return posted
+        simulation_id, location = posted
+        self._remember_simulation(simulation_id, "multi", payloads[0].get("type", "REGULAR"), len(payloads))
+        return {
+            "status": "SUBMITTED",
+            "type": "MULTI",
+            "simulation_id": simulation_id,
+            "multisimulation_id": simulation_id,
+            "expected_children": len(payloads),
+            "progress_url": location,
+            "note": ("Multi-simulation is running asynchronously (typically 3-10 minutes for "
+                     f"{len(payloads)} alphas). Call get_simulation with this simulation_id to get "
+                     "per-child progress and, once finished, one compact row per alpha (each row "
+                     "echoes its settings). You can do other work between checks."),
+        }
 
-            # Filter out None values from settings
-            settings_dict = {k: v for k, v in settings_dict.items() if v is not None}
-            
-            # Prepare simulation payload
-            payload = {
-                'type': simulation_data.type,
-                'settings': settings_dict
-            }
-            
-            # Add type-specific fields
-            if simulation_data.type in ("REGULAR", "REGION_AGNOSTIC"):
-                if simulation_data.regular:
-                    payload['regular'] = simulation_data.regular
-            elif simulation_data.type == "SUPER":
-                if simulation_data.combo:
-                    payload['combo'] = simulation_data.combo
-                if simulation_data.selection:
-                    payload['selection'] = simulation_data.selection
-            
-            # Filter out None values from entire payload
-            payload = {k: v for k, v in payload.items() if v is not None}
-            
-            response = await self._request('post', f"{self.base_url}/simulations", json=payload)
-            if response.status_code == 429:
-                # Per-account concurrent simulation slots are full (e.g. other
-                # sessions' simulations still running) — return structured info
-                # instead of a raw error so the client can back off sensibly.
-                retry_after = _retry_after_seconds(response) or 30.0
-                return {
-                    "status": "RATE_LIMITED",
-                    "retry_after_seconds": retry_after,
-                    "note": ("BRAIN's per-account concurrent simulation limit is reached "
-                             "(another simulation is still running on this account). "
-                             f"Retry create_simulation after ~{int(retry_after)}s, or first "
-                             "finish/check the running ones; you can do other work meanwhile."),
-                }
-            if response.status_code >= 400:
-                # Surface BRAIN's rejection reason (invalid settings choice,
-                # blank expression, ...) instead of a bare "400 Bad Request".
-                raise Exception(_http_error_detail(response, "simulation rejected"))
-            response.raise_for_status()
-
-            location = response.headers.get('Location', '')
-            if not location:
-                raise Exception("BRAIN returned no Location header for the submitted simulation")
-            simulation_id = location.split('/')[-1]
-
-            self.log(f"Simulation submitted with ID: {simulation_id}", "SUCCESS")
-
-            # Submit-only: return immediately so the MCP client is never parked
-            # on a long-running HTTP call. Progress/result via check_simulation_progress.
-            return {
-                "status": "SUBMITTED",
-                "simulation_id": simulation_id,
-                "progress_url": location,
-                "note": ("Simulation is running asynchronously (typically 1-5 minutes). "
-                         "Call check_simulation_progress with this progress_url to get "
-                         "progress (0.0-1.0) and, once finished, the full alpha result. "
-                         "You can do other work between checks."),
-            }
-
-        except Exception as e:
-            self.log(f"❌ Failed to create simulation: {str(e)}", "ERROR")
-            raise
+    async def cancel_simulation(self, ref: str) -> Dict[str, Any]:
+        """DELETE a queued/running simulation to free its account slot."""
+        await self.ensure_authenticated()
+        url = _simulation_url(ref)
+        response = await self._request('delete', url)
+        if response.status_code >= 400:
+            raise Exception(_http_error_detail(response, "cancel simulation"))
+        return {"simulation_id": url.rsplit('/', 1)[-1], "cancelled": True,
+                "http_status": response.status_code}
 
     async def check_simulation_progress(self, location: str, wait_seconds: float = 0,
                                         compact: bool = True) -> Dict[str, Any]:
@@ -955,15 +973,18 @@ class BrainApiClient:
             await asyncio.sleep(wait)
             waited += wait
     
-    async def get_raa_alpha(self, parent_alpha_id: str) -> Dict[str, Any]:
+    async def get_raa_alpha(self, parent_alpha_id: str,
+                            parent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Summarise an RA parent alpha: settings/expression plus one metric row per
         region child. An RA_PARENT carries no metrics of its own — all performance
-        lives on its RA_CHILD alphas, so they are fetched concurrently."""
+        lives on its RA_CHILD alphas, so they are fetched concurrently. `parent` is
+        the already-fetched parent object, if the caller has it."""
         await self.ensure_authenticated()
 
-        parent_resp = await self._request('get', f"{self.base_url}/alphas/{_seg(parent_alpha_id, 'alpha id')}")
-        parent_resp.raise_for_status()
-        parent = parent_resp.json()
+        if parent is None:
+            parent_resp = await self._request('get', f"{self.base_url}/alphas/{_seg(parent_alpha_id, 'alpha id')}")
+            parent_resp.raise_for_status()
+            parent = parent_resp.json()
         child_ids = parent.get("children") or []
         if not child_ids:
             return {"type": parent.get("type"), "parent_alpha_id": parent_alpha_id,
@@ -1000,11 +1021,11 @@ class BrainApiClient:
             "children_without_warnings": len(clean),
             "children_pending": len(pending),
             "note": ("Submission needs >=2 children with no FAIL. Then run "
-                     "check_correlation on those children: one child passing PROD "
+                     "check_alpha(check='prod') on those children: one child passing PROD "
                      "correlation lets all passing children be submitted together "
                      "(the whole RAA counts as a single submission). Use "
-                     "get_submission_check on the PARENT id — children cannot be "
-                     "checked individually."),
+                     "check_alpha(check='submission') and submit_alpha on the PARENT id — "
+                     "children cannot be checked individually."),
         }
 
     async def get_alpha_details(self, alpha_id: str) -> Dict[str, Any]:
@@ -1107,16 +1128,23 @@ class BrainApiClient:
         submission_end_date: Optional[str] = None,
         order: Optional[str] = None,
         hidden: Optional[bool] = None,
+        status: Optional[str] = None,
+        alpha_type: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Get user's alphas with advanced filtering."""
+        """Get user's alphas with advanced filtering (stage/status/type, dates, hidden)."""
         await self.ensure_authenticated()
         
         try:
             params = {
-                "stage": stage,
                 "limit": limit,
                 "offset": offset,
             }
+            if stage:
+                params["stage"] = stage
+            if status:
+                params["status"] = status
+            if alpha_type:
+                params["type"] = alpha_type
             if start_date:
                 params["dateCreated>"] = start_date
             if end_date:
@@ -1569,35 +1597,6 @@ class BrainApiClient:
             self.log(f"Failed to get messages: {str(e)}", "ERROR")
             raise
 
-    async def get_glossary_terms(self, email: str = "", password: str = "") -> List[Dict[str, str]]:
-        """Glossary terms from the support site (email/password are ignored: the
-        browser reuses this session's cookies)."""
-        try:
-            return (await forum_client.get_glossary_terms())["terms"]
-        except Exception as e:
-            self.log(f"Failed to get glossary terms: {str(e)}", "ERROR")
-            raise
-
-    async def search_forum_posts(self, email: str, password: str, search_query: str, 
-                                 max_results: int = 50) -> Dict[str, Any]:
-        """Search forum posts."""
-        try:
-            res = await forum_client.search_posts(search_query, max_results=max_results)
-            return {**res, "success": True, "total_found": res.get("count")}
-        except Exception as e:
-            self.log(f"Failed to search forum posts: {str(e)}", "ERROR")
-            raise
-
-    async def read_forum_post(self, email: str, password: str, article_id: str, 
-                              include_comments: bool = True) -> Dict[str, Any]:
-        """Get forum post."""
-        try:
-            res = await forum_client.read_post(article_id, include_comments=include_comments)
-            return {**res, "success": True}
-        except Exception as e:
-            self.log(f"Failed to read forum post: {str(e)}", "ERROR")
-            raise
-    
     async def get_alpha_yearly_stats(self, alpha_id: str, max_wait: float = 30) -> Dict[str, Any]:
         """Yearly-stats recordset; same contract as get_alpha_pnl ({} = still computing)."""
         await self.ensure_authenticated()
@@ -1699,19 +1698,20 @@ class BrainApiClient:
         values are written back into ProdMemo.
         """
         await self.ensure_authenticated()
-        aliases = {"production": "prod", "prod": "prod", "self": "self"}
+        aliases = {"production": "prod", "prod": "prod", "self": "self",
+                   "power-pool": "power-pool", "power_pool": "power-pool"}
         ctype = (correlation_type or "both").lower()
         if ctype == "both":
             kinds = ["prod", "self"]
         elif ctype in aliases:
             kinds = [aliases[ctype]]
         else:
-            raise ValueError("correlation_type must be 'prod'/'production', 'self' or 'both'")
+            raise ValueError("correlation_type must be 'prod'/'production', 'self', 'power-pool' or 'both'")
 
         polled = await asyncio.gather(*[self._poll_correlation(alpha_id, k, max_wait) for k in kinds])
         checks: Dict[str, Any] = {}
         for kind, r in zip(kinds, polled):
-            name = "production" if kind == "prod" else "self"
+            name = {"prod": "production", "power-pool": "power_pool"}.get(kind, kind)
             entry: Dict[str, Any] = {"status": r["status"]}
             if r["status"] == "DONE":
                 mx = r.get("max")
@@ -1720,7 +1720,7 @@ class BrainApiClient:
                 entry["top"] = _correlation_top_rows(r.get("data") or {}, 3)
                 if include_data:
                     entry["correlation_data"] = r.get("data")
-                if mx is not None:
+                if mx is not None and kind in ("prod", "self"):  # ProdMemo keeps prod/self only
                     await self._record_platform_corr(alpha_id, kind, mx, r.get("min"))
             elif r["status"] == "PENDING":
                 entry["retry_after_seconds"] = r.get("retry_after_seconds")
@@ -1841,6 +1841,15 @@ class BrainApiClient:
             self.log(f"Failed to set alpha properties: {str(e)}", "ERROR")
             raise
 
+    async def update_alphas_bulk(self, alpha_ids: List[str], fields: Dict[str, Any]) -> Dict[str, Any]:
+        """favorite / hidden / color for many alphas in one PATCH /alphas request."""
+        await self.ensure_authenticated()
+        body = [{"id": _seg(a, 'alpha id'), **fields} for a in alpha_ids]
+        response = await self._request('patch', f"{self.base_url}/alphas", json=body)
+        if response.status_code >= 400:
+            raise Exception(_http_error_detail(response, "bulk alpha update"))
+        return {"alpha_ids": list(alpha_ids), "updated": sorted(fields)}
+
     async def get_record_sets(self, alpha_id: str, max_wait: float = 20) -> Dict[str, Any]:
         """List available record sets for an alpha (polls while BRAIN prepares them)."""
         await self.ensure_authenticated()
@@ -1886,6 +1895,22 @@ class BrainApiClient:
         if response.status_code >= 400:
             raise Exception(_http_error_detail(response, "activity diversity"))
         return response.json()
+
+    async def get_payments(self) -> Dict[str, Any]:
+        """Base payments (daily) and other payments (quarterly, competitions,
+        referrals). Each half reports its own error instead of hiding the other."""
+        async def fetch(kind: str) -> Any:
+            try:
+                resp = await self._request('get', f"{self.base_url}/users/self/activities/{kind}")
+                if resp.status_code >= 400:
+                    return {"error": _http_error_detail(resp, kind)}
+                return resp.json() if (resp.text or "").strip() else {}
+            except Exception as e:
+                return {"error": f"{kind}: {e}"}
+
+        await self.ensure_authenticated()
+        base_payments, other_payments = await asyncio.gather(fetch("base-payment"), fetch("other-payment"))
+        return {"base_payments": base_payments, "other_payments": other_payments}
 
     async def _self_id_or_none(self) -> Optional[str]:
         try:
@@ -2056,19 +2081,6 @@ class BrainApiClient:
             out["note"] = "team_id is not supported by the before-and-after endpoint and was ignored."
         return out
 
-    async def expand_nested_data(self, data: List[Dict[str, Any]], preserve_original: bool = True) -> List[Dict[str, Any]]:
-        """Flatten complex nested data structures into tabular format."""
-        try:
-            df = pd.json_normalize(data, sep='_')
-            if preserve_original:
-                original_df = pd.DataFrame(data)
-                df = pd.concat([original_df, df], axis=1)
-                df = df.loc[:,~df.columns.duplicated()]
-            return df.to_dict(orient='records')
-        except Exception as e:
-            self.log(f"Failed to expand nested data: {str(e)}", "ERROR")
-            raise
-            
     # --- New documentation endpoint ---
     
     async def get_documentation_page(self, page_id: str) -> Dict[str, Any]:
@@ -2086,1054 +2098,122 @@ class BrainApiClient:
 brain_client = BrainApiClient()
 forum_client = ForumClient(brain_client.cookie_list)
 
-# --- Configuration Management ---
+# ProdMemo (prodmemo_service) holds no BRAIN client of its own: inject this one,
+# which already carries credd-backed auth and 401 self-healing.
+prodmemo_client.fetcher = brain_client
 
-def _resolve_config_path(for_write: bool = False) -> str:
-    """
-    Resolve the configuration file path.
-    
-    Checks for a file specified by the MCP_CONFIG_FILE environment variable,
-    then falls back to ~/.brain_mcp_config.json. If for_write is True,
-    it ensures the directory exists.
-    """
-    if 'MCP_CONFIG_FILE' in os.environ:
-        return os.environ['MCP_CONFIG_FILE']
-    
-    config_path = Path(__file__).parent / "user_config.json"
-    
-    if for_write:
-        try:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-        except (IOError, OSError) as e:
-            logger.warning(f"Could not create config directory {config_path.parent}: {e}")
-            # Fallback to a temporary file if home is not writable
-            import tempfile
-            return tempfile.NamedTemporaryFile(delete=False).name
-            
-    return str(config_path)
 
-def load_config() -> Dict[str, Any]:
-    """Load configuration from file."""
-    config_file = _resolve_config_path()
-    if os.path.exists(config_file):
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (IOError, json.JSONDecodeError) as e:
-            logger.error(f"Error loading config file {config_file}: {e}")
-    return {}
+# --- Response shaping ---------------------------------------------------------
 
-def save_config(config: Dict[str, Any]):
-    """Save configuration to file using the resolved config path.
-    
-    This function now uses the write-enabled path resolver to handle
-    cases where the default home directory is not writable.
-    """
-    config_file = _resolve_config_path(for_write=True)
-    try:
-        with open(config_file, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2)
-    except IOError as e:
-        logger.error(f"Error saving config file to {config_file}: {e}")
+_SUMMARY_SETTING_KEYS = ("instrumentType", "region", "universe", "delay", "decay", "neutralization",
+                         "truncation", "pasteurization", "nanHandling", "unitHandling", "language",
+                         "testPeriod", "maxTrade", "maxPosition", "lookback", "selectionHandling",
+                         "selectionLimit", "componentActivation")
+_SUMMARY_IS_METRICS = ("sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
+                       "longCount", "shortCount", "pnl", "bookSize", "startDate")
 
-def _redact(value: Any) -> Any:
-    """Mask secrets (passwords, tokens, cookies) before a config leaves the server."""
-    if isinstance(value, dict):
-        return {k: ("***" if re.search(r"pass|token|secret|cookie|key", str(k), re.I) and v else _redact(v))
-                for k, v in value.items()}
+
+def _code_of(part: Any) -> Any:
+    return part.get("code") if isinstance(part, dict) else part
+
+
+def _alpha_summary(alpha: Dict[str, Any]) -> Dict[str, Any]:
+    """One alpha without the bulky parts: identity, all settings, full code, IS
+    metrics and every check (name/result/value/limit)."""
+    if not isinstance(alpha, dict):
+        return alpha
+    settings = alpha.get("settings") or {}
+    is_ = alpha.get("is") or {}
+    checks = [c for c in is_.get("checks") or [] if isinstance(c, dict)]
+    out: Dict[str, Any] = {
+        "id": alpha.get("id"), "type": alpha.get("type"), "stage": alpha.get("stage"),
+        "status": alpha.get("status"), "name": alpha.get("name"),
+        "dateCreated": alpha.get("dateCreated"), "dateSubmitted": alpha.get("dateSubmitted"),
+        "settings": {k: settings.get(k) for k in _SUMMARY_SETTING_KEYS if settings.get(k) is not None},
+    }
+    for part in ("regular", "combo", "selection"):
+        code = _code_of(alpha.get(part))
+        if code:
+            out[part] = code
+    out["is"] = {k: is_.get(k) for k in _SUMMARY_IS_METRICS if is_.get(k) is not None}
+    if checks:
+        out["is"]["checks"] = [{k: c.get(k) for k in ("name", "result", "value", "limit") if c.get(k) is not None}
+                               for c in checks]
+        out["is"]["failed"] = [c.get("name") for c in checks if c.get("result") == "FAIL"]
+    if alpha.get("tags"):
+        out["tags"] = [t.get("name", t) if isinstance(t, dict) else t for t in alpha["tags"]]
+    if alpha.get("classifications"):
+        out["classifications"] = [c.get("id") or c.get("name") for c in alpha["classifications"]
+                                  if isinstance(c, dict)]
+    if _alpha_pyramid_keys(alpha):
+        out["pyramids"] = _alpha_pyramid_keys(alpha)
+    for key in ("grade", "favorite", "hidden", "color", "category", "osmosisPoints"):
+        if alpha.get(key) not in (None, False, ""):
+            out[key] = alpha.get(key)
+    return {k: v for k, v in out.items() if v not in (None, {}, [])}
+
+
+def _alpha_list_row(alpha: Dict[str, Any]) -> Dict[str, Any]:
+    """Listing row: the compact metric row plus what tells alphas apart in a list."""
+    if not isinstance(alpha, dict):
+        return alpha
+    row = {"type": alpha.get("type"), "stage": alpha.get("stage"), "status": alpha.get("status"),
+           "dateCreated": alpha.get("dateCreated"), "dateSubmitted": alpha.get("dateSubmitted"),
+           "name": alpha.get("name"), **_compact_alpha_row(alpha)}
+    if alpha.get("type") == "SUPER":
+        row["expr"] = {"combo": _code_of(alpha.get("combo")), "selection": _code_of(alpha.get("selection"))}
+    return {k: v for k, v in row.items() if v not in (None, [], {}, "")}
+
+
+def _as_list(value: Any, name: str) -> List[Any]:
+    """A tool argument that takes one value or a list of them."""
+    if value is None:
+        return []
+    if isinstance(value, (str, dict)):
+        return [value]
     if isinstance(value, list):
-        return [_redact(v) for v in value]
-    return value
-
-
-# --- MCP Tool Definitions ---
-
-def _transport_security():
-    """DNS-rebinding protection: FastMCP enables it for loopback binds; extend it to
-    the host names a reverse proxy forwards (WQMCP_ALLOWED_HOSTS, comma-separated)."""
-    from mcp.server.transport_security import TransportSecuritySettings
-    extra = [h.strip() for h in os.environ.get("WQMCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
-    if not extra:
-        if WQMCP_HOST not in ("127.0.0.1", "localhost", "::1"):
-            logger.warning("WQMCP_HOST=%s without WQMCP_ALLOWED_HOSTS: no DNS-rebinding protection "
-                           "and no authentication; put an authenticating reverse proxy in front.",
-                           WQMCP_HOST)
-        return None
-    return TransportSecuritySettings(
-        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *extra],
-        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
-                         *[f"https://{h}" for h in extra], *[f"http://{h}" for h in extra]])
-
-
-# Default to loopback: this server has no authentication of its own. Set
-# WQMCP_HOST=0.0.0.0 (behind an authenticating proxy) for remote clients.
-WQMCP_HOST = os.environ.get("WQMCP_HOST", "127.0.0.1")
-WQMCP_PORT = int(os.environ.get("WQMCP_PORT", "8761"))
-
-mcp = FastMCP(
-    "brain-platform-mcp",
-    instructions="A server for interacting with the WorldQuant BRAIN platform",
-    host=WQMCP_HOST,
-    port=WQMCP_PORT,
-    transport_security=_transport_security(),
-)
-
-
-def _write_guard(what: str) -> Optional[Dict[str, Any]]:
-    """Error payload when writes are disabled (WQMCP_READ_ONLY=1), else None."""
-    if READ_ONLY:
-        return {"error": f"{what} is disabled: this server runs with WQMCP_READ_ONLY=1"}
-    return None
-
-@mcp.tool()
-async def authenticate(email: Optional[str] = "", password: Optional[str] = "") -> Dict[str, Any]:
-    """
-    🔐 Verify / refresh the BRAIN login state.
-
-    Login is managed centrally by the credd daemon (creds-daemon) — this MCP no
-    longer logs in with a password itself. Calling this tool is optional: every
-    other tool self-heals its login automatically. Use it to check that the
-    platform connection is healthy.
-
-    Args:
-        email: Ignored (kept for backward compatibility; credentials live in credd)
-        password: Ignored (kept for backward compatibility; credentials live in credd)
-
-    Returns:
-        Authentication status from the credd-backed session
-    """
-    try:
-        return await brain_client.authenticate(email or "", password or "")
-    except Exception as e:
-        return {"error": str(e)}
-
-@mcp.tool()
-async def manage_config(action: str = "get", settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    🔧 Manage configuration settings - get or update configuration.
-    
-    Args:
-        action: Action to perform ("get" to retrieve config, "set" to update config)
-        settings: Configuration settings to update (required when action="set")
-    
-    Returns:
-        Current or updated configuration including authentication status
-    """
-    if action == "get":
-        config = _redact(load_config())
-        auth_status = await brain_client.get_authentication_status()
-        
-        return {
-            "config": config,
-            "auth_status": auth_status,
-            "is_authenticated": await brain_client.is_authenticated()
-        }
-    
-    elif action == "set":
-        if settings is None:
-            return {"error": "Settings parameter is required when action='set'"}
-        guard = _write_guard("manage_config(set)")
-        if guard:
-            return guard
-        config = load_config()
-        config.update(settings)
-        save_config(config)
-        return _redact(config)
-    
-    else:
-        return {"error": f"Invalid action '{action}'. Use 'get' or 'set'."}
-
-# --- Simulation Tools ---
-
-@mcp.tool()
-async def create_simulation(
-    type: str = "REGULAR",
-    instrument_type: str = "EQUITY",
-    region: str = "USA",
-    universe: str = "TOP3000",
-    delay: int = 1,
-    decay: float = 0.0,
-    neutralization: str = "NONE",
-    truncation: float = 0.0,
-    test_period: str = "P0Y0M",
-    unit_handling: str = "VERIFY",
-    nan_handling: str = "OFF",
-    language: str = "FASTEXPR",
-    visualization: bool = True,
-    regular: Optional[str] = None,
-    combo: Optional[str] = None,
-    selection: Optional[str] = None,
-    pasteurization: str = "ON",
-    max_trade: str = "OFF",
-    selection_handling: str = "POSITIVE",
-    selection_limit: int = 1000,
-    component_activation: str = "IS",
-    max_position: str = "OFF",
-    lookback: Optional[int] = None,
-    simulation_mode: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    🚀 Submit a new simulation on BRAIN platform (returns immediately).
-
-    This tool submits a simulation with your alpha code and returns right away with
-    a simulation_id and a progress_url — it does NOT wait for the simulation to
-    finish (simulations typically take 1-5 minutes). To get progress and the final
-    result, call check_simulation_progress with the returned progress_url. You can
-    do other work between checks.
-
-    Args:
-        type: Simulation type ("REGULAR" or "SUPER")
-        instrument_type: Type of instruments (e.g., "EQUITY")
-        region: Market region (e.g., "USA")
-        universe: Universe of stocks (e.g., "TOP3000")
-        delay: Data delay (0 or 1)
-        decay: Decay value for the simulation
-        neutralization: Neutralization method
-        truncation: Truncation value
-        test_period: Test period (e.g., "P0Y0M"). Ignored when language="PYTHON".
-        unit_handling: Unit handling method. Ignored when language="PYTHON".
-        nan_handling: NaN handling method. Ignored when language="PYTHON".
-        language: Expression language. "FASTEXPR" (default) or "PYTHON".
-        visualization: Enable visualization
-        regular: Regular simulation code (for REGULAR type). For language="PYTHON" pass a Python source string.
-        combo: Combo code (for SUPER type)
-        selection: Selection code (for SUPER type)
-        lookback: PYTHON-only lookback window (required when language="PYTHON", ignored otherwise).
-        simulation_mode: "QUICK" or "FULL" (default None = platform default, FULL).
-            QUICK = fast feedback for rapid iteration: returns core metrics only
-            (PnL, sub-universe PnL, weight concentration, fitness, IS ladder,
-            Sharpe, returns, turnover), skips visualizations and the Theme /
-            Competition / correlation checks, and the alpha is NOT directly
-            submittable. QUICK forces visualization=False. Use FULL for
-            near-submission-ready alphas that need all checks.
-
-    Returns:
-        {"status": "SUBMITTED", "simulation_id": ..., "progress_url": ...} — poll
-        check_simulation_progress(progress_url) for progress and the final result.
-    """
-    guard = _write_guard("create_simulation")
-    if guard:
-        return guard
-    try:
-        if (language or "").upper() == "PYTHON" and lookback is None:
-            return {"error": "lookback is required when language='PYTHON'"}
-        try:
-            simulation_mode, visualization = _normalize_simulation_mode(simulation_mode, visualization)
-        except ValueError as e:
-            return {"error": str(e)}
-
-        settings = SimulationSettings(
-            instrumentType=instrument_type,
-            region=region,
-            universe=universe,
-            delay=delay,
-            decay=decay,
-            neutralization=neutralization,
-            truncation=truncation,
-            testPeriod=test_period,
-            unitHandling=unit_handling,
-            nanHandling=nan_handling,
-            language=language,
-            visualization=visualization,
-            pasteurization=pasteurization,
-            maxTrade=max_trade,
-            selectionHandling=selection_handling,
-            selectionLimit=selection_limit,
-            componentActivation=component_activation,
-            maxPosition=max_position,
-            lookback=lookback,
-            simulationMode=simulation_mode,
-        )
-
-        sim_data = SimulationData(
-            type=type,
-            settings=settings,
-            regular=regular,
-            combo=combo,
-            selection=selection
-        )
-
-        return await brain_client.create_simulation(sim_data)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def check_simulation_progress(progress_url: str, wait_seconds: float = 0,
-                                    compact: bool = True) -> Dict[str, Any]:
-    """
-    ⏳ Check the progress / result of a submitted simulation — single OR multi.
-
-    Use this after create_simulation or create_multi_simulation returns
-    {"status": "SUBMITTED", "progress_url": ...}. The URL type is detected
-    automatically:
-    - single simulation: progress (0.0-1.0) while running; the alpha when
-      finished; BRAIN's error message if the simulation failed.
-    - multi-simulation: per-child status with completed_children/total_children
-      while running; once ALL children finish, alpha_results with one entry per
-      child.
-    - RAA (create_raa_simulation): once finished, the parent_alpha_id plus one
-      compact metric row per region child (same shape as get_raa_alpha).
-
-    Args:
-        progress_url: The progress_url returned by create_simulation /
-            create_multi_simulation / create_raa_simulation
-            (e.g. "https://api.worldquantbrain.com/simulations/<id>")
-        wait_seconds: Optional bounded wait before answering (0 = check once and
-            return immediately; max 120). Use e.g. 30-60 to block briefly when you
-            have nothing else to do.
-        compact: True (default) = one short row per finished alpha: id, ops
-            (operator count), sharpe, fitness, turnover, margin_bps,
-            robust_sharpe, sub_sharpe, y2_sharpe, cluster, fails (failed checks),
-            set (universe/decay/neutralization/truncation/maxTrade) and expr.
-            False = the full alpha object (same shape as get_alpha_details).
-
-    Returns:
-        {"status": "RUNNING", ...} with progress info while running; final results
-        when finished; {"status": "ERROR"/..., "message": ...} on failure.
-    """
-    try:
-        try:
-            progress_url = _simulation_url(progress_url)
-        except ValueError as e:
-            return {"error": f"{e}. Pass the progress_url (or simulation id) returned by create_simulation"}
-        return await brain_client.check_simulation_progress(progress_url, wait_seconds, compact)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def create_raa_simulation(
-    regular: str,
-    universe: str = "MEDIUM",
-    decay: float = 10,
-    neutralization: str = "SLOW_AND_FAST",
-    truncation: float = 0.08,
-    pasteurization: str = "ON",
-    unit_handling: str = "VERIFY",
-    nan_handling: str = "OFF",
-    max_trade: str = "OFF",
-    max_position: str = "OFF",
-    visualization: bool = False,
-    simulation_mode: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    🌍 Submit a Region Agnostic Alpha (RAA) simulation — one expression, all regions.
-
-    A single RAA simulation runs the SAME expression in GLB / USA / ASI / EUR at
-    once, producing an RA_PARENT alpha with up to 4 RA_CHILD alphas. Returns
-    immediately; poll check_simulation_progress(progress_url), which detects RAA
-    and reports the parent id plus one metric row per region child.
-
-    Platform rules enforced here (violations fail the simulation outright):
-    - region is always "ALL", delay always 1, instrumentType always EQUITY.
-    - universe must be an RAA pseudo-universe: LARGE / MEDIUM / SMALL. Per region:
-      LARGE  -> ASI MINVOL1M / EUR TOP2500 / GLB MINVOL1M / USA TOP3000
-      MEDIUM -> ASI MINVOL10M / EUR TOP1200 / GLB MINVOL10M / USA TOP2000
-      SMALL  -> ASI TOP500 / EUR TOP800 / GLB TOPDIV3000 / USA TOP1000
-    - max_trade and max_position cannot both be "ON" (ASI children are forced to
-      maxTrade by the platform anyway).
-
-    Quota: one RAA consumes 4 concurrent simulation slots but counts as a single
-    submission. Submitting requires >=2 children passing all checks, and at least
-    one of those children passing PROD correlation.
-
-    Args:
-        regular: FASTEXPR alpha expression. Every data field used must exist in at
-            least 2 of the 4 regions (fields tagged region "ALL" on the platform);
-            a field present in only one region cannot be an RAA.
-        universe: "LARGE", "MEDIUM" or "SMALL" (default "MEDIUM").
-        decay / neutralization / truncation / pasteurization / unit_handling /
-        nan_handling / max_trade / max_position / visualization: same meaning as in
-        create_simulation; one setting applies to all four regions.
-        simulation_mode: "QUICK" or "FULL" (default None = platform default). See
-            create_simulation; QUICK forces visualization=False and is not
-            directly submittable.
-
-    Returns:
-        {"status": "SUBMITTED", "simulation_id": ..., "progress_url": ...} — poll
-        check_simulation_progress(progress_url); or {"status": "RATE_LIMITED", ...}.
-    """
-    guard = _write_guard("create_raa_simulation")
-    if guard:
-        return guard
-    try:
-        if (universe or "").upper() not in RAA_UNIVERSES:
-            return {"error": f"RAA universe must be one of {RAA_UNIVERSES}, got '{universe}'"}
-        if (max_trade or "").upper() == "ON" and (max_position or "").upper() == "ON":
-            return {"error": "maxTrade and maxPosition cannot both be ON for an RAA simulation"}
-        if not regular:
-            return {"error": "regular (the alpha expression) is required"}
-        try:
-            simulation_mode, visualization = _normalize_simulation_mode(simulation_mode, visualization)
-        except ValueError as e:
-            return {"error": str(e)}
-
-        settings = SimulationSettings(
-            instrumentType="EQUITY",
-            region="ALL",
-            universe=universe.upper(),
-            delay=1,
-            decay=decay,
-            neutralization=neutralization,
-            truncation=truncation,
-            pasteurization=pasteurization,
-            unitHandling=unit_handling,
-            nanHandling=nan_handling,
-            language="FASTEXPR",
-            visualization=visualization,
-            testPeriod=None,  # RAA payload carries no testPeriod
-            maxTrade=max_trade,
-            maxPosition=max_position,
-            simulationMode=simulation_mode,
-        )
-        sim_data = SimulationData(type="REGION_AGNOSTIC", settings=settings, regular=regular)
-        return await brain_client.create_simulation(sim_data)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_raa_alpha(parent_alpha_id: str) -> Dict[str, Any]:
-    """
-    🌍 Read an existing RAA parent alpha: settings, expression and per-region child metrics.
-
-    Use this for RA_PARENT alphas from earlier runs (check_simulation_progress
-    already returns this shape for a freshly finished RAA). The parent itself has
-    no metrics — this fetches every RA_CHILD and returns one compact row per region
-    (sharpe, fitness, turnover, returns, drawdown, margin_bps, 2Y sharpe,
-    sub-universe sharpe, FAIL and WARNING check names) plus how many children pass
-    every check.
-
-    Args:
-        parent_alpha_id: The RA_PARENT alpha id (not a child id).
-    """
-    try:
-        return await brain_client.get_raa_alpha(parent_alpha_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-# --- Alpha and Data Retrieval Tools ---
-
-@mcp.tool()
-async def get_alpha_details(alpha_id: str) -> Dict[str, Any]:
-    """
-    📋 Get detailed information about an alpha.
-    
-    Args:
-        alpha_id: The ID of the alpha to retrieve
-    
-    Returns:
-        Detailed alpha information
-    """
-    try:
-        return await brain_client.get_alpha_details(alpha_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_datasets(
-    instrument_type: str = "EQUITY",
-    region: str = "USA",
-    delay: int = 1,
-    universe: str = "TOP3000",
-    theme: str = "false",
-    search: Optional[str] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
-) -> Dict[str, Any]:
-    """
-    📚 Get available datasets for research.
-    
-    Use this to discover what data is available for your alpha research.
-    
-    Args:
-        instrument_type: Type of instruments (e.g., "EQUITY")
-        region: Market region (e.g., "USA")
-        delay: Data delay (0 or 1)
-        universe: Universe of stocks (e.g., "TOP3000")
-        theme: Theme filter
-        search: Free-text search
-        limit: Page size (1-50; default = BRAIN's 20). Response `count` is the total.
-        offset: Skip this many datasets (paging)
-    
-    Returns:
-        Available datasets
-    """
-    try:
-        return await brain_client.get_datasets(instrument_type, region, delay, universe, theme, search,
-                                               limit, offset)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_datafields(
-    instrument_type: str = "EQUITY",
-    region: str = "USA",
-    delay: int = 1,
-    universe: str = "TOP3000",
-    theme: str = "false",
-    dataset_id: Optional[str] = None,
-    data_type: str = "",
-    search: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-) -> Dict[str, Any]:
-    """
-    🔍 Get available data fields for alpha construction.
-    
-    Use this to find specific data fields you can use in your alpha formulas.
-    
-    Args:
-        instrument_type: Type of instruments (e.g., "EQUITY")
-        region: Market region (e.g., "USA")
-        delay: Data delay (0 or 1)
-        universe: Universe of stocks (e.g., "TOP3000")
-        theme: Theme filter
-        dataset_id: Specific dataset ID to filter by
-        data_type: Type of data (e.g., "MATRIX",'VECTOR','GROUP')
-        search: Search term to filter fields
-        limit: Page size (1-100, default 50). Response `count` is the total.
-        offset: Skip this many fields (paging)
-    
-    Returns:
-        Available data fields
-    """
-    try:
-        return await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id, data_type, search,
-                                                 limit, offset)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_alpha_pnl(alpha_id: str) -> Dict[str, Any]:
-    """
-    📈 Get PnL (Profit and Loss) data for an alpha.
-    
-    Args:
-        alpha_id: The ID of the alpha
-    
-    Returns:
-        PnL data for the alpha
-    """
-    try:
-        return await brain_client.get_alpha_pnl(alpha_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_user_alphas(
-    stage: str = "IS",
-    limit: int = 30,
-    offset: int = 0,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    submission_start_date: Optional[str] = None,
-    submission_end_date: Optional[str] = None,
-    order: Optional[str] = None,
-    hidden: Optional[bool] = None,
-) -> Dict[str, Any]:
-    """
-    👤 Get user's alphas with advanced filtering, pagination, and sorting.
-
-    This tool retrieves a list of your alphas, allowing for detailed filtering based on stage,
-    creation date, submission date, and visibility. It also supports pagination and custom sorting.
-
-    Args:
-        stage (str): The stage of the alphas to retrieve.
-            - "IS": In-Sample (alphas that have not been submitted).
-            - "OS": Out-of-Sample (alphas that have been submitted).
-            Defaults to "IS".
-        limit (int): The maximum number of alphas to return in a single request.
-            For example, `limit=50` will return at most 50 alphas. Defaults to 30.
-        offset (int): The number of alphas to skip from the beginning of the list.
-            Used for pagination. For example, `limit=50, offset=50` will retrieve alphas 51-100.
-            Defaults to 0.
-        start_date (Optional[str]): The earliest creation date for the alphas to be included.
-            Filters for alphas created on or after this date.
-            Example format: "2023-01-01T00:00:00Z".
-        end_date (Optional[str]): The latest creation date for the alphas to be included.
-            Filters for alphas created before this date.
-            Example format: "2023-12-31T23:59:59Z".
-        submission_start_date (Optional[str]): The earliest submission date for the alphas.
-            Only applies to "OS" alphas. Filters for alphas submitted on or after this date.
-            Example format: "2024-01-01T00:00:00Z".
-        submission_end_date (Optional[str]): The latest submission date for the alphas.
-            Only applies to "OS" alphas. Filters for alphas submitted before this date.
-            Example format: "2024-06-30T23:59:59Z".
-        order (Optional[str]): The sorting order for the returned alphas.
-            Prefix with a hyphen (-) for descending order.
-            Examples: "name" (sort by name ascending), "-dateSubmitted" (sort by submission date descending).
-        hidden (Optional[bool]): Filter alphas based on their visibility.
-            - `True`: Only return hidden alphas.
-            - `False`: Only return non-hidden alphas.
-            If not provided, both hidden and non-hidden alphas are returned.
-
-    Returns:
-        Dict[str, Any]: A dictionary containing a list of alpha details under the 'results' key,
-        along with pagination information. If an error occurs, it returns a dictionary with an 'error' key.
-    """
-    try:
-        return await brain_client.get_user_alphas(
-            stage=stage, limit=limit, offset=offset, start_date=start_date,
-            end_date=end_date, submission_start_date=submission_start_date,
-            submission_end_date=submission_end_date, order=order, hidden=hidden
-        )
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def submit_alpha(alpha_id: str, wait_seconds: float = 60) -> Dict[str, Any]:
-    """
-    📤 Submit an alpha for production and wait for BRAIN's verdict.
-
-    Submission is asynchronous on BRAIN: this posts it, then follows the platform's
-    Retry-After polling until the final check report (up to wait_seconds, max 300).
-
-    Returns:
-        success (bool) and status: SUBMITTED, REJECTED (see failed / checks),
-        PENDING (still processing — call submit_alpha again; it resumes polling and
-        never submits twice), RATE_LIMITED or ERROR.
-    Run get_submission_check first if you only want to know whether it would pass.
-
-    Args:
-        alpha_id: The ID of the alpha to submit
-        wait_seconds: How long to follow the submission before answering (default 60)
-    """
-    guard = _write_guard("submit_alpha")
-    if guard:
-        return guard
-    if not ALLOW_SUBMIT:
-        return {"error": "submissions are disabled on this server (WQMCP_ALLOW_SUBMIT=0); "
-                         "use get_submission_check to see whether the alpha would pass"}
-    try:
-        return await brain_client.submit_alpha(alpha_id, wait_seconds)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def value_factor_trendScore(start_date: str, end_date: str) -> Dict[str, Any]:
-    """Compute and return the diversity score for REGULAR alphas in a submission-date window.
-    This function calculate the diversity of the users' submission, by checking the diversity, we can have a good understanding on the valuefactor's trend.
-    This MCP tool wraps BrainApiClient.value_factor_trendScore and always uses submission dates (OS).
-
-    Inputs:
-        - start_date: ISO UTC start datetime (e.g. '2025-08-14T00:00:00Z')
-        - end_date: ISO UTC end datetime (e.g. '2025-08-18T23:59:59Z')
-        - p_max: optional integer total number of pyramid categories for normalization
-
-    Returns: compact JSON with diversity_score, N, A, P, P_max, S_A, S_P, S_H, per_pyramid_counts
-    """
-    try:
-        return await brain_client.value_factor_trendScore(start_date=start_date, end_date=end_date)
-    except Exception as e:
-        return {"error": str(e)}
-
-# --- Community and Events Tools ---
-
-@mcp.tool()
-async def get_events() -> Dict[str, Any]:
-    """
-    🏆 Get available events and competitions.
-    
-    Returns:
-        Available events and competitions
-    """
-    try:
-        return await brain_client.get_events()
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_leaderboard(user_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    🏅 Get leaderboard data.
-    
-    Args:
-        user_id: Optional user ID to filter results
-    
-    Returns:
-        Leaderboard data
-    """
-    try:
-        return await brain_client.get_leaderboard(user_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-
-# --- Forum Tools ---
-
-@mcp.tool()
-async def get_operators() -> Dict[str, Any]:
-    """
-    🔧 Get available operators for alpha creation.
-    
-    Returns:
-        Dictionary containing operators list and count
-    """
-    try:
-        operators = await brain_client.get_operators()
-        if isinstance(operators, list):
-            return {"results": operators, "count": len(operators)}
-        return operators
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def run_selection(
-    selection: str,
-    instrument_type: str = "EQUITY",
-    region: str = "USA",
-    delay: int = 1,
-    selection_limit: int = 1000,
-    selection_handling: str = "POSITIVE",
-    limit: int = 10,
-) -> Dict[str, Any]:
-    """
-    🎯 Run a selection query to filter instruments.
-    
-    Args:
-        selection: Selection criteria
-        instrument_type: Type of instruments
-        region: Geographic region
-        delay: Delay setting
-        selection_limit: Maximum number of results
-        selection_handling: How to handle selection results
-    
-    Returns:
-        Selection results
-    """
-    try:
-        return await brain_client.run_selection(
-            selection, instrument_type, region, delay, selection_limit, selection_handling, limit
-        )
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_user_profile(user_id: str = "self") -> Dict[str, Any]:
-    """
-    👤 Get user profile information.
-    
-    Args:
-        user_id: User ID (default: "self" for current user)
-    
-    Returns:
-        User profile data
-    """
-    try:
-        return await brain_client.get_user_profile(user_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_documentations() -> Dict[str, Any]:
-    """
-    📚 Get available documentations and learning materials.
-    
-    Returns:
-        List of documentations
-    """
-    try:
-        return await brain_client.get_documentations()
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-# --- Message and Forum Tools ---
-
-@mcp.tool()
-async def get_messages(limit: Optional[int] = None, offset: int = 0) -> Dict[str, Any]:
-    """
-    💬 Get messages for the current user with optional pagination.
-    
-    Args:
-        limit: Maximum number of messages to return (e.g., 10 for top 10 messages)
-        offset: Number of messages to skip (for pagination)
-    
-    Returns:
-        Messages for the current user, optionally limited by count
-    """
-    try:
-        return await brain_client.get_messages(limit, offset)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_glossary_terms(email: str = "", password: str = "") -> List[Dict[str, str]]:
-    """
-    📚 Get glossary terms from WorldQuant BRAIN forum.
-    
-    Note: This uses Playwright and is implemented in forum_functions.py
-    
-    Args:
-        email: Your BRAIN platform email address (optional if in config)
-        password: Your BRAIN platform password (optional if in config)
-    
-    Returns:
-        A list of glossary terms with definitions
-    """
-    try:
-        # Login is credd-backed: the browser context reuses brain_client's session
-        # cookies, so email/password are legacy pass-throughs and may be empty.
-
-        return await brain_client.get_glossary_terms(email, password)
-    except Exception as e:
-        logger.error(f"Error in get_glossary_terms tool: {e}")
-        return [{"error": str(e)}]
-
-@mcp.tool()
-async def search_forum_posts(search_query: str, email: str = "", password: str = "", 
-                             max_results: int = 50) -> Dict[str, Any]:
-    """
-    🔍 Search forum posts on WorldQuant BRAIN support site.
-    
-    Note: This uses Playwright and is implemented in forum_functions.py
-    
-    Args:
-        search_query: Search term or phrase
-        email: Your BRAIN platform email address (optional if in config)
-        password: Your BRAIN platform password (optional if in config)
-        max_results: Maximum number of results to return (default: 50)
-    
-    Returns:
-        Search results with analysis
-    """
-    try:
-        # Login is credd-backed; email/password are legacy pass-throughs.
-
-        return await brain_client.search_forum_posts(email, password, search_query, max_results)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def read_forum_post(article_id: str, email: str = "", password: str = "", 
-                          include_comments: bool = True) -> Dict[str, Any]:
-    """
-    📄 Get a specific forum post by article ID.
-    
-    Note: This uses Playwright and is implemented in forum_functions.py
-    
-    Args:
-        article_id: The article ID to retrieve (e.g., "32984819083415-新人求模板")
-        email: Your BRAIN platform email address (optional if in config)
-        password: Your BRAIN platform password (optional if in config)
-    
-    Returns:
-        Forum post content with comments
-    """
-    try:
-        # Login is credd-backed; email/password are legacy pass-throughs.
-
-        return await brain_client.read_forum_post(email, password, article_id, include_comments)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_alpha_yearly_stats(alpha_id: str) -> Dict[str, Any]:
-    """Get yearly statistics for an alpha."""
-    try:
-        return await brain_client.get_alpha_yearly_stats(alpha_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def check_correlation(alpha_id: str, correlation_type: str = "both", threshold: float = 0.7,
-                            max_wait: float = 60, include_data: bool = False) -> Dict[str, Any]:
-    """Platform production and/or self correlation of an alpha.
-
-    Each type comes back with status:
-      DONE    — max_correlation, passes_check (max < threshold), top 3 correlated alphas
-      PENDING — platform still computing when max_wait ran out; call again later
-                (retry_after_seconds). NOT a failure.
-      ERROR   — the platform really failed (http_status / error given).
-    Top-level status is ERROR if any type errored, else PENDING if any is pending,
-    else DONE; all_passed is true/false only when DONE, otherwise null.
-    Measured values are saved into ProdMemo as reference points.
-
-    Args:
-        alpha_id: Alpha to check
-        correlation_type: "prod" (or "production"), "self", or "both" (default)
-        threshold: Pass threshold (default 0.7)
-        max_wait: Seconds to keep polling while the platform computes (default 60, max 300)
-        include_data: Also return the raw correlation payloads (large)
-    """
-    try:
-        return await brain_client.check_correlation(alpha_id, correlation_type, threshold,
-                                                    max_wait, include_data)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_submission_check(alpha_id: str, max_wait: float = 60) -> Dict[str, Any]:
-    """Platform-authoritative pre-submission check (the same checks as the Submit button).
-
-    Returns status DONE/PENDING, all_passed, failed / pending / errored check
-    names, and each check's result/value/limit. When PROD_CORRELATION comes back
-    as ERROR (the platform is busy), the dedicated prod-correlation endpoint is
-    tried and its result reported in prod_fallback. A measured prod correlation
-    is saved into ProdMemo.
-
-    Args:
-        alpha_id: Alpha to check
-        max_wait: Seconds to keep polling while the platform runs the checks (default 60, max 300)
-    """
-    try:
-        return await brain_client.get_submission_check(alpha_id, max_wait)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def set_alpha_properties(
-    alpha_id: str,
-    name: Optional[str] = None,
-    color: Optional[str] = None,
-    category: Optional[str] = None,
-    regular_desc: Optional[str] = None,
-    selection_desc: Optional[str] = None,
-    combo_desc: Optional[str] = None,
-    osmosis_points: Optional[int] = None,
-    tags: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """Update alpha properties (name, color, tags, descriptions, category, osmosis points)."""
-    guard = _write_guard("set_alpha_properties")
-    if guard:
-        return guard
-    try:
-        return await brain_client.set_alpha_properties(
-            alpha_id,
-            name,
-            color,
-            category,
-            regular_desc,
-            selection_desc,
-            combo_desc,
-            osmosis_points,
-            tags,
-        )
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_record_sets(alpha_id: str) -> Dict[str, Any]:
-    """List available record sets for an alpha."""
-    try:
-        return await brain_client.get_record_sets(alpha_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_record_set_data(alpha_id: str, record_set_name: str) -> Dict[str, Any]:
-    """Get data from a specific record set."""
-    try:
-        return await brain_client.get_record_set_data(alpha_id, record_set_name)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_user_activities(user_id: str, grouping: Optional[str] = None) -> Dict[str, Any]:
-    """Get user activity diversity data."""
-    try:
-        return await brain_client.get_user_activities(user_id, grouping)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_pyramid_multipliers() -> Dict[str, Any]:
-    """Get current pyramid multipliers showing BRAIN's encouragement levels."""
-    try:
-        return await brain_client.get_pyramid_multipliers()
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_pyramid_alphas(start_date: Optional[str] = None,
-                               end_date: Optional[str] = None) -> Dict[str, Any]:
-    """Get user's current alpha distribution across pyramid categories."""
-    try:
-        return await brain_client.get_pyramid_alphas(start_date, end_date)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-        
-@mcp.tool()
-async def get_user_competitions(user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Get list of competitions that the user is participating in."""
-    try:
-        return await brain_client.get_user_competitions(user_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_competition_details(competition_id: str) -> Dict[str, Any]:
-    """Get detailed information about a specific competition."""
-    try:
-        return await brain_client.get_competition_details(competition_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_competition_agreement(competition_id: str) -> Dict[str, Any]:
-    """Get the rules, terms, and agreement for a specific competition."""
-    try:
-        return await brain_client.get_competition_agreement(competition_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def get_platform_setting_options() -> Dict[str, Any]:
-    """Discover valid simulation setting options (instrument types, regions, delays, universes, neutralization).
-
-    Use this when a simulation request might contain an invalid/mismatched setting. If an AI or user supplies
-    incorrect parameters (e.g., wrong region for an instrument type), call this tool to retrieve the authoritative
-    option sets and correct the inputs before proceeding.
-
-    Returns:
-        A structured list of valid combinations and choice lists to validate or fix simulation settings.
-    """
-    try:
-        return await brain_client.get_platform_setting_options()
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-@mcp.tool()
-async def performance_comparison(alpha_id: str, team_id: Optional[str] = None, 
-                                 competition: Optional[str] = None) -> Dict[str, Any]:
-    """Get performance comparison data for an alpha."""
-    try:
-        return await brain_client.performance_comparison(alpha_id, team_id, competition)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-        
-# --- Dataframe Tool ---
-
-@mcp.tool()
-async def expand_nested_data(data: List[Dict[str, Any]], preserve_original: bool = True) -> List[Dict[str, Any]]:
-    """Flatten complex nested data structures into tabular format."""
-    try:
-        return await brain_client.expand_nested_data(data, preserve_original)
-    except Exception as e:
-        return [{"error": f"An unexpected error occurred: {str(e)}"}]
-        
-# --- Documentation Tool ---
-
-@mcp.tool()
-async def get_documentation_page(page_id: str) -> Dict[str, Any]:
-    """Retrieve detailed content of a specific documentation page/article."""
-    try:
-        return await brain_client.get_documentation_page(page_id)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-# --- Advanced Simulation Tools ---
-
-# Per-alpha override keys for create_multi_simulation: tool-style snake_case
-# names map to the API's camelCase; camelCase is accepted as-is. language and
-# lookback stay batch-level because they change the payload shape.
-_MULTI_OVERRIDE_KEYS = {
+        return list(value)
+    raise ValueError(f"{name} must be a string or a list of strings")
+
+
+# --- Simulation planning ------------------------------------------------------
+
+# Accepted spellings of the simulation type (case-insensitive).
+SIMULATION_TYPES = {
+    "REGULAR": "REGULAR",
+    "SUPER": "SUPER", "SA": "SUPER", "SUPERALPHA": "SUPER",
+    "REGION_AGNOSTIC": "REGION_AGNOSTIC", "RA": "REGION_AGNOSTIC", "RAA": "REGION_AGNOSTIC",
+}
+SIMULATION_BATCH_MODES = ("auto", "single", "multi", "concurrent")
+MAX_SIMULATIONS_PER_CALL = 10
+
+# Defaults for the settings create_simulation leaves as None. RAA has its own:
+# region ALL / delay 1 are fixed, and only LARGE / MEDIUM / SMALL universes exist.
+_TYPE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "REGULAR": {"instrumentType": "EQUITY", "region": "USA", "universe": "TOP3000", "delay": 1,
+                "decay": 0.0, "neutralization": "NONE", "truncation": 0.0, "visualization": True},
+    "REGION_AGNOSTIC": {"instrumentType": "EQUITY", "region": "ALL", "universe": "MEDIUM", "delay": 1,
+                        "decay": 10.0, "neutralization": "SLOW_AND_FAST", "truncation": 0.08,
+                        "visualization": False},
+}
+_TYPE_DEFAULTS["SUPER"] = _TYPE_DEFAULTS["REGULAR"]
+_RAA_FIXED = {"instrumentType": "EQUITY", "region": "ALL", "delay": 1}
+
+# per_alpha_settings keys: tool-style snake_case names map to the API's camelCase;
+# camelCase is accepted as-is. language and lookback stay call-level because they
+# change the payload shape.
+_OVERRIDE_KEYS = {
     "instrument_type": "instrumentType", "region": "region", "universe": "universe",
     "delay": "delay", "decay": "decay", "neutralization": "neutralization",
     "truncation": "truncation", "pasteurization": "pasteurization",
     "unit_handling": "unitHandling", "nan_handling": "nanHandling",
     "max_trade": "maxTrade", "max_position": "maxPosition", "test_period": "testPeriod",
     "visualization": "visualization", "simulation_mode": "simulationMode",
+    "selection_handling": "selectionHandling", "selection_limit": "selectionLimit",
+    "component_activation": "componentActivation",
 }
-_MULTI_OVERRIDE_KEYS.update({v: v for v in list(_MULTI_OVERRIDE_KEYS.values())})
+_OVERRIDE_KEYS.update({v: v for v in list(_OVERRIDE_KEYS.values())})
+
 
 # Operators whose optional parameters must be passed by keyword: a positional
 # optional argument makes that child fail, and a failed child cancels the whole
@@ -3227,318 +2307,1026 @@ def _lint_expression(expr: str) -> List[str]:
     return problems
 
 
-@mcp.tool()
-async def create_multi_simulation(
-    alpha_expressions: List[str],
-    instrument_type: str = "EQUITY",
-    region: str = "USA",
-    universe: str = "TOP3000",
-    delay: int = 1,
-    decay: float = 0.0,
-    neutralization: str = "NONE",
-    truncation: float = 0.0,
-    test_period: str = "P0Y0M",
+def _check_raa_settings(settings: Dict[str, Any], prefix: str) -> None:
+    """Platform rules for REGION_AGNOSTIC (violations fail the simulation outright)."""
+    for key, fixed in _RAA_FIXED.items():
+        if str(settings.get(key)).strip().upper() != str(fixed):
+            raise ValueError(f"{prefix}an RAA simulation always runs with {key}={fixed!r}, "
+                             f"got {settings.get(key)!r}")
+        settings[key] = fixed
+    universe = str(settings.get("universe") or "").strip().upper()
+    if universe not in RAA_UNIVERSES:
+        raise ValueError(f"{prefix}RAA universe must be one of {list(RAA_UNIVERSES)}, "
+                         f"got {settings.get('universe')!r}")
+    settings["universe"] = universe
+    if (str(settings.get("maxTrade")).upper() == "ON"
+            and str(settings.get("maxPosition")).upper() == "ON"):
+        raise ValueError(f"{prefix}maxTrade and maxPosition cannot both be ON for an RAA simulation")
+
+
+def _finalize_settings(sim_type: str, settings: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    settings = dict(settings)
+    if sim_type == "REGION_AGNOSTIC":
+        _check_raa_settings(settings, prefix)
+    try:
+        settings["simulationMode"], settings["visualization"] = _normalize_simulation_mode(
+            settings.get("simulationMode"), settings.get("visualization"))
+    except ValueError as e:
+        raise ValueError(f"{prefix}{e}")
+    return settings
+
+
+def _lint_problems(codes: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Lint each distinct FASTEXPR expression once (a settings sweep repeats one)."""
+    seen: Dict[str, int] = {}
+    rows = []
+    for i, code in enumerate(codes):
+        expr = code.get("regular")
+        if expr is None or expr in seen:
+            continue
+        seen[expr] = i
+        problems = _lint_expression(expr)
+        if problems:
+            rows.append({"index": i, "expr": expr[:120], "issues": problems})
+    return rows
+
+
+# --- MCP server -----------------------------------------------------------------
+
+def _transport_security():
+    """DNS-rebinding protection: FastMCP enables it for loopback binds; extend it to
+    the host names a reverse proxy forwards (WQMCP_ALLOWED_HOSTS, comma-separated)."""
+    from mcp.server.transport_security import TransportSecuritySettings
+    extra = [h.strip() for h in os.environ.get("WQMCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    if not extra:
+        if WQMCP_HOST not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning("WQMCP_HOST=%s without WQMCP_ALLOWED_HOSTS: no DNS-rebinding protection "
+                           "and no authentication; put an authenticating reverse proxy in front.",
+                           WQMCP_HOST)
+        return None
+    return TransportSecuritySettings(
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *extra],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+                         *[f"https://{h}" for h in extra], *[f"http://{h}" for h in extra]])
+
+
+# Default to loopback: this server has no authentication of its own. Set
+# WQMCP_HOST=0.0.0.0 (behind an authenticating proxy) for remote clients.
+WQMCP_HOST = os.environ.get("WQMCP_HOST", "127.0.0.1")
+WQMCP_PORT = int(os.environ.get("WQMCP_PORT", "8761"))
+
+mcp = FastMCP(
+    "brain-platform-mcp",
+    instructions=(
+        "WorldQuant BRAIN research tools. Typical loop: get_platform_setting_options -> "
+        "get_datasets / get_datafields / get_operators -> create_simulation (mode single / multi / "
+        "concurrent; type REGULAR, SUPER (SA) or REGION_AGNOSTIC (RA/RAA); language FASTEXPR or "
+        "PYTHON) -> get_simulation (poll with wait_seconds) -> check_alpha -> "
+        "submit_alpha(confirm=True). Long-running BRAIN jobs answer RUNNING / PENDING with "
+        "retry_after_seconds: call the same tool again instead of waiting idle. A failing tool "
+        "returns {\"error\": ...}. prodmemo_* tools estimate Prod correlation locally."
+    ),
+    host=WQMCP_HOST,
+    port=WQMCP_PORT,
+    transport_security=_transport_security(),
+)
+
+READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
+WRITE_IDEMPOTENT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+                                   openWorldHint=True)
+DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
+LOCAL_READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+LOCAL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
+
+
+def _tool(annotations: ToolAnnotations):
+    """Register an MCP tool whose failures come back as {"error": ...}: callers such
+    as scripts/prodmemo_daily_sync.py read that shape rather than MCP's isError."""
+    def register(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                return {"error": str(e) or repr(e)}
+        return mcp.tool(annotations=annotations)(wrapper)
+    return register
+
+
+def _write_guard(what: str) -> Optional[Dict[str, Any]]:
+    """Error payload when writes are disabled (WQMCP_READ_ONLY=1), else None."""
+    if READ_ONLY:
+        return {"error": f"{what} is disabled: this server runs with WQMCP_READ_ONLY=1"}
+    return None
+
+
+# --- Account ------------------------------------------------------------------
+
+@_tool(READ)
+async def brain_status(refresh: bool = False) -> Dict[str, Any]:
+    """
+    🔐 Check the BRAIN login (managed by the credd daemon; this server holds no password).
+
+    Every other tool self-heals an expired login, so this is only needed to diagnose
+    a connection problem.
+
+    Args:
+        refresh: Force-pull fresh cookies from credd first; on failure the error says
+            why (credd down, token mismatch, backoff, biometric verification pending).
+
+    Returns:
+        authenticated, user, token_expiry, plus the server's read_only / allow_submit switches.
+    """
+    switches = {"credd_url": CREDD_URL, "read_only": READ_ONLY, "allow_submit": ALLOW_SUBMIT}
+    if refresh:
+        auth = await brain_client.authenticate()
+        return {"authenticated": True, **auth, **switches}
+    status = await brain_client.get_authentication_status()
+    if status is None:
+        return {"authenticated": False, **switches,
+                "note": "BRAIN rejected the session or credd is unreachable; call "
+                        "brain_status(refresh=True) for the exact reason."}
+    return {"authenticated": True, "user": status.get("user"),
+            "token_expiry": (status.get("token") or {}).get("expiry"),
+            "permissions": status.get("permissions"), **switches}
+
+
+# --- Simulation -----------------------------------------------------------------
+
+@_tool(WRITE)
+async def create_simulation(
+    expressions: Union[str, List[str], None] = None,
+    type: str = "REGULAR",
+    mode: str = "auto",
+    combo: Union[str, List[str], None] = None,
+    selection: Union[str, List[str], None] = None,
+    language: str = "FASTEXPR",
+    lookback: Optional[int] = None,
+    instrument_type: Optional[str] = None,
+    region: Optional[str] = None,
+    universe: Optional[str] = None,
+    delay: Optional[int] = None,
+    decay: Optional[float] = None,
+    neutralization: Optional[str] = None,
+    truncation: Optional[float] = None,
+    pasteurization: str = "ON",
     unit_handling: str = "VERIFY",
     nan_handling: str = "OFF",
-    language: str = "FASTEXPR",
-    visualization: bool = True,
-    pasteurization: str = "ON",
+    test_period: str = "P0Y0M",
     max_trade: str = "OFF",
-    lookback: Optional[int] = None,
+    max_position: str = "OFF",
+    visualization: Optional[bool] = None,
     simulation_mode: Optional[str] = None,
+    selection_handling: str = "POSITIVE",
+    selection_limit: int = 1000,
+    component_activation: str = "IS",
     per_alpha_settings: Optional[List[Dict[str, Any]]] = None,
-    max_position: Optional[str] = None,
     validate_expressions: bool = True,
 ) -> Dict[str, Any]:
     """
-    🚀 Submit 2-10 regular alpha simulations in a single request (returns immediately).
+    🚀 Submit simulations (backtests) — returns immediately; poll get_simulation.
 
-    This tool submits a multisimulation and returns right away with a
-    progress_url — it does NOT wait for completion (typically 3-10 minutes). Poll
-    check_simulation_progress(progress_url): it reports per-child progress, then
-    one compact row per alpha once finished. Call get_platform_setting_options to
-    get the valid options for the simulation.
+    TYPE (what is simulated):
+      - "REGULAR": expressions = alpha expression(s). language="PYTHON" makes each
+        entry Python source (lookback then required).
+      - "SUPER" (alias "SA"): combo + selection expressions. Pass lists (paired
+        one-to-one, or one side a single string) to run several SuperAlphas.
+      - "REGION_AGNOSTIC" (aliases "RA", "RAA"): one FASTEXPR expression run in
+        GLB / USA / ASI / EUR at once -> an RA_PARENT alpha with up to 4 RA_CHILD
+        alphas. region is always "ALL" and delay 1; universe must be LARGE, MEDIUM
+        or SMALL (LARGE -> ASI MINVOL1M / EUR TOP2500 / GLB MINVOL1M / USA TOP3000,
+        MEDIUM -> ASI MINVOL10M / EUR TOP1200 / GLB MINVOL10M / USA TOP2000,
+        SMALL -> ASI TOP500 / EUR TOP800 / GLB TOPDIV3000 / USA TOP1000); maxTrade
+        and maxPosition cannot both be ON. Every data field must exist in >= 2 of
+        the 4 regions. One RAA takes 4 concurrent simulation slots.
 
-    Every child may use DIFFERENT settings (the platform accepts per-item
-    settings): the keyword arguments below are the base, and per_alpha_settings[i]
-    overrides them for alpha_expressions[i]. Sweeping decay / neutralization /
-    truncation / maxTrade on one expression is a single batch:
-        alpha_expressions=["rank(x)"],
-        per_alpha_settings=[{"decay": 3}, {"decay": 5}, {"neutralization": "MARKET"}]
-    (a single expression is repeated for every per_alpha_settings entry).
+    MODE (how several are run):
+      - "single": exactly one simulation.
+      - "multi": 2-10 REGULAR alphas (FASTEXPR or PYTHON) in ONE multi-simulation
+        request (one parent id). BRAIN cancels the whole batch if any child fails,
+        so FASTEXPR expressions are linted first and a problem refuses the batch.
+      - "concurrent": 1-10 independent simulations submitted in parallel, one id
+        each — for SUPER / REGION_AGNOSTIC batches, or REGULAR alphas that must not
+        share one failure. Items beyond the account's concurrent-simulation limit
+        come back RATE_LIMITED (resubmit those later).
+      - "auto" (default): single for one item; multi for 2+ REGULAR; concurrent
+        for 2+ SUPER / REGION_AGNOSTIC.
 
-    Args:
-        alpha_expressions: 2-10 alpha expressions; or ONE expression plus 2-10
-            per_alpha_settings entries. For language="PYTHON" each entry is Python source.
-        per_alpha_settings: Optional list of per-child overrides, same length as
-            alpha_expressions (use {} for "base settings"). Keys: decay,
-            neutralization, truncation, max_trade, max_position, universe, region,
-            delay, pasteurization, nan_handling, unit_handling, test_period,
-            visualization, simulation_mode, instrument_type (camelCase API names
-            such as maxTrade also work). language/lookback are batch-level only.
-        instrument_type / region / universe / delay / decay / neutralization /
-        truncation / pasteurization / max_trade: base settings (see create_simulation).
-        max_position: base maxPosition ("ON"/"OFF"; default None = omitted).
-        test_period / unit_handling / nan_handling: ignored when language="PYTHON".
-        language: "FASTEXPR" (default) or "PYTHON".
-        visualization: Enable visualization (default: True)
-        lookback: PYTHON-only lookback window (required when language="PYTHON").
-        simulation_mode: "QUICK" or "FULL" (default None = platform default, FULL).
-            QUICK = fast feedback (core metrics only, no visualizations, no
-            Theme / Competition / correlation checks, not directly submittable);
-            forces visualization=False for that child.
-        validate_expressions: Lint FASTEXPR expressions before sending (default
-            True): unbalanced parentheses, or an optional operator argument passed
-            positionally (e.g. ts_backfill(x, 250) instead of lookback=250). One
-            bad child makes the platform cancel the WHOLE batch, so the request
-            is refused with the problems listed. Set False to send anyway.
+    SETTINGS: arguments left as None take the type's defaults — REGULAR / SUPER:
+    region USA, universe TOP3000, delay 1, decay 0, neutralization NONE,
+    truncation 0, visualization True; REGION_AGNOSTIC: universe MEDIUM, decay 10,
+    neutralization SLOW_AND_FAST, truncation 0.08, visualization False. Use
+    get_platform_setting_options for valid region / universe / neutralization
+    combinations. test_period / unit_handling / nan_handling are dropped for
+    PYTHON; selection_* / component_activation apply to SUPER only.
+    simulation_mode: "QUICK" (core metrics only, no visualizations, no Theme /
+    Competition / correlation checks, NOT directly submittable; forces
+    visualization=False) or "FULL"; None = platform default (FULL).
+
+    PER-ITEM SETTINGS: per_alpha_settings[i] overrides the settings for item i;
+    with a single expression (or combo/selection pair) it is repeated for every
+    entry, so a sweep is one call:
+        expressions=["rank(x)"], per_alpha_settings=[{"decay": 3}, {"decay": 5},
+        {"neutralization": "MARKET"}]
+    Keys: decay, neutralization, truncation, max_trade, max_position, universe,
+    region, delay, pasteurization, nan_handling, unit_handling, test_period,
+    visualization, simulation_mode, instrument_type, selection_handling,
+    selection_limit, component_activation (camelCase API names such as maxTrade
+    also work). language / lookback are call-level only.
+
+    validate_expressions: lint FASTEXPR expressions (unbalanced parentheses, an
+    optional operator argument passed positionally such as ts_backfill(x, 250)
+    instead of lookback=250). It blocks a multi batch; for single / concurrent the
+    problems come back as lint_warnings and the simulations are still sent.
 
     Returns:
-        {"status": "SUBMITTED", "type": "MULTI", "multisimulation_id": ...,
-         "progress_url": ..., "children": [{"index", "overrides"}...]} — poll
-        check_simulation_progress(progress_url); or {"status": "RATE_LIMITED", ...}
-        when the account's concurrent simulation slots are full.
+        {"status": "SUBMITTED", "mode", "type", "simulation_id" (single / multi) or
+        "simulation_ids" (concurrent), "settings_used", "next": the get_simulation
+        call}; "RATE_LIMITED" with retry_after_seconds when the account's slots are
+        full; "PARTIAL" when only some concurrent items were accepted.
     """
-    guard = _write_guard("create_multi_simulation")
+    guard = _write_guard("create_simulation")
     if guard:
         return guard
-    try:
-        exprs = list(alpha_expressions or [])
-        overrides_list = list(per_alpha_settings or [])
-        if overrides_list and len(exprs) == 1:
-            exprs = exprs * len(overrides_list)
-        if overrides_list and len(overrides_list) != len(exprs):
-            return {"error": (f"per_alpha_settings has {len(overrides_list)} entries but there are "
-                              f"{len(exprs)} expressions; they must match one-to-one")}
-        if len(exprs) < 2:
-            return {"error": "At least 2 alpha expressions (or 1 expression + 2 per_alpha_settings) are required"}
-        if len(exprs) > 10:
-            return {"error": "Maximum 10 alpha expressions allowed per request"}
-        if any(not isinstance(e, str) or not e.strip() for e in exprs):
-            return {"error": "Every alpha expression must be a non-empty string"}
+    sim_type = SIMULATION_TYPES.get(str(type or "").strip().upper())
+    if not sim_type:
+        raise ValueError(f"type must be one of {sorted(SIMULATION_TYPES)}, got {type!r}")
+    mode = str(mode or "auto").strip().lower()
+    if mode not in SIMULATION_BATCH_MODES:
+        raise ValueError(f"mode must be one of {list(SIMULATION_BATCH_MODES)}, got {mode!r}")
+    language = str(language or "FASTEXPR").strip().upper()
+    is_python = language == "PYTHON"
+    if is_python and lookback is None:
+        raise ValueError("lookback is required when language='PYTHON'")
+    if is_python and sim_type == "REGION_AGNOSTIC":
+        raise ValueError("REGION_AGNOSTIC simulations take a FASTEXPR expression (language='FASTEXPR')")
 
-        is_python = (language or "").upper() == "PYTHON"
-        if is_python and lookback is None:
-            return {"error": "lookback is required when language='PYTHON'"}
+    # 1. The code of each simulation.
+    if sim_type == "SUPER":
+        if expressions:
+            raise ValueError("SUPER (SA) simulations use combo + selection, not expressions")
+        combos, selections = _as_list(combo, "combo"), _as_list(selection, "selection")
+        if not combos or not selections:
+            raise ValueError("SUPER (SA) simulations need both combo and selection")
+        if len(combos) > 1 and len(selections) > 1 and len(combos) != len(selections):
+            raise ValueError(f"{len(combos)} combos and {len(selections)} selections: pass lists of "
+                             "the same length, or a single string on one side")
+        codes = [{"combo": combos[i if len(combos) > 1 else 0],
+                  "selection": selections[i if len(selections) > 1 else 0]}
+                 for i in range(max(len(combos), len(selections)))]
+    else:
+        if combo or selection:
+            raise ValueError(f"combo / selection are for type SUPER (SA); {sim_type} uses expressions")
+        codes = [{"regular": e} for e in _as_list(expressions, "expressions")]
+        if not codes:
+            raise ValueError("expressions is required: one alpha expression (or Python source) per simulation")
+    for i, code in enumerate(codes):
+        if any(not isinstance(v, str) or not v.strip() for v in code.values()):
+            raise ValueError(f"item {i}: every expression / combo / selection must be a non-empty string")
 
-        if validate_expressions and not is_python:
-            problems = {i: p for i, p in ((i, _lint_expression(e)) for i, e in enumerate(exprs)) if p}
-            if problems:
-                return {"error": "Expression pre-check failed — one failing child cancels the whole batch",
-                        "problems": [{"index": i, "expr": exprs[i][:120], "issues": p}
-                                     for i, p in problems.items()],
-                        "note": "Fix the expressions, or pass validate_expressions=False to send anyway."}
+    # 2. Per-item overrides; a single code is repeated for each entry (a sweep).
+    overrides_list = list(per_alpha_settings or [])
+    if overrides_list and len(codes) == 1:
+        codes = codes * len(overrides_list)
+    if overrides_list and len(overrides_list) != len(codes):
+        raise ValueError(f"per_alpha_settings has {len(overrides_list)} entries but there are "
+                         f"{len(codes)} simulations; they must match one-to-one")
+    n = len(codes)
+    if n > MAX_SIMULATIONS_PER_CALL:
+        raise ValueError(f"at most {MAX_SIMULATIONS_PER_CALL} simulations per call, got {n}")
 
-        base: Dict[str, Any] = {
-            'instrumentType': instrument_type,
-            'region': region,
-            'universe': universe,
-            'delay': delay,
-            'decay': decay,
-            'neutralization': neutralization,
-            'truncation': truncation,
-            'pasteurization': pasteurization,
-            'language': language,
-            'visualization': visualization,
-            'maxTrade': max_trade,
-        }
-        if max_position is not None:
-            base['maxPosition'] = max_position
-        if simulation_mode is not None:
-            base['simulationMode'] = simulation_mode
-        if is_python:
-            base['lookback'] = lookback
-        else:
-            base['unitHandling'] = unit_handling
-            base['nanHandling'] = nan_handling
-            base['testPeriod'] = test_period
+    # 3. Mode.
+    if mode == "auto":
+        mode = "single" if n == 1 else ("multi" if sim_type == "REGULAR" else "concurrent")
+    if mode == "single" and n != 1:
+        raise ValueError(f"mode='single' takes one simulation, got {n}; use mode='multi' or 'concurrent'")
+    if mode == "multi":
+        if sim_type != "REGULAR":
+            raise ValueError("a multi-simulation holds REGULAR alphas only (FASTEXPR or PYTHON); use "
+                             "mode='concurrent' to run several SUPER / REGION_AGNOSTIC simulations in parallel")
+        if n < 2:
+            raise ValueError("mode='multi' needs 2-10 alphas (or 1 expression + 2-10 per_alpha_settings)")
 
-        multisimulation_data = []
-        children = []
-        for i, alpha_expr in enumerate(exprs):
-            raw = overrides_list[i] if overrides_list else {}
-            if not isinstance(raw, dict):
-                return {"error": f"per_alpha_settings[{i}] must be an object, got {type(raw).__name__}"}
-            unknown = [k for k in raw if k not in _MULTI_OVERRIDE_KEYS]
-            if unknown:
-                return {"error": (f"per_alpha_settings[{i}] has unsupported keys {unknown}; "
-                                  f"allowed: {sorted(set(_MULTI_OVERRIDE_KEYS.values()))} "
-                                  "(or their snake_case forms)")}
-            override = {_MULTI_OVERRIDE_KEYS[k]: v for k, v in raw.items() if v is not None}
-            settings = {**base, **override}
-            if is_python:
-                for k in ('unitHandling', 'nanHandling', 'testPeriod'):
-                    settings.pop(k, None)
-            try:
-                mode, settings['visualization'] = _normalize_simulation_mode(
-                    settings.pop('simulationMode', None), settings['visualization'])
-            except ValueError as e:
-                return {"error": f"alpha {i}: {e}"}
-            if mode:
-                settings['simulationMode'] = mode
-            multisimulation_data.append({'type': 'REGULAR', 'settings': settings, 'regular': alpha_expr})
-            children.append({"index": i, "overrides": override} if override else {"index": i})
+    # 4. Settings: type defaults <- explicit arguments <- per-item overrides.
+    explicit = {"instrumentType": instrument_type, "region": region, "universe": universe,
+                "delay": delay, "decay": decay, "neutralization": neutralization,
+                "truncation": truncation, "visualization": visualization}
+    base: Dict[str, Any] = {**_TYPE_DEFAULTS[sim_type], **{k: v for k, v in explicit.items() if v is not None}}
+    base.update(pasteurization=pasteurization, unitHandling=unit_handling, nanHandling=nan_handling,
+                testPeriod=None if sim_type == "REGION_AGNOSTIC" else test_period,  # RAA carries none
+                maxTrade=max_trade, maxPosition=max_position, language=language,
+                lookback=lookback if is_python else None, simulationMode=simulation_mode,
+                selectionHandling=selection_handling, selectionLimit=selection_limit,
+                componentActivation=component_activation)
 
-        # Send multisimulation request (must go through _request: a direct
-        # session.post here would block the shared event loop for every client)
-        response = await brain_client._request('post', f"{brain_client.base_url}/simulations", json=multisimulation_data)
+    items: List[SimulationData] = []
+    children: List[Dict[str, Any]] = []
+    for i, code in enumerate(codes):
+        raw = overrides_list[i] if overrides_list else {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"per_alpha_settings[{i}] must be an object, got {raw.__class__.__name__}")
+        unknown = [k for k in raw if k not in _OVERRIDE_KEYS]
+        if unknown:
+            raise ValueError(f"per_alpha_settings[{i}] has unsupported keys {unknown}; allowed: "
+                             f"{sorted(set(_OVERRIDE_KEYS.values()))} (or their snake_case forms)")
+        override = {_OVERRIDE_KEYS[k]: v for k, v in raw.items() if v is not None}
+        settings = _finalize_settings(sim_type, {**base, **override}, f"item {i}: " if n > 1 else "")
+        items.append(SimulationData(type=sim_type, settings=SimulationSettings(**settings), **code))
+        children.append({"index": i, "overrides": override} if override else {"index": i})
 
-        if response.status_code == 429:
-            retry_after = _retry_after_seconds(response) or 30.0
-            return {
-                "status": "RATE_LIMITED",
-                "retry_after_seconds": retry_after,
-                "note": ("BRAIN's per-account concurrent simulation limit is reached "
-                         "(another simulation is still running on this account). "
-                         f"Retry create_multi_simulation after ~{int(retry_after)}s, or first "
-                         "finish/check the running ones; you can do other work meanwhile."),
-            }
-        if response.status_code != 201:
-            # Include BRAIN's per-item rejection reasons (400 bodies are a JSON
-            # array with one entry per expression) — a bare status is undiagnosable.
-            detail = _http_error_detail(response)
-            brain_client.log(f"❌ Failed to create multisimulation: {detail}", "ERROR")
-            return {"error": f"Failed to create multisimulation. {detail}"}
+    lint = _lint_problems(codes) if validate_expressions and not is_python else []
+    if lint and mode == "multi":
+        return {"error": "Expression pre-check failed — one failing child cancels the whole multi-simulation",
+                "problems": lint,
+                "note": "Fix the expressions, pass validate_expressions=False to send anyway, or use "
+                        "mode='concurrent' so each alpha runs on its own."}
 
-        location = response.headers.get('Location', '')
-        if not location:
-            return {"error": "No location header in multisimulation response"}
+    payloads = [brain_client.simulation_payload(item) for item in items]
+    if mode == "single":
+        result = await brain_client.create_simulation(items[0])
+        ids = [result["simulation_id"]] if result.get("simulation_id") else []
+    elif mode == "multi":
+        result = await brain_client.create_multi_simulation(payloads)
+        ids = [result["simulation_id"]] if result.get("simulation_id") else []
+    else:
+        result = await _submit_concurrently(items, children)
+        ids = result.get("simulation_ids") or []
+    result = {"mode": mode, "type": sim_type, **result}
+    if mode == "multi" or (mode == "concurrent" and overrides_list):
+        result["children"] = children
+    try:  # the settings of an item without overrides (all of them when there are none)
+        result["settings_used"] = brain_client.simulation_payload(SimulationData(
+            type=sim_type, settings=SimulationSettings(**_finalize_settings(sim_type, base, "")),
+            **codes[0]))["settings"]
+    except ValueError:  # base itself invalid, but every item overrides the bad value
+        pass
+    if lint:
+        result["lint_warnings"] = lint
+    if ids:
+        result["next"] = f"get_simulation(simulation_ids={ids!r}, wait_seconds=60)"
+    return result
 
-        # Submit-only: return immediately, same pattern as create_simulation.
-        result = {
-            "status": "SUBMITTED",
-            "type": "MULTI",
-            "multisimulation_id": location.split('/')[-1],
-            "expected_children": len(exprs),
-            "progress_url": location,
-            "note": ("Multi-simulation is running asynchronously (typically 3-10 minutes for "
-                     f"{len(exprs)} alphas). Call check_simulation_progress with this "
-                     "progress_url to get per-child progress and, once finished, one compact "
-                     "row per alpha (each row echoes its settings). You can do other work between checks."),
-        }
-        if overrides_list:
-            result["children"] = children
-        return result
 
-    except Exception as e:
-        return {"error": f"Error creating multisimulation: {str(e)}"}
-
-# --- Payment and Financial Tools ---
-
-@mcp.tool()
-async def get_daily_and_quarterly_payment(email: str = "", password: str = "") -> Dict[str, Any]:
-    """
-    Get daily and quarterly payment information from WorldQuant BRAIN platform.
-    
-    This function retrieves both base payments (daily alpha performance payments) and
-    other payments (competition rewards, quarterly payments, referrals, etc.).
-
-    Args:
-        email: Ignored (kept for backward compatibility; login is managed by credd)
-        password: Ignored (kept for backward compatibility; login is managed by credd)
-
-    Returns:
-        Dictionary containing base payment and other payment data with summaries and detailed records
-    """
-    try:
-        # Get base payments (login comes from credd via the session; no creds needed)
-        async def fetch(kind: str) -> Any:
-            try:
-                resp = await brain_client._request('get', f"{brain_client.base_url}/users/self/activities/{kind}")
-                if resp.status_code >= 400:
-                    return {"error": _http_error_detail(resp, kind)}
-                return resp.json() if (resp.text or "").strip() else {}
-            except Exception as e:  # keep the other half of the answer
-                return {"error": f"{kind}: {e}"}
-
-        base_payments, other_payments = await asyncio.gather(fetch("base-payment"), fetch("other-payment"))
-        return {
-            "base_payments": base_payments,
-            "other_payments": other_payments
-        }
-        
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
-
-from typing import Sequence
-@mcp.tool()
-async def lookINTO_SimError_message(locations: Sequence[str]) -> dict:
-    """
-    Fetch and parse error/status from multiple simulation locations (URLs).
-    Args:
-        locations: List of simulation result URLs (e.g., /simulations/{id})
-    Returns:
-        List of dicts with location, error message, and raw response
-    """
-    results = []
-    for loc in locations:
+async def _submit_concurrently(items: List[SimulationData], children: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """One POST per simulation, all at once; each item reports its own outcome."""
+    async def submit(i: int, item: SimulationData) -> Dict[str, Any]:
         try:
-            loc = _simulation_url(loc)  # BRAIN /simulations/<id> only (no arbitrary URLs)
-            resp = await brain_client._request('get', loc)
-            if resp.status_code != 200:
-                results.append({
-                    "location": loc,
-                    "error": f"HTTP {resp.status_code}",
-                    "raw": (resp.text or "")[:500]
-                })
-                continue
-            data = resp.json() if resp.text else {}
-            # Try to extract error message or status
-            error_msg = data.get("error") or data.get("message")
-            # If alpha ID is missing, include that info
-            if not data.get("alpha"):
-                error_msg = error_msg or "Simulation did not get through, if you are running a multisimulation, check the other children location in your request"
-            results.append({
-                "location": loc,
-                "error": error_msg,
-                "raw": data
-            })
+            r = await brain_client.create_simulation(item)
         except Exception as e:
-            results.append({
-                "location": loc,
-                "error": str(e),
-                "raw": None
-            })
-    return {"results": results}
+            r = {"status": "ERROR", "error": str(e)}
+        return {**children[i], **{k: r[k] for k in ("status", "simulation_id", "progress_url",
+                                                      "retry_after_seconds", "error") if k in r}}
+
+    rows = list(await asyncio.gather(*(submit(i, item) for i, item in enumerate(items))))
+    ids = [r["simulation_id"] for r in rows if r.get("status") == "SUBMITTED"]
+    if len(ids) == len(rows):
+        status = "SUBMITTED"
+    elif ids:
+        status = "PARTIAL"
+    elif all(r.get("status") == "RATE_LIMITED" for r in rows):
+        status = "RATE_LIMITED"
+    else:
+        status = "ERROR"
+    out: Dict[str, Any] = {"status": status, "submitted": len(ids), "total": len(rows),
+                           "simulation_ids": ids, "simulations": rows}
+    if status == "ERROR":
+        out["error"] = "no simulation was accepted; see simulations[].error"
+    elif status != "SUBMITTED":
+        out["retry_after_seconds"] = max((r.get("retry_after_seconds") or 0) for r in rows) or 30.0
+        out["note"] = ("Items with status RATE_LIMITED hit the account's concurrent-simulation limit "
+                       "(an RAA takes 4 slots): resubmit just those once running simulations finish.")
+    return out
 
 
-# --- ProdMemo: local Self/Pool/Prod correlation memory -----------------------
-# Thin wrappers over prodmemo_service (see docs/PRODMEMO_IMPLEMENTATION.md).
-# The service holds no BRAIN client of its own — inject this module's, which
-# already carries credd-backed auth and 401 self-healing.
-prodmemo_client.fetcher = brain_client
-
-
-@mcp.tool()
-async def prodmemo_sync(mode: str = "incremental") -> Dict[str, Any]:
-    """Sync submitted alphas and their PnL into the local ProdMemo database.
-
-    Runs in the background and returns immediately — poll prodmemo_sync_status.
-    'incremental' probes the remote count first and only fetches what is missing;
-    'full' re-walks every alpha; 'stop' cancels a run in progress.
+@_tool(READ)
+async def get_simulation(simulation_ids: Union[str, List[str], None] = None, wait_seconds: float = 0,
+                         compact: bool = True) -> Dict[str, Any]:
+    """
+    ⏳ Progress / result of simulations — single, multi, RAA, or several at once.
 
     Args:
-        mode: "incremental" (default), "full", or "stop"
+        simulation_ids: One or more simulation ids (or the progress_url values)
+            returned by create_simulation. Omit to list the simulations this server
+            created recently.
+        wait_seconds: Keep polling up to this long before answering (0 = check once;
+            max 120). Use 30-60 to block briefly when there is nothing else to do.
+        compact: True (default) = one short row per finished alpha: id, ops, sharpe,
+            fitness, turnover, margin_bps, robust / sub / y2_sharpe, cluster, fails,
+            set (universe / decay / neutralization / truncation / maxTrade) and expr.
+            False = the full alpha object.
+
+    Returns:
+        For one id: RUNNING with progress (multi: completed_children / children)
+        and retry_after_seconds; COMPLETE with the alpha (multi: alpha_results, one
+        row per child; RAA: parent_alpha_id plus one metric row per region child);
+        or the failure status with BRAIN's own error message. For several ids:
+        {"status": RUNNING / COMPLETE / FINISHED_WITH_ERRORS, "simulations": [...]}.
     """
-    try:
-        return await prodmemo_client.start_sync(mode)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+    refs = _as_list(simulation_ids, "simulation_ids")
+    if not refs:
+        recent = list(brain_client.recent_simulations)
+        return {"recent_simulations": recent,
+                "note": ("Pass simulation_ids to check them." if recent
+                         else "No simulations were created by this server since it started.")}
+    if len(refs) > 20:
+        raise ValueError("at most 20 simulation ids per call")
+    if len(refs) == 1:
+        try:
+            url = _simulation_url(refs[0])
+        except ValueError as e:
+            return {"error": f"{e}. Pass the simulation_id (or progress_url) returned by create_simulation"}
+        return await brain_client.check_simulation_progress(url, wait_seconds, compact)
+
+    async def one(ref: Any) -> Dict[str, Any]:
+        try:
+            url = _simulation_url(ref)
+        except ValueError as e:
+            return {"simulation_id": str(ref), "status": "ERROR", "error": str(e)}
+        try:
+            state = await brain_client.check_simulation_progress(url, wait_seconds, compact)
+        except Exception as e:  # e.g. a network error after the wait ran out: not a verdict
+            state = {"status": "UNKNOWN", "error": str(e)}
+        if "progress_url" not in state and state.get("id"):
+            # compact=False on a finished single: the raw alpha, whose own
+            # "status" (UNSUBMITTED, ACTIVE...) is not the simulation's.
+            state = {"status": "COMPLETE", "progress_url": url, "alpha": state}
+        return {"simulation_id": url.rsplit("/", 1)[-1], **state}
+
+    states = list(await asyncio.gather(*(one(r) for r in dict.fromkeys(refs))))
+    counts = collections.Counter(str(s.get("status")) for s in states)
+    if counts["RUNNING"] or counts["UNKNOWN"]:
+        status = "RUNNING"
+    elif counts["COMPLETE"] == len(states):
+        status = "COMPLETE"
+    else:
+        status = "FINISHED_WITH_ERRORS"
+    out: Dict[str, Any] = {"status": status, "counts": dict(counts), "simulations": states}
+    if status == "RUNNING":
+        out["retry_after_seconds"] = min((s.get("retry_after_seconds") or 5.0) for s in states
+                                         if s.get("status") in ("RUNNING", "UNKNOWN"))
+    return out
 
 
-@mcp.tool()
-async def prodmemo_sync_status() -> Dict[str, Any]:
-    """Progress and final state of the most recent ProdMemo sync."""
-    try:
+@_tool(DESTRUCTIVE)
+async def cancel_simulation(simulation_id: str) -> Dict[str, Any]:
+    """
+    🛑 Cancel a queued / running simulation (DELETE) to free an account simulation slot.
+
+    Args:
+        simulation_id: The simulation id (or progress_url) from create_simulation.
+    """
+    guard = _write_guard("cancel_simulation")
+    if guard:
+        return guard
+    return await brain_client.cancel_simulation(simulation_id)
+
+
+@_tool(READ)
+async def get_platform_setting_options() -> Dict[str, Any]:
+    """Valid simulation settings: every instrument type / region / delay combination
+    with its universes and neutralizations. Call it to fix an invalid or mismatched
+    setting before simulating."""
+    return await brain_client.get_platform_setting_options()
+
+
+@_tool(READ)
+async def preview_super_selection(
+    selection: str,
+    instrument_type: str = "EQUITY",
+    region: str = "USA",
+    delay: int = 1,
+    selection_limit: int = 1000,
+    selection_handling: str = "POSITIVE",
+    limit: int = 10,
+    compact: bool = True,
+) -> Dict[str, Any]:
+    """
+    🎯 Preview which of your alphas a SuperAlpha selection expression would pick.
+
+    Args:
+        selection: SuperAlpha selection expression
+        instrument_type / region / delay: the SuperAlpha's settings
+        selection_limit: Max number of alphas the selection may pick (10-1000)
+        selection_handling: "POSITIVE", "NON_ZERO" or "NON_NAN"
+        limit: How many selected alphas to return
+        compact: One short row per alpha (False = full alpha objects)
+    """
+    data = await brain_client.run_selection(selection, instrument_type, region, delay,
+                                            selection_limit, selection_handling, limit)
+    if compact and isinstance(data, dict) and isinstance(data.get("results"), list):
+        data = {**data, "results": [_alpha_list_row(a) for a in data["results"]]}
+    return data
+
+
+# --- Alphas -------------------------------------------------------------------
+
+@_tool(READ)
+async def list_alphas(
+    stage: Optional[str] = "IS",
+    status: Optional[str] = None,
+    alpha_type: Optional[str] = None,
+    limit: int = 30,
+    offset: int = 0,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    submission_start_date: Optional[str] = None,
+    submission_end_date: Optional[str] = None,
+    order: Optional[str] = None,
+    hidden: Optional[bool] = None,
+    compact: bool = True,
+) -> Dict[str, Any]:
+    """
+    👤 List your alphas with filters, sorting and pagination.
+
+    Args:
+        stage: "IS" (unsubmitted, default), "OS" (submitted), "PROD"; None / "" = any
+        status: e.g. "UNSUBMITTED", "ACTIVE", "DECOMMISSIONED"
+        alpha_type: "REGULAR", "SUPER", "RA_PARENT" or "RA_CHILD"
+        limit / offset: page size (1-100) and number of alphas to skip; the answer
+            carries count (total) and next_offset (None on the last page)
+        start_date / end_date: creation-date window, e.g. "2025-01-01T00:00:00Z"
+        submission_start_date / submission_end_date: submission-date window (OS)
+        order: e.g. "-dateCreated", "-dateSubmitted", "name" (prefix - = descending)
+        hidden: True = only hidden alphas, False = only visible ones, None = both
+        compact: One short row per alpha (metrics, failed checks, settings, code);
+            False = full alpha objects
+    """
+    limit = max(1, min(int(limit or 30), 100))
+    offset = max(0, int(offset or 0))
+    data = await brain_client.get_user_alphas(
+        stage=stage or None, limit=limit, offset=offset, start_date=start_date, end_date=end_date,
+        submission_start_date=submission_start_date, submission_end_date=submission_end_date,
+        order=order, hidden=hidden, status=status, alpha_type=alpha_type)
+    results = data.get("results") or []
+    count = data.get("count")
+    out = {**data, "next_offset": (offset + len(results)
+                                   if results and (count is None or offset + len(results) < count) else None)}
+    if compact:
+        out["results"] = [_alpha_list_row(a) for a in results]
+    return out
+
+
+@_tool(READ)
+async def get_alpha(alpha_id: str, full: bool = False) -> Dict[str, Any]:
+    """
+    📋 One alpha: settings, full code, IS metrics and every check.
+
+    An RA_PARENT (region-agnostic) alpha carries no metrics of its own: its answer
+    is one metric row per region child (sharpe, fitness, turnover, returns,
+    drawdown, margin_bps, 2Y and sub-universe sharpe, FAIL / WARNING check names)
+    plus how many children pass every check.
+
+    Args:
+        alpha_id: The alpha id
+        full: Return the raw BRAIN object (for an RA parent: added as "parent")
+    """
+    alpha = await brain_client.get_alpha_details(alpha_id)
+    if alpha.get("type") in ("RA_PARENT", "REGION_AGNOSTIC") or alpha.get("children"):
+        summary = await brain_client.get_raa_alpha(alpha_id, parent=alpha)
+        if full:
+            summary["parent"] = alpha
+        else:
+            summary.pop("parent", None)
+        return summary
+    return alpha if full else _alpha_summary(alpha)
+
+
+@_tool(READ)
+async def get_alpha_recordset(alpha_id: str, recordset: Optional[str] = None,
+                              wait_seconds: float = 30, max_rows: int = 0) -> Dict[str, Any]:
+    """
+    📈 An alpha's time series / tables: pnl, daily-pnl, sharpe, turnover, yearly-stats, ...
+
+    Args:
+        alpha_id: The alpha id
+        recordset: e.g. "pnl", "yearly-stats", "daily-pnl", "sharpe", "turnover";
+            omit to list the record sets available for this alpha
+        wait_seconds: How long to keep polling while BRAIN computes it (max 300)
+        max_rows: Keep only the most recent rows (0 = all)
+
+    Returns:
+        BRAIN's {schema, records}; status PENDING means BRAIN is still computing
+        it: call again after retry_after_seconds.
+    """
+    if not recordset:
+        data = await brain_client.get_record_sets(alpha_id, wait_seconds)
+        return {"alpha_id": alpha_id, **(data if isinstance(data, dict) else {"results": data})}
+    data = await brain_client.get_record_set_data(alpha_id, recordset, wait_seconds)
+    data = data if isinstance(data, dict) else {"result": data}
+    records = data.get("records")
+    if max_rows and isinstance(records, list) and len(records) > max_rows:
+        data = {**data, "records": records[-max_rows:],
+                "truncated": f"showing the last {max_rows} of {len(records)} rows"}
+    return {"alpha_id": alpha_id, "recordset": recordset, **data}
+
+
+_CHECK_KINDS = ("submission", "correlation", "prod", "self", "power-pool", "all")
+
+
+@_tool(READ)
+async def check_alpha(alpha_id: str, check: str = "submission", wait_seconds: float = 60,
+                      threshold: float = 0.7, include_data: bool = False) -> Dict[str, Any]:
+    """
+    ✅ BRAIN's checks for an alpha: pre-submission checks and / or correlations.
+
+    Args:
+        alpha_id: The alpha id (for an RAA use the PARENT id for "submission")
+        check:
+            "submission" (default) — the same checks as the Submit button: status
+                DONE / PENDING, all_passed, failed / pending / errored names and
+                each check's result / value / limit. When PROD_CORRELATION comes
+                back as ERROR (platform busy) the prod-correlation endpoint is
+                asked instead (prod_fallback).
+            "prod" / "self" / "power-pool" — that correlation: max_correlation,
+                passes_check (max < threshold), the 3 most correlated alphas.
+            "correlation" — prod and self together.
+            "all" — submission and correlation together.
+          Correlation status DONE / PENDING (still computing, call again — NOT a
+          failure) / ERROR. Measured prod / self values are saved into ProdMemo.
+        wait_seconds: How long to keep polling while BRAIN computes (max 300)
+        threshold: Correlation pass threshold (default 0.7)
+        include_data: Also return the raw correlation payloads (large)
+    """
+    kind = str(check or "submission").strip().lower()
+    if kind not in _CHECK_KINDS + ("production", "power_pool", "both"):
+        raise ValueError(f"check must be one of {list(_CHECK_KINDS)}, got {check!r}")
+    if kind == "submission":
+        return await brain_client.get_submission_check(alpha_id, wait_seconds)
+    if kind != "all":
+        ctype = "both" if kind in ("correlation", "both") else kind
+        return await brain_client.check_correlation(alpha_id, ctype, threshold, wait_seconds, include_data)
+    submission, correlation = await asyncio.gather(
+        brain_client.get_submission_check(alpha_id, wait_seconds),
+        brain_client.check_correlation(alpha_id, "both", threshold, wait_seconds, include_data),
+        return_exceptions=True)
+    return {"alpha_id": alpha_id,
+            "submission": ({"error": str(submission)} if isinstance(submission, BaseException) else submission),
+            "correlation": ({"error": str(correlation)} if isinstance(correlation, BaseException) else correlation)}
+
+
+@_tool(DESTRUCTIVE)
+async def submit_alpha(alpha_id: str, confirm: bool = False, wait_seconds: float = 60) -> Dict[str, Any]:
+    """
+    📤 Submit an alpha to BRAIN. Irreversible, so confirm=False (default) is a dry run.
+
+    confirm=False returns the pre-submission checks (as check_alpha) without
+    submitting. confirm=True submits and follows BRAIN's asynchronous submission
+    (Retry-After) up to wait_seconds (max 300).
+
+    Returns:
+        success and status: SUBMITTED, SUBMITTED_WITH_PENDING_CHECKS, REJECTED
+        (see failed / checks), PENDING (still processing — call again with
+        confirm=True; it resumes polling and never submits twice), RATE_LIMITED
+        or ERROR.
+
+    Args:
+        alpha_id: The alpha to submit (for an RAA: the RA_PARENT id)
+        confirm: True = really submit
+        wait_seconds: How long to follow the submission before answering
+    """
+    if not confirm:
+        report = await brain_client.get_submission_check(alpha_id, wait_seconds)
+        return {**report, "dry_run": True,
+                "note": "Not submitted: these are BRAIN's pre-submission checks. Call "
+                        "submit_alpha(alpha_id, confirm=True) to submit."}
+    guard = _write_guard("submit_alpha")
+    if guard:
+        return guard
+    if not ALLOW_SUBMIT:
+        return {"error": "submissions are disabled on this server (WQMCP_ALLOW_SUBMIT=0); "
+                         "submit_alpha(confirm=False) still shows whether the alpha would pass"}
+    return await brain_client.submit_alpha(alpha_id, wait_seconds)
+
+
+@_tool(WRITE_IDEMPOTENT)
+async def update_alpha(
+    alpha_ids: Union[str, List[str]],
+    name: Optional[str] = None,
+    color: Optional[str] = None,
+    category: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    regular_desc: Optional[str] = None,
+    selection_desc: Optional[str] = None,
+    combo_desc: Optional[str] = None,
+    osmosis_points: Optional[int] = None,
+    favorite: Optional[bool] = None,
+    hidden: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    ✏️ Update alpha properties.
+
+    favorite / hidden (and color, for several alphas) apply to every id in one
+    bulk request. name, category, tags, descriptions and osmosis_points apply to
+    a single alpha.
+
+    Args:
+        alpha_ids: One alpha id or a list (up to 100)
+        name / color / category / tags: alpha metadata ([] clears tags)
+        regular_desc / selection_desc / combo_desc: descriptions (SUPER: selection / combo)
+        osmosis_points: 1-100000
+        favorite / hidden: flags
+    """
+    guard = _write_guard("update_alpha")
+    if guard:
+        return guard
+    ids = [str(a).strip() for a in _as_list(alpha_ids, "alpha_ids")]
+    if not ids or len(ids) > 100:
+        raise ValueError("alpha_ids must hold 1-100 alpha ids")
+    single = {"name": name, "category": category, "tags": tags, "regular_desc": regular_desc,
+              "selection_desc": selection_desc, "combo_desc": combo_desc, "osmosis_points": osmosis_points}
+    single = {k: v for k, v in single.items() if v is not None}
+    if single and len(ids) != 1:
+        raise ValueError(f"{sorted(single)} can only be set on one alpha at a time")
+    bulk = {k: v for k, v in (("favorite", favorite), ("hidden", hidden),
+                               ("color", color if len(ids) > 1 else None)) if v is not None}
+    if not single and not bulk and color is None:
+        raise ValueError("nothing to update")
+    out: Dict[str, Any] = {"alpha_ids": ids}
+    if len(ids) == 1 and (single or color is not None):
+        updated = await brain_client.set_alpha_properties(
+            ids[0], name=name, color=color, category=category, regular_desc=regular_desc,
+            selection_desc=selection_desc, combo_desc=combo_desc, osmosis_points=osmosis_points,
+            tags=tags)
+        out["alpha"] = _alpha_summary(updated) if isinstance(updated, dict) else updated
+    if bulk:
+        out.update(await brain_client.update_alphas_bulk(ids, bulk))
+    return out
+
+
+@_tool(READ)
+async def get_alpha_performance(alpha_id: str, competition_id: Optional[str] = None,
+                                wait_seconds: float = 30) -> Dict[str, Any]:
+    """
+    📊 How adding this alpha changes your portfolio: before / after stats (sharpe,
+    fitness, turnover, returns, drawdown, margin), yearly stats and PnL.
+
+    Args:
+        alpha_id: The alpha id
+        competition_id: Show the competition's before / after view instead
+        wait_seconds: How long to keep polling while BRAIN computes it
+    """
+    return await brain_client.performance_comparison(alpha_id, None, competition_id, wait_seconds)
+
+
+# --- Data -----------------------------------------------------------------------
+
+@_tool(READ)
+async def get_datasets(
+    instrument_type: str = "EQUITY",
+    region: str = "USA",
+    delay: int = 1,
+    universe: str = "TOP3000",
+    theme: str = "false",
+    search: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """
+    📚 Datasets available for a region / delay / universe.
+
+    Args:
+        instrument_type / region / delay / universe: see get_platform_setting_options
+        theme: Theme filter
+        search: Free-text search
+        limit: Page size (1-50; default = BRAIN's 20). Response `count` is the total.
+        offset: Skip this many datasets (paging)
+    """
+    return await brain_client.get_datasets(instrument_type, region, delay, universe, theme, search,
+                                           limit, offset)
+
+
+@_tool(READ)
+async def get_datafields(
+    instrument_type: str = "EQUITY",
+    region: str = "USA",
+    delay: int = 1,
+    universe: str = "TOP3000",
+    theme: str = "false",
+    dataset_id: Optional[str] = None,
+    data_type: str = "",
+    search: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """
+    🔍 Data fields usable in alpha expressions.
+
+    Args:
+        instrument_type / region / delay / universe: see get_platform_setting_options
+        theme: Theme filter
+        dataset_id: Only fields of this dataset
+        data_type: "MATRIX", "VECTOR", "GROUP" ... ("" / "ALL" = any)
+        search: Search term
+        limit: Page size (1-100, default 50). Response `count` is the total.
+        offset: Skip this many fields (paging)
+    """
+    return await brain_client.get_datafields(instrument_type, region, delay, universe, theme, dataset_id,
+                                             data_type, search, limit, offset)
+
+
+@_tool(READ)
+async def get_operators(category: Optional[str] = None, name: Optional[str] = None,
+                        detail: bool = False) -> Dict[str, Any]:
+    """
+    🔧 Operators available in expressions.
+
+    Args:
+        category: e.g. "Arithmetic", "Time Series", "Cross Sectional", "Group"
+        name: Substring match on the operator name
+        detail: Full objects (complete descriptions, documentation links) instead of
+            name / category / definition / scope / description (first 200 chars)
+    """
+    data = await brain_client.get_operators()
+    ops = data.get("operators") if isinstance(data, dict) and "operators" in data else data
+    if not isinstance(ops, list):
+        return data
+    picked = [op for op in ops if isinstance(op, dict)
+              and (not category or str(op.get("category", "")).lower() == category.lower())
+              and (not name or name.lower() in str(op.get("name", "")).lower())]
+    rows = picked if detail else [
+        {"name": op.get("name"), "category": op.get("category"), "definition": op.get("definition"),
+         "scope": op.get("scope"), "description": (op.get("description") or "")[:200]}
+        for op in picked]
+    return {"count": len(rows), "results": rows,
+            "categories": sorted({str(op.get("category")) for op in ops
+                                  if isinstance(op, dict) and op.get("category")})}
+
+
+# --- Account activity -----------------------------------------------------------
+
+_ACTIVITY_KINDS = ("diversity", "pyramid-alphas", "pyramid-multipliers", "payments",
+                   "diversity-score", "profile")
+
+
+@_tool(READ)
+async def get_activity(kind: str, grouping: Optional[str] = None, start_date: Optional[str] = None,
+                       end_date: Optional[str] = None, user_id: str = "self") -> Dict[str, Any]:
+    """
+    🧭 Your BRAIN activity, scores and profile.
+
+    Args:
+        kind:
+            "diversity" — alpha counts and data-diversity PASS / FAIL per group
+                (grouping e.g. "region,delay" or "dataCategory,region,delay").
+            "pyramid-alphas" — your alphas per pyramid category (start_date /
+                end_date as YYYY-MM-DD).
+            "pyramid-multipliers" — BRAIN's current pyramid multipliers.
+            "payments" — base payments (daily) and other payments (quarterly,
+                competitions, referrals).
+            "diversity-score" — client-side estimate of the value-factor trend for
+                the REGULAR alphas submitted between start_date and end_date (ISO,
+                both required): diversity_score = S_A * S_P * S_H with N, A, P,
+                P_max and per-pyramid counts.
+            "profile" — your full record (user_id "self") or another user's public
+                profile.
+        grouping / start_date / end_date / user_id: see kind
+    """
+    kind = str(kind or "").strip().lower()
+    if kind == "diversity":
+        return await brain_client.get_user_activities(user_id or "self", grouping)
+    if kind == "pyramid-alphas":
+        return await brain_client.get_pyramid_alphas(start_date, end_date)
+    if kind == "pyramid-multipliers":
+        return await brain_client.get_pyramid_multipliers()
+    if kind == "payments":
+        return await brain_client.get_payments()
+    if kind == "diversity-score":
+        if not start_date or not end_date:
+            raise ValueError("diversity-score needs start_date and end_date")
+        return await brain_client.value_factor_trendScore(start_date=start_date, end_date=end_date)
+    if kind == "profile":
+        return await brain_client.get_user_profile(user_id or "self")
+    raise ValueError(f"kind must be one of {list(_ACTIVITY_KINDS)}, got {kind!r}")
+
+
+# --- Community ------------------------------------------------------------------
+
+@_tool(READ)
+async def get_leaderboard(user_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    🏅 Consultant leaderboard row for a user (default: you).
+
+    Args:
+        user_id: Another user's id
+    """
+    return await brain_client.get_leaderboard(user_id)
+
+
+@_tool(READ)
+async def get_competitions(competition_id: Optional[str] = None, include_agreement: bool = False,
+                           user_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    🏆 Competitions: the ones a user takes part in, or one competition's details.
+
+    Args:
+        competition_id: Return this competition's details instead of the list
+        include_agreement: With competition_id, also fetch its rules / agreement
+        user_id: Whose competitions to list (default: you)
+    """
+    if not competition_id:
+        return await brain_client.get_user_competitions(user_id)
+    details = await brain_client.get_competition_details(competition_id)
+    if include_agreement:
+        try:
+            details = {**details, "agreement": await brain_client.get_competition_agreement(competition_id)}
+        except Exception as e:  # the agreement is best effort
+            details = {**details, "agreement": {"error": str(e)}}
+    return details
+
+
+@_tool(READ)
+async def get_events() -> Dict[str, Any]:
+    """🗓️ BRAIN events (webinars, meetups)."""
+    return await brain_client.get_events()
+
+
+@_tool(READ)
+async def get_messages(limit: Optional[int] = None, offset: int = 0) -> Dict[str, Any]:
+    """
+    💬 Your BRAIN announcements and notifications (embedded images are stripped).
+
+    Args:
+        limit: Maximum number of messages to return
+        offset: Number of messages to skip (paging)
+    """
+    return await brain_client.get_messages(limit, offset)
+
+
+@_tool(READ)
+async def get_documentation(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    📖 Official BRAIN documentation.
+
+    Args:
+        page_id: Omit for the tutorials with their pages (ids + titles); pass a page
+            id for that page's content.
+    """
+    if page_id:
+        return await brain_client.get_documentation_page(page_id)
+    return await brain_client.get_documentations()
+
+
+# --- Forum (support.worldquantbrain.com, headless browser) ----------------------
+
+@_tool(READ)
+async def search_forum_posts(search_query: str, max_results: int = 50) -> Dict[str, Any]:
+    """
+    🔍 Search the BRAIN community forum.
+
+    Args:
+        search_query: Search term or phrase
+        max_results: Maximum number of results (default 50)
+    """
+    res = await forum_client.search_posts(search_query, max_results=max_results)
+    return {**res, "success": True, "total_found": res.get("count")}
+
+
+@_tool(READ)
+async def read_forum_post(article_id: str, include_comments: bool = True) -> Dict[str, Any]:
+    """
+    📄 Read one forum post or article (body keeps line breaks and code) with its comments.
+
+    Args:
+        article_id: Post / article id (e.g. "32984819083415-新人求模板"), "posts/<id>",
+            "articles/<id>" or a support.worldquantbrain.com URL
+        include_comments: Also return the comments
+    """
+    res = await forum_client.read_post(article_id, include_comments=include_comments)
+    return {**res, "success": True}
+
+
+@_tool(READ)
+async def get_glossary_terms() -> Dict[str, Any]:
+    """📚 BRAIN glossary terms and definitions from the support site (cached)."""
+    return await forum_client.get_glossary_terms()
+
+
+# --- ProdMemo: local Self / Pool / Prod correlation memory ----------------------
+# Thin wrappers over prodmemo_service (see docs/PRODMEMO_IMPLEMENTATION.md).
+
+@_tool(LOCAL_WRITE)
+async def prodmemo_sync(mode: str = "incremental") -> Dict[str, Any]:
+    """
+    Sync submitted alphas and their PnL into the local ProdMemo database.
+
+    Runs in the background and returns immediately — poll prodmemo_sync("status").
+
+    Args:
+        mode: "incremental" (default: probes the remote count first and fetches only
+            what is missing), "full" (re-walks every alpha), "stop" (cancels a run
+            in progress) or "status" (progress / final state of the latest run)
+    """
+    if str(mode or "").strip().lower() == "status":
         return await prodmemo_client.sync_status()
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+    return await prodmemo_client.start_sync(mode)
 
 
-@mcp.tool()
+@_tool(LOCAL_READ)
 async def prodmemo_check(alpha_id: str = "", alpha_ids: Optional[List[str]] = None,
                          run_platform_check: bool = False, verbose: bool = False) -> Dict[str, Any]:
-    """Estimate Prod Correlation locally for one or many alphas (no platform quota).
+    """
+    Estimate Prod Correlation locally for one or many alphas (no platform quota).
 
     Per alpha (compact row):
       prod_est          — empirical estimate prod ≈ a + b × pool (the most useful
@@ -3549,32 +3337,30 @@ async def prodmemo_check(alpha_id: str = "", alpha_ids: Optional[List[str]] = No
                           proves the platform check would fail
       platform_prod     — platform-measured Prod, if known
       recommendation    — "skip" (bound > 0.7), "check", or "insufficient_data"
-    Platform Prod values measured by check_correlation / get_submission_check
-    are written back automatically and become new reference/calibration points.
+    Platform Prod values measured by check_alpha are written back automatically
+    and become new reference / calibration points.
 
     Args:
         alpha_id: One alpha to evaluate
         alpha_ids: Several alphas (up to 20) — use instead of alpha_id
-        run_platform_check: Also query the platform for Prod/Self correlation and
+        run_platform_check: Also query the platform for Prod / Self correlation and
             store the result (costs platform time; improves future estimates)
         verbose: Return the full per-alpha report (local details, witness,
             calibration, resolved values) instead of the compact row
     """
-    try:
-        ids = list(alpha_ids or []) + ([alpha_id] if alpha_id else [])
-        result = await prodmemo_client.check_many(ids, run_platform_check, verbose)
-        return result["results"][0] if len(result["results"]) == 1 and not alpha_ids else result
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+    ids = list(alpha_ids or []) + ([alpha_id] if alpha_id else [])
+    result = await prodmemo_client.check_many(ids, run_platform_check, verbose)
+    return result["results"][0] if len(result["results"]) == 1 and not alpha_ids else result
 
 
-@mcp.tool()
+@_tool(LOCAL_READ)
 async def prodmemo_get(alpha_id: str = "", stale_only: bool = False,
                        above: float = 0.0, group_key: str = "",
                        limit: int = 100) -> Dict[str, Any]:
-    """Inspect stored ProdMemo state — one alpha in full, or a filtered list.
+    """
+    Inspect stored ProdMemo state — one alpha in full, or a filtered list.
 
-    Each entry reports sync state (metadata/PnL present, PnL last date), platform
+    Each entry reports sync state (metadata / PnL present, PnL last date), platform
     correlations, local correlations with a live `stale` flag, and the resolved
     value per metric (platform Ⓟ preferred, non-stale local Ⓛ as fallback, ≥ for
     the Prod lower bound).
@@ -3586,31 +3372,26 @@ async def prodmemo_get(alpha_id: str = "", stale_only: bool = False,
         group_key: Restrict to one Region|Universe|Delay group, e.g. "USA|TOP3000|D1"
         limit: Maximum rows for list mode
     """
-    try:
-        return await prodmemo_client.get(alpha_id=alpha_id, stale_only=stale_only,
-                                         above=above, group_key=group_key, limit=limit)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+    return await prodmemo_client.get(alpha_id=alpha_id, stale_only=stale_only,
+                                     above=above, group_key=group_key, limit=limit)
 
 
-@mcp.tool()
+@_tool(LOCAL_READ)
 async def prodmemo_stats() -> Dict[str, Any]:
     """Counts held in the ProdMemo database, including how many alphas are usable
     as Prod lower-bound reference curves (valid_reference_count)."""
-    try:
-        return await prodmemo_client.stats()
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+    return await prodmemo_client.stats()
 
 
-@mcp.tool()
+@_tool(LOCAL_WRITE)
 async def prodmemo_manage(action: str, alpha_id: str = "", data: str = "") -> Dict[str, Any]:
-    """Maintain the ProdMemo store: export, import, or clear correlation data.
+    """
+    Maintain the ProdMemo store: export, import, or clear correlation data.
 
     'import' accepts the WebDataScope browser extension's Corr JSON export — the
     only way to carry over platform Prod values captured in the browser, which
     cannot be re-derived server-side. Clearing is NOT reversible: 'clear_corrs'
-    drops correlations but keeps alphas/PnL, 'clear_sync' does the opposite (the
+    drops correlations but keeps alphas / PnL, 'clear_sync' does the opposite (the
     surviving local correlations then read as stale).
 
     Args:
@@ -3618,10 +3399,7 @@ async def prodmemo_manage(action: str, alpha_id: str = "", data: str = "") -> Di
         alpha_id: Alpha to drop, for action="delete"
         data: Corr JSON payload, for action="import"
     """
-    try:
-        return await prodmemo_client.manage(action, alpha_id=alpha_id, data=data)
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+    return await prodmemo_client.manage(action, alpha_id=alpha_id, data=data)
 
 
 # --- Main entry point ---

@@ -9,8 +9,10 @@ Needs CREDD_URL (+ CREDD_TOKEN if credd requires it) and network access to
 api.worldquantbrain.com (support.worldquantbrain.com for --forum).
 
     python scripts/live_regression.py                # read-only (default)
-    python scripts/live_regression.py --writes       # + QUICK simulations, metadata round-trip
+    python scripts/live_regression.py --writes       # + QUICK simulations (single / multi / concurrent),
+                                                     #   metadata round-trip
     python scripts/live_regression.py --raa          # + one RAA simulation (uses 4 slots)
+    python scripts/live_regression.py --probe-multi-raa   # may a multi-simulation hold RAA items?
     python scripts/live_regression.py --forum        # + forum tools (Playwright)
     python scripts/live_regression.py --prodmemo     # + ProdMemo status (needs its database)
     python scripts/live_regression.py --selection "<SuperAlpha selection expr>"
@@ -90,6 +92,8 @@ async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--writes", action="store_true")
     ap.add_argument("--raa", action="store_true")
+    ap.add_argument("--probe-multi-raa", action="store_true",
+                    help="ask BRAIN whether a multi-simulation may hold REGION_AGNOSTIC items (cancelled if accepted)")
     ap.add_argument("--forum", action="store_true")
     ap.add_argument("--prodmemo", action="store_true")
     ap.add_argument("--accept-versions", action="store_true", help="send the catalog's versioned Accept headers")
@@ -128,9 +132,9 @@ async def main() -> int:
         T = run.tool
         run.note("versioned Accept headers", "INFO", "on" if pf.SEND_ACCEPT_VERSIONS else "off (default)", "AUTH-9")
 
-        auth = await run.check("authenticate", lambda: T("authenticate"),
-                               ok(lambda p: p.get("status") == "authenticated", "authenticated"), "AUTH-17")
-        if not isinstance(auth, dict) or auth.get("status") != "authenticated":
+        auth = await run.check("brain_status(refresh)", lambda: T("brain_status", refresh=True),
+                               ok(lambda p: p.get("authenticated") is True, "authenticated"), "AUTH-17")
+        if not isinstance(auth, dict) or auth.get("authenticated") is not True:
             return finish(run, args.report)
 
         await run.check("get_platform_setting_options", lambda: T("get_platform_setting_options"),
@@ -152,8 +156,8 @@ async def main() -> int:
                         ok(lambda p: p["count"] > 20, "operators"), "DATA-9")
 
         for stage in ("IS", "OS"):
-            res = await run.check(f"get_user_alphas(stage={stage})",
-                                  lambda s=stage: T("get_user_alphas", stage=s, limit=5),
+            res = await run.check(f"list_alphas(stage={stage})",
+                                  lambda s=stage: T("list_alphas", stage=s, limit=5),
                                   ok(lambda p: "results" in p, "results"), "ALPHA-9")
             if isinstance(res, dict) and res.get("results"):
                 ctx[stage] = res["results"][0]["id"]
@@ -161,61 +165,67 @@ async def main() -> int:
         if "count_IS" in ctx:
             far = (today + dt.timedelta(days=3650)).isoformat()
             async def probe():
-                a = await T("get_user_alphas", stage="IS", limit=1, start_date=far)
-                b = await T("get_user_alphas", stage="IS", limit=1, hidden=True)
-                return a, b
+                a = await T("list_alphas", stage="IS", limit=1, start_date=far)
+                b = await T("list_alphas", stage="IS", limit=1, hidden=True)
+                c = await T("list_alphas", stage="", limit=1, alpha_type="RA_PARENT")
+                return a, b, c
             await run.check("undocumented list filters honoured?", probe,
-                            lambda ab: ("INFO", f"start_date=+10y -> count {ab[0].get('count')} vs unfiltered "
-                                                f"{ctx['count_IS']}; hidden=true -> {ab[1].get('count')} "
-                                                "(a smaller count means the filter works)"), "ALPHA-12")
+                            lambda r: ("INFO", f"start_date=+10y -> count {r[0].get('count')} vs unfiltered "
+                                               f"{ctx['count_IS']}; hidden=true -> {r[1].get('count')}; "
+                                               f"type=RA_PARENT -> {r[2].get('count')} "
+                                               "(a smaller count means the filter works)"), "ALPHA-12")
         alpha = ctx.get("IS") or ctx.get("OS")
         if alpha:
-            await run.check("get_alpha_details", lambda: T("get_alpha_details", alpha_id=alpha),
-                            ok(lambda p: p.get("id") == alpha, "alpha"))
-            await run.check("get_record_sets", lambda: T("get_record_sets", alpha_id=alpha),
+            await run.check("get_alpha", lambda: T("get_alpha", alpha_id=alpha),
+                            ok(lambda p: p.get("id") == alpha or p.get("parent_alpha_id") == alpha, "alpha"))
+            await run.check("get_alpha_recordset(list)", lambda: T("get_alpha_recordset", alpha_id=alpha),
                             ok(lambda p: p.get("results") or p.get("status") == "PENDING", "list"), "ANLY-7")
-            await run.check("get_record_set_data(pnl)", lambda: T("get_record_set_data", alpha_id=alpha,
-                                                                  record_set_name="pnl"),
+            await run.check("get_alpha_recordset(pnl)",
+                            lambda: T("get_alpha_recordset", alpha_id=alpha, recordset="pnl", max_rows=5),
                             ok(lambda p: p.get("records") or p.get("status") == "PENDING", "data or PENDING"), "ANLY-2")
-            await run.check("get_alpha_yearly_stats", lambda: T("get_alpha_yearly_stats", alpha_id=alpha),
-                            ok(lambda p: isinstance(p, dict), "dict ({} = still computing)"), "ANLY-2")
-            await run.check("check_correlation(both)",
-                            lambda: T("check_correlation", alpha_id=alpha, max_wait=args.wait),
+            await run.check("get_alpha_recordset(yearly-stats)",
+                            lambda: T("get_alpha_recordset", alpha_id=alpha, recordset="yearly-stats"),
+                            ok(lambda p: p.get("records") or p.get("status") == "PENDING", "data or PENDING"), "ANLY-2")
+            await run.check("check_alpha(correlation)",
+                            lambda: T("check_alpha", alpha_id=alpha, check="correlation", wait_seconds=args.wait),
                             ok(lambda p: p["status"] in ("DONE", "PENDING", "ERROR"), "status"), "ALPHA-5")
-            await run.check("get_submission_check", lambda: T("get_submission_check", alpha_id=alpha,
-                                                              max_wait=args.wait),
+            await run.check("check_alpha(submission)",
+                            lambda: T("check_alpha", alpha_id=alpha, wait_seconds=args.wait),
                             ok(lambda p: p["status"] in ("DONE", "PENDING"), "status"), "ALPHA-1")
-            await run.check("performance_comparison", lambda: T("performance_comparison", alpha_id=alpha),
+            await run.check("get_alpha_performance", lambda: T("get_alpha_performance", alpha_id=alpha),
                             ok(lambda p: isinstance(p, dict), "before/after"), "ANLY-6")
 
         for label, tool, kw in (
-                ("get_user_activities(diversity)", "get_user_activities", {"user_id": "self", "grouping": "region,delay"}),
-                ("get_pyramid_multipliers", "get_pyramid_multipliers", {}),
-                ("get_pyramid_alphas", "get_pyramid_alphas", {"start_date": d90, "end_date": today.isoformat()}),
-                ("get_daily_and_quarterly_payment", "get_daily_and_quarterly_payment", {}),
-                ("value_factor_trendScore", "value_factor_trendScore", {"start_date": d90, "end_date": today.isoformat()}),
+                ("get_activity(diversity)", "get_activity", {"kind": "diversity", "grouping": "region,delay"}),
+                ("get_activity(pyramid-multipliers)", "get_activity", {"kind": "pyramid-multipliers"}),
+                ("get_activity(pyramid-alphas)", "get_activity",
+                 {"kind": "pyramid-alphas", "start_date": d90, "end_date": today.isoformat()}),
+                ("get_activity(payments)", "get_activity", {"kind": "payments"}),
+                ("get_activity(diversity-score)", "get_activity",
+                 {"kind": "diversity-score", "start_date": d90, "end_date": today.isoformat()}),
+                ("get_activity(profile)", "get_activity", {"kind": "profile"}),
                 ("get_leaderboard", "get_leaderboard", {}),
-                ("get_user_profile(self)", "get_user_profile", {}),
-                ("get_user_competitions", "get_user_competitions", {}),
+                ("get_competitions", "get_competitions", {}),
                 ("get_events", "get_events", {}),
                 ("get_messages", "get_messages", {"limit": 3}),
-                ("get_documentations", "get_documentations", {})):
+                ("get_documentation", "get_documentation", {})):
             res = await run.check(label, lambda t=tool, k=kw: T(t, **k), ok(), "AUTH/MISC")
-            if label == "get_daily_and_quarterly_payment" and isinstance(res, dict):
+            if label == "get_activity(payments)" and isinstance(res, dict):
                 errs = [k for k, v in res.items() if isinstance(v, dict) and v.get("error")]
                 if errs:
                     run.note("payment halves", "WARN", f"errors in {errs}: {[res[k]['error'][:120] for k in errs]}", "AUTH-10")
-            if label == "get_user_competitions" and isinstance(res, dict) and res.get("results"):
+            if label == "get_competitions" and isinstance(res, dict) and res.get("results"):
                 ctx["competition"] = res["results"][0]["id"]
-            if label == "get_documentations" and isinstance(res, dict):
+            if label == "get_documentation" and isinstance(res, dict):
                 ctx["page"] = next((p["id"] for t in res.get("results") or [] for p in t.get("pages") or []), None)
         if ctx.get("competition"):
-            await run.check("get_competition_agreement exists?",
-                            lambda: T("get_competition_agreement", competition_id=ctx["competition"]),
-                            lambda p: ("INFO", "agreement endpoint returned data" if not p.get("error")
-                                       else f"no agreement: {p['error'][:120]}"), "MISC-4")
+            await run.check("competition agreement exists?",
+                            lambda: T("get_competitions", competition_id=ctx["competition"], include_agreement=True),
+                            lambda p: ("INFO", "agreement endpoint returned data"
+                                       if not (p.get("agreement") or {}).get("error")
+                                       else f"no agreement: {p['agreement']['error'][:120]}"), "MISC-4")
         if ctx.get("page"):
-            await run.check("get_documentation_page", lambda: T("get_documentation_page", page_id=ctx["page"]),
+            await run.check("get_documentation(page)", lambda: T("get_documentation", page_id=ctx["page"]),
                             ok(lambda p: p.get("content"), "content"))
 
         if args.selection:
@@ -230,52 +240,75 @@ async def main() -> int:
                 return out
             await run.check("super-selection param names", selection_probe,
                             lambda o: ("INFO", f"{o} — the style returning only CHN is honoured"), "SIM-1")
+            await run.check("preview_super_selection", lambda: T("preview_super_selection", selection=args.selection,
+                                                                 region=args.region, limit=3),
+                            ok(lambda p: "results" in p, "results"))
 
+        submitted = ok(lambda p: p["status"] in ("SUBMITTED", "PARTIAL", "RATE_LIMITED"), "submitted")
         if args.writes:
-            single = await run.check("create_simulation(QUICK)",
-                                     lambda: T("create_simulation", regular="rank(-returns)", region=args.region,
-                                               universe=args.universe, decay=4, neutralization="SUBINDUSTRY",
-                                               truncation=0.08, simulation_mode="QUICK"),
-                                     ok(lambda p: p["status"] in ("SUBMITTED", "RATE_LIMITED"), "submitted"), "SIM-4")
-            multi = await run.check("create_multi_simulation(per_alpha_settings)",
-                                    lambda: T("create_multi_simulation", alpha_expressions=["rank(-returns)"],
-                                              per_alpha_settings=[{"decay": 2}, {"decay": 6}], region=args.region,
-                                              universe=args.universe, simulation_mode="QUICK"),
-                                    ok(lambda p: p["status"] in ("SUBMITTED", "RATE_LIMITED"), "submitted"), "SIM-9")
-            for label, sub in (("single", single), ("multi", multi)):
-                if isinstance(sub, dict) and sub.get("progress_url"):
-                    res = await run.check(f"check_simulation_progress({label})",
-                                          lambda u=sub["progress_url"]: T("check_simulation_progress", progress_url=u,
-                                                                          wait_seconds=min(args.wait, 120)),
-                                          ok(lambda p: p["status"] in ("COMPLETE", "RUNNING", "WARNING"), "status"),
-                                          "SIM-3/5/6")
-                    if label == "single" and isinstance(res, dict) and (res.get("alpha") or {}).get("id"):
-                        ctx["new_alpha"] = res["alpha"]["id"]
+            common = dict(region=args.region, universe=args.universe, simulation_mode="QUICK")
+            single = await run.check("create_simulation(single, QUICK)",
+                                     lambda: T("create_simulation", expressions="rank(-returns)", decay=4,
+                                               neutralization="SUBINDUSTRY", truncation=0.08, **common),
+                                     submitted, "SIM-4")
+            multi = await run.check("create_simulation(multi sweep)",
+                                    lambda: T("create_simulation", expressions="rank(-returns)",
+                                              per_alpha_settings=[{"decay": 2}, {"decay": 6}], **common),
+                                    submitted, "SIM-9")
+            conc = await run.check("create_simulation(concurrent)",
+                                   lambda: T("create_simulation", expressions=["rank(-returns)", "-rank(volume)"],
+                                             mode="concurrent", **common),
+                                   submitted)
+            ids = [i for sub in (single, multi, conc) if isinstance(sub, dict)
+                   for i in ([sub["simulation_id"]] if sub.get("simulation_id") else sub.get("simulation_ids") or [])]
+            if ids:
+                res = await run.check("get_simulation(all)",
+                                      lambda: T("get_simulation", simulation_ids=ids, wait_seconds=min(args.wait, 120)),
+                                      ok(lambda p: p["status"] in ("COMPLETE", "RUNNING", "FINISHED_WITH_ERRORS"),
+                                         "status"), "SIM-3/5/6")
+                for st in (res or {}).get("simulations") or []:
+                    if st.get("simulation_id") == (single or {}).get("simulation_id") and (st.get("alpha") or {}).get("id"):
+                        ctx["new_alpha"] = st["alpha"]["id"]
             ra = sorted({str(h["retry_after"]) for h in run.http if h["path"].startswith("/simulations/") and h["status"] == 200})
             run.note("Retry-After values on /simulations polls", "INFO",
                      f"{ra} ('None' = absent on finished responses; '0' would mean presence alone is wrong)", "SIM-17")
             if ctx.get("new_alpha"):
                 async def roundtrip():
-                    a = await T("set_alpha_properties", alpha_id=ctx["new_alpha"], name="wqmcp-live-test",
+                    a = await T("update_alpha", alpha_ids=ctx["new_alpha"], name="wqmcp-live-test",
                                 tags=["wqmcp_live"])
-                    stored = await T("get_alpha_details", alpha_id=ctx["new_alpha"])
-                    await T("set_alpha_properties", alpha_id=ctx["new_alpha"], name="", tags=[])
+                    stored = await T("get_alpha", alpha_id=ctx["new_alpha"], full=True)
+                    await T("update_alpha", alpha_ids=ctx["new_alpha"], name="", tags=[])
                     return a, stored
-                await run.check("set_alpha_properties round-trip", roundtrip,
+                await run.check("update_alpha round-trip", roundtrip,
                                 lambda r: ("FAIL", str(r[0])) if r[0].get("error") else
                                 ("INFO", f"name={r[1].get('name')!r} tags as stored={r[1].get('tags')!r}"), "ALPHA-13")
         if args.raa:
-            raa = await run.check("create_raa_simulation", lambda: T("create_raa_simulation", regular="rank(-returns)",
-                                                                     simulation_mode="QUICK"),
-                                  ok(lambda p: p["status"] in ("SUBMITTED", "RATE_LIMITED"), "submitted"))
-            if isinstance(raa, dict) and raa.get("progress_url"):
-                await run.check("check_simulation_progress(RAA)",
-                                lambda: T("check_simulation_progress", progress_url=raa["progress_url"],
+            raa = await run.check("create_simulation(type=RAA)",
+                                  lambda: T("create_simulation", expressions="rank(-returns)", type="RAA",
+                                            simulation_mode="QUICK"),
+                                  submitted)
+            if isinstance(raa, dict) and raa.get("simulation_id"):
+                await run.check("get_simulation(RAA)",
+                                lambda: T("get_simulation", simulation_ids=raa["simulation_id"],
                                           wait_seconds=min(args.wait, 120)),
                                 ok(lambda p: p["status"] in ("COMPLETE", "RUNNING"), "status"))
+        if args.probe_multi_raa:
+            async def multi_raa_probe():
+                item = {"type": "REGION_AGNOSTIC", "regular": "rank(-returns)",
+                        "settings": {"instrumentType": "EQUITY", "region": "ALL", "universe": "MEDIUM", "delay": 1,
+                                     "decay": 10, "neutralization": "SLOW_AND_FAST", "truncation": 0.08,
+                                     "pasteurization": "ON", "unitHandling": "VERIFY", "nanHandling": "OFF",
+                                     "language": "FASTEXPR", "visualization": False, "simulationMode": "QUICK"}}
+                resp = await original("post", f"{brain.base_url}/simulations", json=[item, item])
+                location = resp.headers.get("Location")
+                if location:  # accepted: do not leave 8 slots busy
+                    await original("delete", location)
+                return resp.status_code, (resp.text or "")[:300], location
+            await run.check("multi-simulation of REGION_AGNOSTIC items accepted?", multi_raa_probe,
+                            lambda r: ("INFO", f"HTTP {r[0]} {'(accepted, then cancelled)' if r[2] else ''} {r[1]}"))
         if args.forum:
             await run.check("get_glossary_terms", lambda: T("get_glossary_terms"),
-                            ok(lambda p: isinstance(p, list) and len(p) > 10, "terms"), "FORUM-11")
+                            ok(lambda p: len(p["terms"]) > 10, "terms"), "FORUM-11")
             found = await run.check("search_forum_posts", lambda: T("search_forum_posts", search_query="sharpe", max_results=5),
                                     ok(lambda p: p["count"] > 0 and p.get("signed_in", True), "results"), "FORUM-1/4")
             if isinstance(found, dict) and found.get("results"):
@@ -283,7 +316,7 @@ async def main() -> int:
                                 ok(lambda p: bool(p["post"]["body"]), "body"), "FORUM-2/5")
         if args.prodmemo:
             await run.check("prodmemo_stats", lambda: T("prodmemo_stats"), ok())
-            await run.check("prodmemo_sync_status", lambda: T("prodmemo_sync_status"), ok())
+            await run.check("prodmemo_sync(status)", lambda: T("prodmemo_sync", mode="status"), ok())
 
     return finish(run, args.report)
 
