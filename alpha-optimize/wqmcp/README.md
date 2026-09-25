@@ -47,7 +47,7 @@ claude mcp add --transport http brain-platform http://127.0.0.1:8761/mcp
 | `WQMCP_CONNECT_TIMEOUT` / `WQMCP_READ_TIMEOUT` | `10` / `60` | 单次请求的连接超时和读超时（秒） |
 | `WQMCP_FORUM_CONCURRENCY` / `WQMCP_FORUM_TIMEOUT` | `2` / `90` | 论坛工具的并发页数上限和单次操作超时（秒） |
 | `WQMCP_FORUM_BROWSER_CHANNEL` | `chrome` | 先尝试本机 Chrome，失败时退回 Playwright 自带的 Chromium |
-| `WQMCP_FORUM_CHROMIUM_SANDBOX` | `0` | 设为 `1` 时启用 Chromium 沙箱（Playwright 默认关闭） |
+| `WQMCP_FORUM_CHROMIUM_SANDBOX` | `0` | 设为 `1` 时启用 Chromium 沙箱。Playwright 默认关闭沙箱，而无头浏览器只会访问 support 站点；在非 root、非容器环境里建议开启 |
 | `WQMCP_GLOSSARY_TTL` | `86400` | 术语表缓存时间（秒） |
 | `WQMCP_LOG_LEVEL` | `INFO` | 日志只输出到 stderr |
 
