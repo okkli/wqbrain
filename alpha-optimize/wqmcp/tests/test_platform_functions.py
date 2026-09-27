@@ -416,3 +416,56 @@ async def test_check_alpha_needs_an_alpha_except_for_the_queue(bg_client):
     assert set(await pf.check_alpha(check="queue")) >= {"throttled", "computing", "waiting", "max_at_a_time"}
     out = await pf.check_alpha(check="prod")
     assert "alpha_id is required" in str(out.get("error"))
+
+
+@pytest.mark.asyncio
+async def test_cancel_one_waiting_all(bg_client):
+    client, gate = bg_client, bg_client.correlation_gate
+    gate.max_alphas = 1
+    s = install(client, {"/correlations/": [COMPUTING()]})       # BRAIN never answers
+    for alpha in ("A1", "B2", "C3", "D4"):
+        await client.check_correlation(alpha, "both", max_wait=0)
+    assert [r["alpha_id"] for r in gate.snapshot()["waiting"]] == ["B2", "C3", "D4"]
+
+    out = await pf.check_alpha(alpha_id="C3", check="cancel")     # one alpha that waits
+    assert out["cancelled"] == [{"alpha_id": "C3", "checks": ["prod", "self"], "was": "waiting"}]
+    assert [(r["position"], r["alpha_id"]) for r in out["queue"]["waiting"]] == [(1, "B2"), (2, "D4")]
+    assert "note" not in out
+
+    out = await pf.check_alpha(alpha_id="A1", check="cancel")     # the one being computed
+    assert out["cancelled"][0]["was"] == "computing" and "BRAIN already started" in out["note"]
+    await until(client, lambda: [r["alpha_id"] for r in gate.snapshot()["computing"]] == ["B2"])
+    polled_a1 = len([c for c in s.calls if "/alphas/A1/" in c[1]])
+    assert gate.snapshot()["waiting"][0]["alpha_id"] == "D4"      # B2 moved up and started
+
+    out = await pf.check_alpha(alpha_id="waiting", check="cancel")
+    assert [r["alpha_id"] for r in out["cancelled"]] == ["D4"]
+    assert [r["alpha_id"] for r in out["queue"]["computing"]] == ["B2"] and out["queue"]["waiting"] == []
+
+    out = await pf.check_alpha(alpha_id="all", check="cancel")
+    assert [r["alpha_id"] for r in out["cancelled"]] == ["B2"]
+    assert out["queue"]["computing"] == [] and out["queue"]["waiting"] == [] and not gate.inflight
+    sent = len(s.calls)
+    await client.real_sleep(0.05)
+    assert len(s.calls) == sent                                   # nothing is polled any more
+    assert len([c for c in s.calls if "/alphas/A1/" in c[1]]) == polled_a1
+
+    out = await pf.check_alpha(alpha_id="all", check="cancel")
+    assert out["cancelled"] == [] and "Nothing to cancel" in out["note"]
+    assert "alpha_id is required" in str((await pf.check_alpha(check="cancel")).get("error"))
+
+    again = await client.check_correlation("C3", "prod", max_wait=0)   # can be asked for again
+    assert again["checks"]["production"]["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_a_caller_waiting_for_a_cancelled_job_is_told_so(bg_client):
+    client, gate = bg_client, bg_client.correlation_gate
+    gate.grace_seconds = 0.0
+    install(client, {"/correlations/prod": [COMPUTING()]})
+    waiting = asyncio.ensure_future(client.check_correlation("A1", "prod", max_wait=30))
+    await until(client, lambda: gate.snapshot()["computing"])
+    await pf.check_alpha(alpha_id="A1", check="cancel")
+    out = await asyncio.wait_for(waiting, timeout=2)
+    assert out["status"] == "CANCELLED" and out["checks"]["production"]["status"] == "CANCELLED"
+    assert out["all_passed"] is None
