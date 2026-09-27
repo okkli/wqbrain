@@ -21,6 +21,9 @@ FAKE = FakeBrain()
 os.environ["WQMCP_BASE_URL"] = FAKE.url
 os.environ["CREDD_URL"] = FAKE.url
 os.environ.pop("CREDD_TOKEN", None)
+# Correlation jobs end with the call that started them, so request counts are
+# exact; the background queue has its own tests, which switch it on.
+os.environ["WQMCP_CORR_BACKGROUND"] = "0"
 
 
 @pytest.fixture

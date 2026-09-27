@@ -179,23 +179,28 @@ _PENDING_RETRY_SECONDS = 10.0
 
 
 class CorrelationGate:
-    """Account-wide admission control for BRAIN's correlation / check endpoints.
+    """Account-wide queue for BRAIN's correlation / check endpoints.
 
-    Asking for the prod or self correlation of several alphas at once makes BRAIN
-    answer 429 for the whole account. Every client of this server shares one
-    gate, which keeps the pressure down in four ways:
+    Asking for the prod or self correlation of several alphas at once gets the
+    whole account rate limited. BRAIN does not always say so with a 429: a
+    throttled account just keeps answering "empty body, Retry-After: 1" for
+    every alpha, for as long as the requests keep coming. Every client of this
+    server shares one gate, which keeps the pressure down:
 
-    - a queue: at most `max_alphas` alphas are being computed at a time; the
-      others wait their turn (first come, first served) inside their own wait
-      budget and report PENDING + queued when it runs out;
-    - a slot stays taken while BRAIN is still computing, also after the tool
-      call that started it returned PENDING (for `hold_seconds` after its last
-      poll), so re-asking later continues that alpha instead of piling on;
-    - a slot is given up after `max_slot_seconds` whatever happens, so a
-      computation BRAIN never finishes cannot block the queue for good;
-    - pacing: requests to these endpoints are at least `min_interval` apart;
-    - finished results are remembered for `cache_seconds`, and identical
-      requests that overlap share one poll.
+    - a queue: at most `max_alphas` alphas are computed at a time, the others
+      wait first come, first served. `snapshot()` shows who is computing and
+      who waits;
+    - jobs live in the background (`background`): a request keeps its place and
+      keeps being polled after the tool call that made it returned PENDING, for
+      up to `queue_seconds`; the result is remembered for `cache_seconds`, so
+      asking again later collects it;
+    - a slot is handed on after `max_slot_seconds`; the alpha goes to the back
+      of the queue, so one alpha BRAIN never finishes cannot block the others;
+    - throttle detection: no result for `stall_seconds` while something is
+      computing (or a 429) means rate limiting. Until a result arrives only one
+      alpha is computed and it is polled every `throttled_interval` seconds;
+    - pacing (`min_interval` between requests), growing poll intervals, and
+      overlapping identical requests share one job.
     """
 
     def __init__(self) -> None:
@@ -207,12 +212,23 @@ class CorrelationGate:
         self.max_alphas = max(1, int(env("WQMCP_CORR_MAX_ALPHAS", "2")))
         self.min_interval = max(0.0, float(env("WQMCP_CORR_MIN_INTERVAL", "0.5")))
         self.hold_seconds = max(0.0, float(env("WQMCP_CORR_HOLD_SECONDS", "90")))
-        self.cache_seconds = max(0.0, float(env("WQMCP_CORR_CACHE_SECONDS", "600")))
+        self.cache_seconds = max(0.0, float(env("WQMCP_CORR_CACHE_SECONDS", "1800")))
         self.max_slot_seconds = max(1.0, float(env("WQMCP_CORR_MAX_SLOT_SECONDS", "600")))
-        self._active: Dict[Tuple[str, str], List[float]] = {}   # (alpha, kind) -> [admitted, last poll]
-        self._waiting: List[Tuple[int, str]] = []         # tickets, oldest first
+        self.background = env("WQMCP_CORR_BACKGROUND", "1") != "0"
+        self.queue_seconds = max(1.0, float(env("WQMCP_CORR_QUEUE_SECONDS", "3600")))
+        self.stall_seconds = max(1.0, float(env("WQMCP_CORR_STALL_SECONDS", "180")))
+        self.throttled_interval = max(1.0, float(env("WQMCP_CORR_THROTTLED_INTERVAL", "60")))
+        # How long a caller waits past its own budget for the first answer.
+        self.grace_seconds = 5.0
+        # (alpha, kind) -> {"admitted", "seen", "polls"}
+        self._active: Dict[Tuple[str, str], Dict[str, float]] = {}
+        # tickets, oldest first: (number, alpha, kind, enqueued at)
+        self._waiting: List[Tuple[int, str, str, float]] = []
         self._tickets = 0
         self._next_request = 0.0
+        self._last_result: Optional[float] = None    # last time BRAIN gave an answer
+        self._pending_since: Optional[float] = None  # computing without an answer since
+        self._throttled_until = 0.0                  # after an explicit 429
         self._cache: "collections.OrderedDict[Tuple[str, str], Tuple[float, Dict[str, Any]]]" = \
             collections.OrderedDict()
         self.inflight: Dict[Tuple[str, str], "asyncio.Task"] = {}
@@ -221,26 +237,38 @@ class CorrelationGate:
     def computing(self) -> set:
         """Alphas BRAIN is (as far as we know) still computing."""
         now = time.monotonic()
-        for key in [k for k, (_, seen) in self._active.items() if now - seen > self.hold_seconds]:
+        for key in [k for k, slot in self._active.items() if now - slot["seen"] > self.hold_seconds]:
             del self._active[key]
-        return {alpha for (alpha, _), (admitted, _) in self._active.items()
-                if now - admitted <= self.max_slot_seconds}
+        if not self._active and not self._waiting:
+            self._pending_since = None
+        return {alpha for (alpha, _), slot in self._active.items()
+                if now - slot["admitted"] <= self.max_slot_seconds}
 
-    def enqueue(self, alpha_id: str) -> Tuple[int, str]:
+    def throttled(self) -> bool:
+        now = time.monotonic()
+        if now < self._throttled_until:
+            return True
+        return self._pending_since is not None and now - self._pending_since > self.stall_seconds
+
+    def limit(self) -> int:
+        """How many alphas may be computed at once right now."""
+        return 1 if self.throttled() else self.max_alphas
+
+    def enqueue(self, alpha_id: str, kind: str = "") -> Tuple[int, str, str, float]:
         self._tickets += 1
-        ticket = (self._tickets, alpha_id)
+        ticket = (self._tickets, alpha_id, kind, time.monotonic())
         self._waiting.append(ticket)
         return ticket
 
-    def leave(self, ticket: Tuple[int, str]) -> None:
+    def leave(self, ticket: Tuple[int, str, str, float]) -> None:
         if ticket in self._waiting:
             self._waiting.remove(ticket)
 
-    def admit(self, ticket: Tuple[int, str], kind: str) -> bool:
+    def admit(self, ticket: Tuple[int, str, str, float], kind: str) -> bool:
         alpha_id = ticket[1]
         computing = self.computing()
         if alpha_id not in computing:
-            if len(computing) >= self.max_alphas:
+            if len(computing) >= self.limit():
                 return False
             ahead = next((t for t in self._waiting if t[1] not in computing), ticket)
             if ahead[1] != alpha_id:
@@ -251,23 +279,98 @@ class CorrelationGate:
         self.leave(ticket)
         return True
 
-    def touch(self, alpha_id: str, kind: str) -> None:
+    def touch(self, alpha_id: str, kind: str, polled: bool = False) -> None:
         now = time.monotonic()
         slot = self._active.get((alpha_id, kind))
         if slot is None:
-            self._active[(alpha_id, kind)] = [now, now]
-        else:
-            slot[1] = now
+            slot = self._active[(alpha_id, kind)] = {"admitted": now, "seen": now, "polls": 0}
+        slot["seen"] = now
+        if polled:
+            slot["polls"] += 1
+        if self._pending_since is None:
+            self._pending_since = now
 
     def release(self, alpha_id: str, kind: str) -> None:
         self._active.pop((alpha_id, kind), None)
 
-    def position(self, ticket: Tuple[int, str]) -> int:
+    def answered(self) -> None:
+        """BRAIN produced a result: whatever throttling there was is over."""
+        now = time.monotonic()
+        self._last_result = now
+        self._throttled_until = 0.0
+        self._pending_since = now if self._active else None
+
+    def rate_limited(self, retry_after: float = 0.0) -> None:
+        """BRAIN answered 429 on one of these endpoints."""
+        self._throttled_until = max(self._throttled_until,
+                                    time.monotonic() + max(retry_after, self.throttled_interval))
+
+    def position(self, ticket_or_alpha: Any) -> int:
         """1 = next in line; counts the alphas (not requests) waiting ahead."""
-        if ticket not in self._waiting:
-            return 0
-        ahead = {t[1] for t in self._waiting[:self._waiting.index(ticket)]} - {ticket[1]}
-        return len(ahead) + 1
+        alpha_id = ticket_or_alpha[1] if isinstance(ticket_or_alpha, tuple) else str(ticket_or_alpha)
+        order = list(dict.fromkeys(t[1] for t in self._waiting))
+        return order.index(alpha_id) + 1 if alpha_id in order else 0
+
+    def poll_delay(self, retry_after: float, polls: int, remaining: float) -> float:
+        if self.throttled():
+            return max(1.0, min(max(retry_after, self.throttled_interval), remaining))
+        return _poll_delay(retry_after, polls, remaining)
+
+    # -- what callers are told -------------------------------------------------
+    def describe(self, alpha_id: str, kind: str) -> Dict[str, Any]:
+        """The PENDING answer for a request whose job is still going on."""
+        now = time.monotonic()
+        slot = self._active.get((alpha_id, kind)) if alpha_id in self.computing() else None
+        keeps = (" This server keeps polling in the background; call again later to collect the result."
+                 if self.background else " Call again later.")
+        if slot is not None:
+            return {"status": "PENDING", "computing_for_seconds": int(now - slot["admitted"]),
+                    "polls": int(slot["polls"]),
+                    "retry_after_seconds": self.throttled_interval if self.throttled() else _PENDING_RETRY_SECONDS,
+                    "note": "BRAIN has not answered yet (not a failure)." + keeps}
+        return {"status": "PENDING", "queued": True, "queue_position": self.position(alpha_id),
+                "retry_after_seconds": 30.0,
+                "note": (f"Not started yet: waiting in line (at most {self.limit()} alphas are computed "
+                         "at a time, to stay under BRAIN's rate limit)."
+                         + (" It keeps its place in the background; call again later." if self.background
+                            else " Call again later."))}
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Who is being computed and who waits, oldest first."""
+        now = time.monotonic()
+        live = self.computing()
+        computing: Dict[str, Dict[str, Any]] = {}
+        for (alpha, kind), slot in self._active.items():
+            if alpha not in live:
+                continue
+            row = computing.setdefault(alpha, {"alpha_id": alpha, "checks": [], "for_seconds": 0, "polls": 0})
+            row["checks"].append(kind)
+            row["for_seconds"] = max(row["for_seconds"], int(now - slot["admitted"]))
+            row["polls"] += int(slot["polls"])
+        waiting: Dict[str, Dict[str, Any]] = {}
+        for _, alpha, kind, since in self._waiting:
+            if alpha in live:
+                continue
+            row = waiting.setdefault(alpha, {"position": len(waiting) + 1, "alpha_id": alpha, "checks": [],
+                                             "waiting_seconds": int(now - since)})
+            row["checks"].append(kind)
+        throttled = self.throttled()
+        out: Dict[str, Any] = {
+            "throttled": throttled,
+            "max_at_a_time": self.limit(),
+            "computing": sorted(computing.values(), key=lambda r: -r["for_seconds"]),
+            "waiting": list(waiting.values()),
+        }
+        if self._last_result is not None:
+            out["last_result_seconds_ago"] = int(now - self._last_result)
+        if throttled:
+            silent = int(now - self._pending_since) if self._pending_since is not None else None
+            out["note"] = ((f"BRAIN has returned no correlation for {silent}s" if silent is not None
+                            else "BRAIN answered 429")
+                           + ": treated as rate limiting. One alpha at a time, polled every "
+                           f"{int(self.throttled_interval)}s, until BRAIN answers again. Nothing is lost: "
+                           "the queue is worked through in order.")
+        return out
 
     # -- pacing --------------------------------------------------------------
     async def pace(self) -> None:
@@ -1765,64 +1868,83 @@ class BrainApiClient:
 
     async def _wait_for_slot(self, alpha_id: str, kind: str, deadline: float) -> Optional[Dict[str, Any]]:
         """Queue for a CorrelationGate slot. None = admitted; otherwise the PENDING
-        result to return because the wait budget ran out while still queued."""
+        result to return because the time ran out while still queued."""
         gate = self.correlation_gate
-        ticket = gate.enqueue(alpha_id)
+        ticket = gate.enqueue(alpha_id, kind)
         try:
             while not gate.admit(ticket, kind):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return {"status": "PENDING", "queued": True, "queue_position": gate.position(ticket),
-                            "retry_after_seconds": 20.0,
-                            "note": (f"Not started yet: {len(gate.computing())} alphas are already being "
-                                     f"computed (at most {gate.max_alphas} at a time, to stay under "
-                                     "BRAIN's rate limit). Call again later.")}
+                    return gate.describe(alpha_id, kind)
                 await asyncio.sleep(min(1.0, remaining))
             return None
         finally:
             gate.leave(ticket)
 
     async def _poll_correlation(self, alpha_id: str, kind: str, max_wait: float) -> Dict[str, Any]:
-        """Correlation of one alpha through the CorrelationGate: cached result,
-        else join an identical poll already running, else queue for a slot and poll."""
+        """Correlation of one alpha through the CorrelationGate: a remembered
+        result, else the job already going on for it, else a new job. The caller
+        waits max_wait for the job; the job itself goes on in the background."""
         gate = self.correlation_gate
-        key = (str(alpha_id), kind)
+        alpha_id = str(alpha_id)
+        key = (alpha_id, kind)
         hit = gate.cached(key)
         if hit is not None:
             return {**hit, "cached": True}
         budget = max(0.0, min(float(max_wait or 0), 300.0))
         task = gate.inflight.get(key)
         if task is None or task.done():
-            task = asyncio.create_task(self._correlation_job(str(alpha_id), kind, budget))
+            task = asyncio.create_task(self._correlation_job(alpha_id, kind, budget))
             gate.inflight[key] = task
             task.add_done_callback(
                 lambda t, k=key: gate.inflight.pop(k, None) if gate.inflight.get(k) is t else None)
         try:
-            # shield: one caller giving up must not cancel the poll others wait on
-            return dict(await asyncio.wait_for(asyncio.shield(task), timeout=budget + 10.0))
+            # shield: a caller giving up must not cancel the job others wait on
+            return dict(await asyncio.wait_for(asyncio.shield(task), timeout=budget + gate.grace_seconds))
         except asyncio.TimeoutError:
-            return {"status": "PENDING", "retry_after_seconds": _PENDING_RETRY_SECONDS}
+            return gate.describe(alpha_id, kind)
 
     async def _correlation_job(self, alpha_id: str, kind: str, budget: float) -> Dict[str, Any]:
+        """Queue, poll, and (in background mode) go back to the end of the queue
+        when the slot is used up, until BRAIN answers or the job's time is over."""
         gate = self.correlation_gate
-        deadline = time.monotonic() + budget
-        queued = await self._wait_for_slot(alpha_id, kind, deadline)
-        if queued is not None:
-            return queued
-        try:
-            result = await self._poll_correlation_now(alpha_id, kind, max(0.0, deadline - time.monotonic()))
-        except BaseException:
-            gate.release(alpha_id, kind)
-            raise
-        if result["status"] == "PENDING" and not result.get("busy"):
-            gate.touch(alpha_id, kind)      # BRAIN keeps computing: the slot stays taken
-        else:
-            gate.release(alpha_id, kind)
-            if result["status"] == "DONE":
-                gate.remember((alpha_id, kind), result)
-        return result
+        deadline = time.monotonic() + (gate.queue_seconds if gate.background else budget)
+        while True:
+            queued = await self._wait_for_slot(alpha_id, kind, deadline)
+            if queued is not None:
+                return queued
+            slot = min(gate.max_slot_seconds, deadline - time.monotonic()) if gate.background \
+                else deadline - time.monotonic()
+            try:
+                result = await self._poll_correlation_now(alpha_id, kind, max(0.0, slot),
+                                                          limit=gate.max_slot_seconds)
+            except BaseException:
+                gate.release(alpha_id, kind)
+                raise
+            if result["status"] != "PENDING":
+                gate.release(alpha_id, kind)
+                gate.answered()
+                if result["status"] == "DONE":
+                    gate.remember((alpha_id, kind), result)
+                    if result.get("max") is not None and kind in ("prod", "self"):
+                        # ProdMemo keeps prod / self: every measured value is a reference point
+                        await self._record_platform_corr(alpha_id, kind, result["max"], result.get("min"))
+                return result
+            if gate.background and deadline - time.monotonic() > 0:
+                gate.release(alpha_id, kind)    # slot used up: to the back of the queue
+                continue
+            if gate.background:
+                gate.release(alpha_id, kind)    # the job is over: nobody polls this alpha any more
+                result["note"] = (f"BRAIN did not answer within {int(gate.queue_seconds // 60)} minutes; "
+                                  "the job was dropped. Ask again to queue it anew.")
+            elif result.get("busy"):
+                gate.release(alpha_id, kind)
+            else:
+                gate.touch(alpha_id, kind)      # BRAIN keeps computing: the slot stays taken
+            return result
 
-    async def _poll_correlation_now(self, alpha_id: str, kind: str, max_wait: float) -> Dict[str, Any]:
+    async def _poll_correlation_now(self, alpha_id: str, kind: str, max_wait: float,
+                                    limit: float = 300.0) -> Dict[str, Any]:
         """Poll GET /alphas/{id}/correlations/{kind} ("prod" or "self") until it
         settles or max_wait runs out, keeping the three outcomes apart:
 
@@ -1834,17 +1956,19 @@ class BrainApiClient:
           body carrying only an error message.
         """
         url = f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/correlations/{kind}"
-        deadline = time.monotonic() + max(0.0, min(float(max_wait or 0), 300.0))
+        deadline = time.monotonic() + max(0.0, min(float(max_wait or 0), max(limit, 300.0)))
         gate = self.correlation_gate
         polls = 0
         while True:
             await gate.pace()
-            gate.touch(str(alpha_id), kind)
+            gate.touch(str(alpha_id), kind, polled=True)
             try:
                 resp = await self._request('get', url)
             except requests.RequestException as e:
                 resp, net_error = None, str(e)
             busy = resp is None or resp.status_code in (429, 503) or resp.status_code >= 500
+            if resp is not None and resp.status_code == 429:
+                gate.rate_limited(_retry_after_seconds(resp))
             if resp is not None and resp.status_code >= 400 and not busy:
                 return {"status": "ERROR", "http_status": resp.status_code,
                         "error": _http_error_detail(resp)}
@@ -1870,7 +1994,7 @@ class BrainApiClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return {"status": "PENDING", "retry_after_seconds": max(ra, _PENDING_RETRY_SECONDS)}
-            await asyncio.sleep(_poll_delay(ra, polls, remaining))
+            await asyncio.sleep(gate.poll_delay(ra, polls, remaining))
             polls += 1
 
     async def get_production_correlation(self, alpha_id: str, max_wait: float = 100) -> Dict[str, Any]:
@@ -1942,13 +2066,12 @@ class BrainApiClient:
                 if include_data:
                     entry["correlation_data"] = r.get("data")
                 if r.get("cached"):
-                    entry["cached"] = True      # measured within the last few minutes
-                elif mx is not None and kind in ("prod", "self"):  # ProdMemo keeps prod/self only
-                    await self._record_platform_corr(alpha_id, kind, mx, r.get("min"))
+                    entry["cached"] = True      # measured a short while ago
             elif r["status"] == "PENDING":
                 entry["retry_after_seconds"] = r.get("retry_after_seconds")
                 entry["note"] = r.get("note") or "Platform is still computing; call again later (not a failure)."
-                entry.update({k: r[k] for k in ("queued", "queue_position", "busy") if k in r})
+                entry.update({k: r[k] for k in ("queued", "queue_position", "computing_for_seconds",
+                                                "polls", "busy") if k in r})
             else:
                 entry.update({k: r[k] for k in ("error", "http_status", "body") if k in r})
             checks[name] = entry
@@ -1957,8 +2080,11 @@ class BrainApiClient:
         status = "ERROR" if "ERROR" in statuses else ("PENDING" if "PENDING" in statuses else "DONE")
         passes = [c.get("passes_check") for c in checks.values()]
         all_passed = all(passes) if status == "DONE" and None not in passes else None
-        return {"alpha_id": alpha_id, "threshold": threshold, "status": status,
-                "all_passed": all_passed, "checks": checks}
+        out = {"alpha_id": alpha_id, "threshold": threshold, "status": status,
+               "all_passed": all_passed, "checks": checks}
+        if status == "PENDING":
+            out["queue"] = self.correlation_gate.snapshot()   # who is computed, who waits
+        return out
 
     async def get_submission_check(self, alpha_id: str, max_wait: float = 60) -> Dict[str, Any]:
         """Platform-authoritative pre-submission check (GET /alphas/{id}/check).
@@ -1976,7 +2102,7 @@ class BrainApiClient:
         gate = self.correlation_gate
         queued = await self._wait_for_slot(str(alpha_id), "check", deadline)
         if queued is not None:
-            return {"alpha_id": alpha_id, **queued}
+            return {"alpha_id": alpha_id, **queued, "queue": gate.snapshot()}
         try:
             data = await self._poll_check(url, alpha_id, deadline)
         finally:
@@ -1984,10 +2110,16 @@ class BrainApiClient:
         if isinstance(data, dict) and data.get("status") in ("ERROR", "PENDING") and "alpha_id" in data:
             if data["status"] == "PENDING":
                 gate.touch(str(alpha_id), "check")   # still computing on BRAIN's side
+                data["queue"] = gate.snapshot()
+            else:
+                gate.answered()
             return data
         report = await self._submission_report(alpha_id, data, max_wait)
         if report.get("status") == "PENDING":
             gate.touch(str(alpha_id), "check")       # its correlation checks are still running
+            report["queue"] = gate.snapshot()
+        else:
+            gate.answered()
         return report
 
     async def _poll_check(self, url: str, alpha_id: str, deadline: float) -> Any:
@@ -1997,8 +2129,10 @@ class BrainApiClient:
         polls = 0
         while True:
             await gate.pace()
-            gate.touch(str(alpha_id), "check")
+            gate.touch(str(alpha_id), "check", polled=True)
             resp = await self._request('get', url)
+            if resp.status_code == 429:
+                gate.rate_limited(_retry_after_seconds(resp))
             if resp.status_code >= 400:
                 out = {"alpha_id": alpha_id, "status": "ERROR", "http_status": resp.status_code,
                        "error": _http_error_detail(resp)}
@@ -2020,7 +2154,7 @@ class BrainApiClient:
             if remaining <= 0:
                 return {"alpha_id": alpha_id, "status": "PENDING", "retry_after_seconds": max(ra, _PENDING_RETRY_SECONDS),
                         "note": "Platform is still running the checks; call again later."}
-            await asyncio.sleep(_poll_delay(ra, polls, remaining))
+            await asyncio.sleep(gate.poll_delay(ra, polls, remaining))
             polls += 1
 
     async def _submission_report(self, alpha_id: str, data: Any, max_wait: float) -> Dict[str, Any]:
@@ -2701,9 +2835,11 @@ async def brain_status(refresh: bool = False) -> Dict[str, Any]:
             why (credd down, token mismatch, backoff, biometric verification pending).
 
     Returns:
-        authenticated, user, token_expiry, plus the server's read_only / allow_submit switches.
+        authenticated, user, token_expiry, the server's read_only / allow_submit
+        switches, and correlation_queue (who is computed, who waits, throttling).
     """
-    switches = {"credd_url": CREDD_URL, "read_only": READ_ONLY, "allow_submit": ALLOW_SUBMIT}
+    switches = {"credd_url": CREDD_URL, "read_only": READ_ONLY, "allow_submit": ALLOW_SUBMIT,
+                "correlation_queue": brain_client.correlation_gate.snapshot()}
     if refresh:
         auth = await brain_client.authenticate()
         return {"authenticated": True, **auth, **switches}
@@ -3201,18 +3337,29 @@ async def get_alpha_recordset(alpha_id: str, recordset: Optional[str] = None,
     return {"alpha_id": alpha_id, "recordset": recordset, **data}
 
 
-_CHECK_KINDS = ("submission", "correlation", "prod", "self", "power-pool", "all")
+_CHECK_KINDS = ("submission", "correlation", "prod", "self", "power-pool", "all", "queue")
 
 
 @_tool(READ)
-async def check_alpha(alpha_id: str, check: str = "submission", wait_seconds: float = 60,
+async def check_alpha(alpha_id: str = "", check: str = "submission", wait_seconds: float = 60,
                       threshold: float = 0.7, include_data: bool = False) -> Dict[str, Any]:
     """
     ✅ BRAIN's checks for an alpha: pre-submission checks and / or correlations.
 
+    Correlations are queued: BRAIN rate limits an account that asks for several
+    at once (it then answers nothing at all, for every alpha). At most 2 alphas
+    are computed at a time and the rest wait in line. A request keeps running in
+    the background after this call returned PENDING, so just call again later
+    with the same arguments: the answer is then "cached", "computing" (with
+    computing_for_seconds) or "queued" (with queue_position). Every PENDING
+    answer carries "queue": who is computed, who waits, and whether BRAIN is
+    throttling (the server then slows down by itself).
+
     Args:
-        alpha_id: The alpha id (for an RAA use the PARENT id for "submission")
+        alpha_id: The alpha id (for an RAA use the PARENT id for "submission").
+            Not needed for check="queue".
         check:
+            "queue" — only show the correlation queue; asks BRAIN nothing.
             "submission" (default) — the same checks as the Submit button: status
                 DONE / PENDING, all_passed, failed / pending / errored names and
                 each check's result / value / limit. When PROD_CORRELATION comes
@@ -3231,6 +3378,10 @@ async def check_alpha(alpha_id: str, check: str = "submission", wait_seconds: fl
     kind = str(check or "submission").strip().lower()
     if kind not in _CHECK_KINDS + ("production", "power_pool", "both"):
         raise ValueError(f"check must be one of {list(_CHECK_KINDS)}, got {check!r}")
+    if kind == "queue":
+        return brain_client.correlation_gate.snapshot()
+    if not str(alpha_id or "").strip():
+        raise ValueError("alpha_id is required (only check=\"queue\" works without one)")
     if kind == "submission":
         return await brain_client.get_submission_check(alpha_id, wait_seconds)
     if kind != "all":

@@ -277,3 +277,142 @@ async def test_blank_name_is_sent_as_null(client):
     await client.set_alpha_properties("A1", name="", tags=[])
     await client.set_alpha_properties("A1", name="momentum v2")
     assert calls == [{"name": None, "tags": []}, {"name": "momentum v2"}]
+
+
+# --- background queue: keep waiting after the call returned, show the queue --------
+
+@pytest.fixture
+def bg_client(monkeypatch):
+    """Background mode, with sleeps that only yield so jobs move on quickly."""
+    real_sleep = asyncio.sleep
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        await real_sleep(0.001)
+
+    monkeypatch.setattr(pf.asyncio, "sleep", fake_sleep)
+    written = []
+
+    async def fake_record(alpha_id, kind, max_v, min_v=None, source="platform"):
+        written.append((alpha_id, kind, max_v))
+
+    monkeypatch.setattr(pf.prodmemo_client, "record_platform_corr", fake_record)
+    c = pf.brain_client
+    c._cooldown_until = 0.0
+    gate = c.correlation_gate
+    gate.reset()
+    gate.background, gate.grace_seconds, gate.min_interval = True, 0.0, 0.0
+    c.sleeps, c.written, c.real_sleep = sleeps, written, real_sleep
+    yield c
+    for task in list(gate.inflight.values()):
+        task.cancel()
+    gate.reset()
+    c.session = None
+
+
+async def until(client, predicate, seconds=3.0):
+    end = pf.time.monotonic() + seconds
+    while not predicate():
+        assert pf.time.monotonic() < end, "timed out"
+        await client.real_sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_background_job_finishes_after_the_call_returned(bg_client):
+    client, gate = bg_client, bg_client.correlation_gate
+    s = install(client, {"/correlations/prod": [COMPUTING() for _ in range(6)] + [resp(200, {"max": 0.66, "min": -0.1})]})
+    first = await client.check_correlation("A1", "prod", max_wait=0)
+    entry = first["checks"]["production"]
+    assert entry["status"] == "PENDING" and "background" in entry["note"]
+    assert first["queue"]["computing"][0]["alpha_id"] == "A1" or first["queue"]["waiting"]
+
+    await until(client, lambda: gate.cached(("A1", "prod")) is not None)
+    polls = len(s.calls)
+    assert polls == 7 and client.written == [("A1", "prod", 0.66)]   # saved without anybody waiting
+    later = await client.check_correlation("A1", "prod", max_wait=0)
+    assert later["status"] == "DONE" and later["checks"]["production"]["max_correlation"] == 0.66
+    assert later["checks"]["production"]["cached"] is True and len(s.calls) == polls
+    assert "queue" not in later
+
+
+@pytest.mark.asyncio
+async def test_queue_is_visible_and_worked_through_in_order(bg_client):
+    client, gate = bg_client, bg_client.correlation_gate
+    gate.max_alphas = 1
+    release = {"A1": False}
+
+    class Session(FakeSession):
+        def get(self, url, **kw):
+            self.calls.append(("get", url, None))
+            alpha = url.split("/alphas/")[1].split("/")[0]
+            if alpha == "A1" and not release["A1"]:
+                return COMPUTING()
+            return resp(200, {"max": {"A1": 0.3, "B2": 0.5, "C3": 0.8}[alpha]})
+
+    client.session = s = Session({})
+    outs = [await client.check_correlation(a, "prod", max_wait=0) for a in ("A1", "B2", "C3")]
+    assert [o["checks"]["production"].get("queue_position") for o in outs] == [None, 1, 2]
+    queue = await pf.check_alpha(check="queue")
+    assert [r["alpha_id"] for r in queue["computing"]] == ["A1"]
+    assert [(r["position"], r["alpha_id"], r["checks"]) for r in queue["waiting"]] == \
+        [(1, "B2", ["prod"]), (2, "C3", ["prod"])]
+    assert queue["computing"][0]["polls"] >= 1 and queue["throttled"] is False
+    assert not [c for c in s.calls if "/alphas/B2" in c[1] or "/alphas/C3" in c[1]]   # nothing sent for them yet
+
+    release["A1"] = True
+    await until(client, lambda: all(gate.cached((a, "prod")) for a in ("A1", "B2", "C3")))
+    order = list(dict.fromkeys(c[1].split("/alphas/")[1].split("/")[0] for c in s.calls))
+    assert order == ["A1", "B2", "C3"]
+    done = await client.check_correlation("C3", "prod", max_wait=0)
+    assert done["checks"]["production"]["passes_check"] is False
+    assert (await pf.check_alpha(check="queue"))["computing"] == []
+
+
+@pytest.mark.asyncio
+async def test_used_up_slot_goes_to_the_back_of_the_queue(bg_client):
+    client, gate = bg_client, bg_client.correlation_gate
+    gate.max_alphas, gate.max_slot_seconds, gate.queue_seconds = 1, 0.05, 0.6
+    s = install(client, {"/correlations/prod": [COMPUTING()]})   # BRAIN never answers
+    await client.check_correlation("A1", "prod", max_wait=0)
+    await client.check_correlation("B2", "prod", max_wait=0)
+    await until(client, lambda: not gate.inflight, seconds=5)
+    polled = [c[1].split("/alphas/")[1].split("/")[0] for c in s.calls]
+    turns = [a for a, b in zip(polled, [None] + polled) if a != b]
+    assert turns[:4] == ["A1", "B2", "A1", "B2"]                 # they take turns
+    assert gate.snapshot()["computing"] == [] and gate.cached(("A1", "prod")) is None
+
+
+def test_no_answer_for_a_while_is_treated_as_rate_limiting(monkeypatch):
+    gate = pf.CorrelationGate()
+    clock = [5000.0]
+    monkeypatch.setattr(pf.time, "monotonic", lambda: clock[0])
+    gate.touch("A1", "prod", polled=True)
+    assert not gate.throttled() and gate.limit() == 2
+    assert gate.poll_delay(1.0, 3, 300) == pf._poll_delay(1.0, 3, 300)
+    for _ in range(4):                       # polled for four minutes, never an answer
+        clock[0] += 60
+        gate.touch("A1", "prod", polled=True)
+    snap = gate.snapshot()
+    assert gate.throttled() and gate.limit() == 1 and snap["throttled"] and snap["max_at_a_time"] == 1
+    assert "240s" in snap["note"] and snap["computing"][0] == \
+        {"alpha_id": "A1", "checks": ["prod"], "for_seconds": 240, "polls": 5}
+    assert gate.poll_delay(1.0, 3, 300) == 60.0 and gate.poll_delay(1.0, 3, 20) == 20.0
+    assert not gate.admit(gate.enqueue("B2", "prod"), "prod")
+
+    gate.answered()                          # BRAIN answers again: back to normal
+    assert not gate.throttled() and gate.limit() == 2
+    assert gate.snapshot()["last_result_seconds_ago"] == 0
+
+    gate.rate_limited(30)                    # an explicit 429
+    assert gate.throttled()
+    clock[0] += 61
+    gate.touch("A1", "prod")
+    assert not gate.throttled()
+
+
+@pytest.mark.asyncio
+async def test_check_alpha_needs_an_alpha_except_for_the_queue(bg_client):
+    assert set(await pf.check_alpha(check="queue")) >= {"throttled", "computing", "waiting", "max_at_a_time"}
+    out = await pf.check_alpha(check="prod")
+    assert "alpha_id is required" in str(out.get("error"))

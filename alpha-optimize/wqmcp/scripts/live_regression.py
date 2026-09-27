@@ -197,6 +197,9 @@ async def main() -> int:
             await run.check("check_alpha(correlation)",
                             lambda: T("check_alpha", alpha_id=alpha, check="correlation", wait_seconds=args.wait),
                             ok(lambda p: p["status"] in ("DONE", "PENDING", "ERROR"), "status"), "ALPHA-5")
+            await run.check("check_alpha(queue)", lambda: T("check_alpha", check="queue"),
+                            ok(lambda p: isinstance(p["computing"], list) and isinstance(p["waiting"], list)
+                               and isinstance(p["throttled"], bool), "queue snapshot"))
             await run.check("check_alpha(submission)",
                             lambda: T("check_alpha", alpha_id=alpha, wait_seconds=args.wait),
                             ok(lambda p: p["status"] in ("DONE", "PENDING"), "status"), "ALPHA-1")
