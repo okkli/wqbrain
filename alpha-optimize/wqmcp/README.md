@@ -21,9 +21,13 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_ACCEPT_VERSIONS` | `0` | 设为 `1` 时按目录发送带版本号的 Accept 头。默认关闭，因为线上验证过的是不带版本号的请求；先用 `scripts/live_regression.py --accept-versions` 实测，再决定是否打开 |
 | `WQMCP_CORR_MAX_ALPHAS` | `2` | 同一时刻最多让 BRAIN 计算几个 alpha 的相关性（prod / self / power-pool / 提交检查），其余排队 |
 | `WQMCP_CORR_MIN_INTERVAL` | `0.5` | 相关性和提交检查接口的请求之间至少间隔几秒 |
-| `WQMCP_CORR_HOLD_SECONDS` | `90` | 返回 PENDING 之后，名额为这个 alpha 保留多久；期间再查同一个 alpha 不用重新排队 |
-| `WQMCP_CORR_MAX_SLOT_SECONDS` | `600` | 一个 alpha 最多占用名额多久。BRAIN 一直算不完时，到时间就让给排队的 alpha |
-| `WQMCP_CORR_CACHE_SECONDS` | `600` | 已算出的相关性在内存里保留多久，期间重复查询直接返回（结果带 `cached: true`）。设为 `0` 关闭 |
+| `WQMCP_CORR_BACKGROUND` | `1` | 查询在后台继续排队和轮询，不随那次工具调用结束。设为 `0` 时查询随调用结束 |
+| `WQMCP_CORR_QUEUE_SECONDS` | `3600` | 一个查询在后台最多存活多久，超时仍无结果就放弃 |
+| `WQMCP_CORR_MAX_SLOT_SECONDS` | `600` | 一个 alpha 连续占用名额的上限。到时间还没结果就排到队尾，让后面的先算 |
+| `WQMCP_CORR_STALL_SECONDS` | `180` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
+| `WQMCP_CORR_THROTTLED_INTERVAL` | `60` | 被限流期间每个查询的轮询间隔（秒） |
+| `WQMCP_CORR_HOLD_SECONDS` | `90` | 只在关闭后台模式时有用：返回 PENDING 之后名额为这个 alpha 保留多久 |
+| `WQMCP_CORR_CACHE_SECONDS` | `1800` | 已算出的相关性在内存里保留多久，期间重复查询直接返回（结果带 `cached: true`）。设为 `0` 关闭 |
 | `BRAIN_MESSAGE_IMAGE_MODE` | `ignore` | 消息里的内嵌图片默认直接去掉。设为 `placeholder` 时会把图片写到服务端磁盘 |
 | `WQMCP_BASE_URL` | `https://api.worldquantbrain.com` | 只给测试用 |
 
@@ -155,14 +159,23 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 
 **相关性防限流**
 
-同时让 BRAIN 算多个 alpha 的 prod / self 相关性，会让整个账户被限流（429）。所有连到本服务的客户端共用一个队列：
-- 同一时刻只让 `WQMCP_CORR_MAX_ALPHAS` 个 alpha 在算，其余按先后顺序排队。
-  - 在等待时间内排到了就开始算。
-  - 没排到则返回 `status: PENDING`、`queued: true` 和 `queue_position`，此时还没有向 BRAIN 发请求，稍后再调即可。
-- BRAIN 还没算完时名额不释放，再查同一个 alpha 是继续等它，不会新开一个。
-- 轮询间隔从 1 秒逐步拉长到 15 秒。BRAIN 在计算期间一直回 `Retry-After: 1`，照着每秒查一次，90 秒就是上百个请求。
-- 同一个 alpha 的相同查询如果同时发生，共用一次轮询；算出的结果缓存 10 分钟。
-- `check_alpha(check="submission")` 也会让 BRAIN 计算相关性，所以走同一个队列。
+同时让 BRAIN 算多个 alpha 的 prod / self 相关性，会让整个账户被限流。BRAIN 限流时不一定返回 429：更常见的是对每个 alpha 都一直回"空内容 + `Retry-After: 1`"，请求越多越不出结果。所有连到本服务的客户端共用一个队列：
+
+- **排队**：同一时刻只让 `WQMCP_CORR_MAX_ALPHAS` 个 alpha 在算，其余按先后顺序等。排队中的 alpha 不会向 BRAIN 发任何请求。
+- **后台慢慢等**：查询提交后在后台继续排队和轮询，和那次工具调用是否还在等无关。
+  - 调用超时先返回 `PENDING`，稍后用同样的参数再调一次即可。
+  - 再调时的回答是三种之一：已有结果（`cached: true`）、正在算（`computing_for_seconds`、`polls`）、还在排队（`queued: true`、`queue_position`）。
+  - 算出的 prod / self 会自动写回 ProdMemo，不需要有人等着。
+- **看队列**：`check_alpha(check="queue")` 不访问 BRAIN，只返回队列现状。每个 PENDING 回答里也带同样的 `queue`，`brain_status` 里是 `correlation_queue`。
+  - `computing`：正在算的 alpha、查的是哪几项、已经算了多久、轮询了几次。
+  - `waiting`：排队的 alpha，按顺序列出位置和已等时长。
+  - `throttled`：当前是否判定为被限流；`max_at_a_time`：当前允许同时算几个。
+- **识别限流并降速**：有 alpha 在算却连续 `WQMCP_CORR_STALL_SECONDS` 秒没有任何结果，或者收到 429，就判定为被限流。
+  - 限流期间只允许 1 个 alpha 新进入计算，每个查询每 `WQMCP_CORR_THROTTLED_INTERVAL` 秒才轮询一次。
+  - BRAIN 一旦返回结果，立即恢复正常速度。
+- **轮流**：一个 alpha 连续占用名额满 `WQMCP_CORR_MAX_SLOT_SECONDS` 还没结果，就排到队尾，后面的先算。
+- 正常情况下轮询间隔从 1 秒逐步拉长到 15 秒；同一个 alpha 的相同查询共用一个任务。
+- `check_alpha(check="submission")` 也会让 BRAIN 计算相关性，所以走同一个队列，但它随调用结束，不在后台继续。
 
 **其他**
 - `list_alphas` 和 `get_activity(kind="diversity-score")` 的日期可以只写 `2026-06-29`。BRAIN 只接受带时区的完整时间，工具会补成当天 00:00:00 或 23:59:59（UTC）。
