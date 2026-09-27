@@ -1903,6 +1903,45 @@ class BrainApiClient:
             return dict(await asyncio.wait_for(asyncio.shield(task), timeout=budget + gate.grace_seconds))
         except asyncio.TimeoutError:
             return gate.describe(alpha_id, kind)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise                      # this call itself was cancelled
+            return {"status": "CANCELLED",
+                    "note": "Taken out of the correlation queue by check_alpha(check=\"cancel\")."}
+
+    async def cancel_correlations(self, target: str) -> Dict[str, Any]:
+        """Take correlation jobs out of the queue: one alpha, "waiting" (everything
+        that has not started) or "all". Only this server's queue and polling stop;
+        a computation BRAIN already started is not stopped by it."""
+        gate = self.correlation_gate
+        target = str(target or "").strip()
+        if not target:
+            raise ValueError('alpha_id is required: an alpha id, "waiting" or "all"')
+        computing = gate.computing()
+        mode = target.lower() if target.lower() in ("all", "waiting") else None
+        picked = [(key, task) for key, task in gate.inflight.items() if not task.done() and (
+            mode == "all" or (mode == "waiting" and key[0] not in computing)
+            or (mode is None and key[0] == target))]
+        cancelled: Dict[str, Dict[str, Any]] = {}
+        for (alpha, kind), task in picked:
+            row = cancelled.setdefault(alpha, {"alpha_id": alpha, "checks": [],
+                                               "was": "computing" if alpha in computing else "waiting"})
+            row["checks"].append(kind)
+            task.cancel()
+        if picked:   # let the jobs leave the queue and give their slots back
+            await asyncio.gather(*[task for _, task in picked], return_exceptions=True)
+        for alpha in cancelled:
+            for key in [k for k in gate._active if k[0] == alpha and k[1] != "check"]:
+                gate.release(*key)
+        out: Dict[str, Any] = {"cancelled": list(cancelled.values()), "queue": gate.snapshot()}
+        if not cancelled:
+            out["note"] = ("Nothing to cancel: no correlation job " +
+                           ("is waiting." if mode == "waiting" else "is queued or running." if mode == "all"
+                            else f"for alpha {target} is queued or running."))
+        elif any(r["was"] == "computing" for r in cancelled.values()):
+            out["note"] = ("This server stopped polling. A computation BRAIN already started goes on "
+                           "on its side; its result is simply not collected.")
+        return out
 
     async def _correlation_job(self, alpha_id: str, kind: str, budget: float) -> Dict[str, Any]:
         """Queue, poll, and (in background mode) go back to the end of the queue
@@ -2067,6 +2106,8 @@ class BrainApiClient:
                     entry["correlation_data"] = r.get("data")
                 if r.get("cached"):
                     entry["cached"] = True      # measured a short while ago
+            elif r["status"] == "CANCELLED":
+                entry["note"] = r.get("note")
             elif r["status"] == "PENDING":
                 entry["retry_after_seconds"] = r.get("retry_after_seconds")
                 entry["note"] = r.get("note") or "Platform is still computing; call again later (not a failure)."
@@ -2077,7 +2118,7 @@ class BrainApiClient:
             checks[name] = entry
 
         statuses = [c["status"] for c in checks.values()]
-        status = "ERROR" if "ERROR" in statuses else ("PENDING" if "PENDING" in statuses else "DONE")
+        status = next((st for st in ("ERROR", "CANCELLED", "PENDING") if st in statuses), "DONE")
         passes = [c.get("passes_check") for c in checks.values()]
         all_passed = all(passes) if status == "DONE" and None not in passes else None
         out = {"alpha_id": alpha_id, "threshold": threshold, "status": status,
@@ -3337,7 +3378,7 @@ async def get_alpha_recordset(alpha_id: str, recordset: Optional[str] = None,
     return {"alpha_id": alpha_id, "recordset": recordset, **data}
 
 
-_CHECK_KINDS = ("submission", "correlation", "prod", "self", "power-pool", "all", "queue")
+_CHECK_KINDS = ("submission", "correlation", "prod", "self", "power-pool", "all", "queue", "cancel")
 
 
 @_tool(READ)
@@ -3357,9 +3398,15 @@ async def check_alpha(alpha_id: str = "", check: str = "submission", wait_second
 
     Args:
         alpha_id: The alpha id (for an RAA use the PARENT id for "submission").
-            Not needed for check="queue".
+            Not needed for check="queue". For check="cancel": an alpha id,
+            "waiting" or "all".
         check:
             "queue" — only show the correlation queue; asks BRAIN nothing.
+            "cancel" — take correlation jobs out of the queue: alpha_id = one
+                alpha (waiting or being computed), "waiting" = every job that has
+                not started, "all" = everything. Returns what was cancelled and
+                the queue afterwards. It stops this server's polling; BRAIN is
+                not told anything. A cancelled alpha can be asked for again.
             "submission" (default) — the same checks as the Submit button: status
                 DONE / PENDING, all_passed, failed / pending / errored names and
                 each check's result / value / limit. When PROD_CORRELATION comes
@@ -3380,6 +3427,8 @@ async def check_alpha(alpha_id: str = "", check: str = "submission", wait_second
         raise ValueError(f"check must be one of {list(_CHECK_KINDS)}, got {check!r}")
     if kind == "queue":
         return brain_client.correlation_gate.snapshot()
+    if kind == "cancel":
+        return await brain_client.cancel_correlations(alpha_id)
     if not str(alpha_id or "").strip():
         raise ValueError("alpha_id is required (only check=\"queue\" works without one)")
     if kind == "submission":

@@ -170,6 +170,12 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
   - `computing`：正在算的 alpha、查的是哪几项、已经算了多久、轮询了几次。
   - `waiting`：排队的 alpha，按顺序列出位置和已等时长。
   - `throttled`：当前是否判定为被限流；`max_at_a_time`：当前允许同时算几个。
+- **取消**：`check_alpha(check="cancel", alpha_id=...)`，返回被取消的条目和取消后的队列。
+  - `alpha_id` 填某个 alpha：取消它，不管它在排队还是正在算。
+  - 填 `"waiting"`：取消所有还没开始算的。
+  - 填 `"all"`：全部取消。
+  - 取消只是让本服务停止排队和轮询。BRAIN 已经开始的计算不会因此停止，只是结果不再被取走。
+  - 正在等这个查询的调用会收到 `status: CANCELLED`。取消之后可以重新提交。
 - **识别限流并降速**：有 alpha 在算却连续 `WQMCP_CORR_STALL_SECONDS` 秒没有任何结果，或者收到 429，就判定为被限流。
   - 限流期间只允许 1 个 alpha 新进入计算，每个查询每 `WQMCP_CORR_THROTTLED_INTERVAL` 秒才轮询一次。
   - BRAIN 一旦返回结果，立即恢复正常速度。
