@@ -26,6 +26,10 @@ os.environ.pop("CREDD_TOKEN", None)
 @pytest.fixture
 def fake():
     FAKE.reset()
+    gate = getattr(getattr(sys.modules.get("platform_functions"), "brain_client", None),
+                   "correlation_gate", None)
+    if gate is not None:
+        gate.reset()   # queue, slots and cached correlations are per test
     yield FAKE
 
 
