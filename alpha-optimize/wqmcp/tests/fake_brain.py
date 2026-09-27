@@ -297,6 +297,10 @@ def _alpha_summary(fb, q, body) -> Response:
 
 @route("GET", r"/users/self/alphas")
 def _list_alphas(fb: FakeBrain, q, body) -> Response:
+    for key in ("dateCreated>", "dateCreated<", "dateSubmitted>", "dateSubmitted<"):
+        # like BRAIN: a bare date is refused
+        if key in q and not re.fullmatch(r"\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}:?\d{2})", str(q[key])):
+            return 400, {}, ["Expected ISO 8601 datetime with timezone"]
     items = fb.state.alphas
     if q.get("stage"):
         items = [a for a in items if a["stage"] == q["stage"]]

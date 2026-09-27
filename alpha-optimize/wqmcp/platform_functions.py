@@ -163,6 +163,154 @@ def _http_error_detail(response: requests.Response, context: str = "") -> str:
     return msg
 
 
+def _poll_delay(retry_after: float, polls: int, remaining: float) -> float:
+    """Seconds to wait before poll number `polls` + 1. BRAIN answers "Retry-After: 1"
+    for as long as a correlation or check is computing (often minutes), and
+    polling every second burns the account's request budget into 429s. So the
+    header is a lower bound and the interval grows 1s -> 15s: quick results
+    are still picked up quickly."""
+    backoff = min(1.6 ** polls, 15.0)
+    return max(1.0, min(max(retry_after, backoff), remaining))
+
+
+# What a PENDING result tells the caller to wait: BRAIN's "1" is a polling hint
+# for a client that is already waiting, not a useful delay before a new tool call.
+_PENDING_RETRY_SECONDS = 10.0
+
+
+class CorrelationGate:
+    """Account-wide admission control for BRAIN's correlation / check endpoints.
+
+    Asking for the prod or self correlation of several alphas at once makes BRAIN
+    answer 429 for the whole account. Every client of this server shares one
+    gate, which keeps the pressure down in four ways:
+
+    - a queue: at most `max_alphas` alphas are being computed at a time; the
+      others wait their turn (first come, first served) inside their own wait
+      budget and report PENDING + queued when it runs out;
+    - a slot stays taken while BRAIN is still computing, also after the tool
+      call that started it returned PENDING (for `hold_seconds` after its last
+      poll), so re-asking later continues that alpha instead of piling on;
+    - a slot is given up after `max_slot_seconds` whatever happens, so a
+      computation BRAIN never finishes cannot block the queue for good;
+    - pacing: requests to these endpoints are at least `min_interval` apart;
+    - finished results are remembered for `cache_seconds`, and identical
+      requests that overlap share one poll.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Settings from the environment, and an empty queue / cache."""
+        env = os.environ.get
+        self.max_alphas = max(1, int(env("WQMCP_CORR_MAX_ALPHAS", "2")))
+        self.min_interval = max(0.0, float(env("WQMCP_CORR_MIN_INTERVAL", "0.5")))
+        self.hold_seconds = max(0.0, float(env("WQMCP_CORR_HOLD_SECONDS", "90")))
+        self.cache_seconds = max(0.0, float(env("WQMCP_CORR_CACHE_SECONDS", "600")))
+        self.max_slot_seconds = max(1.0, float(env("WQMCP_CORR_MAX_SLOT_SECONDS", "600")))
+        self._active: Dict[Tuple[str, str], List[float]] = {}   # (alpha, kind) -> [admitted, last poll]
+        self._waiting: List[Tuple[int, str]] = []         # tickets, oldest first
+        self._tickets = 0
+        self._next_request = 0.0
+        self._cache: "collections.OrderedDict[Tuple[str, str], Tuple[float, Dict[str, Any]]]" = \
+            collections.OrderedDict()
+        self.inflight: Dict[Tuple[str, str], "asyncio.Task"] = {}
+
+    # -- queue ---------------------------------------------------------------
+    def computing(self) -> set:
+        """Alphas BRAIN is (as far as we know) still computing."""
+        now = time.monotonic()
+        for key in [k for k, (_, seen) in self._active.items() if now - seen > self.hold_seconds]:
+            del self._active[key]
+        return {alpha for (alpha, _), (admitted, _) in self._active.items()
+                if now - admitted <= self.max_slot_seconds}
+
+    def enqueue(self, alpha_id: str) -> Tuple[int, str]:
+        self._tickets += 1
+        ticket = (self._tickets, alpha_id)
+        self._waiting.append(ticket)
+        return ticket
+
+    def leave(self, ticket: Tuple[int, str]) -> None:
+        if ticket in self._waiting:
+            self._waiting.remove(ticket)
+
+    def admit(self, ticket: Tuple[int, str], kind: str) -> bool:
+        alpha_id = ticket[1]
+        computing = self.computing()
+        if alpha_id not in computing:
+            if len(computing) >= self.max_alphas:
+                return False
+            ahead = next((t for t in self._waiting if t[1] not in computing), ticket)
+            if ahead[1] != alpha_id:
+                return False   # somebody else has waited longer
+            for key in [k for k in self._active if k[0] == alpha_id]:
+                del self._active[key]   # an expired slot of this alpha: it starts over
+        self.touch(alpha_id, kind)
+        self.leave(ticket)
+        return True
+
+    def touch(self, alpha_id: str, kind: str) -> None:
+        now = time.monotonic()
+        slot = self._active.get((alpha_id, kind))
+        if slot is None:
+            self._active[(alpha_id, kind)] = [now, now]
+        else:
+            slot[1] = now
+
+    def release(self, alpha_id: str, kind: str) -> None:
+        self._active.pop((alpha_id, kind), None)
+
+    def position(self, ticket: Tuple[int, str]) -> int:
+        """1 = next in line; counts the alphas (not requests) waiting ahead."""
+        if ticket not in self._waiting:
+            return 0
+        ahead = {t[1] for t in self._waiting[:self._waiting.index(ticket)]} - {ticket[1]}
+        return len(ahead) + 1
+
+    # -- pacing --------------------------------------------------------------
+    async def pace(self) -> None:
+        now = time.monotonic()
+        at = max(now, self._next_request)
+        self._next_request = at + self.min_interval
+        if at > now:
+            await asyncio.sleep(at - now)
+
+    # -- cache ---------------------------------------------------------------
+    def cached(self, key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+        hit = self._cache.get(key)
+        if hit and time.monotonic() - hit[0] < self.cache_seconds:
+            return hit[1]
+        self._cache.pop(key, None)
+        return None
+
+    def remember(self, key: Tuple[str, str], result: Dict[str, Any]) -> None:
+        if self.cache_seconds <= 0:
+            return
+        self._cache[key] = (time.monotonic(), result)
+        self._cache.move_to_end(key)
+        while len(self._cache) > 200:
+            self._cache.popitem(last=False)
+
+
+_DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_HAS_TZ_RE = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
+
+
+def _iso_datetime(value: Any, end_of_day: bool = False) -> str:
+    """BRAIN's alpha date filters only take ISO 8601 datetimes WITH a timezone
+    (a bare "2026-06-29" is a 400). Accept a plain date too: it becomes the start
+    (or, for an upper bound, the end) of that day in UTC; a datetime without a
+    timezone is read as UTC."""
+    text = str(value).strip()
+    if _DATE_ONLY_RE.fullmatch(text):
+        return f"{text}T{'23:59:59' if end_of_day else '00:00:00'}Z"
+    if "T" in text and not _HAS_TZ_RE.search(text):
+        return text + "Z"
+    return text
+
+
 # Region Agnostic Alpha (RAA): one simulation fans out into up to 4 region
 # children (GLB/USA/ASI/EUR). Only these three pseudo-universes are accepted and
 # delay must be 1; the platform rejects anything else outright.
@@ -482,6 +630,8 @@ class BrainApiClient:
         self._submit_results: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         # Fire-and-forget work (ProdMemo write-backs) kept alive until done.
         self._background: set = set()
+        # One gate for every client of this server: see CorrelationGate.
+        self.correlation_gate = CorrelationGate()
         # Simulations created by this process (newest first), for get_simulation().
         self.recent_simulations: collections.deque = collections.deque(maxlen=50)
     
@@ -582,6 +732,7 @@ class BrainApiClient:
         and {"status": "ERROR", "http_status": n, "error": ...} on any other 4xx.
         """
         deadline = time.monotonic() + max(0.0, min(float(max_wait or 0), 300.0))
+        polls = 0
         while True:
             try:
                 resp = await self._request('get', url)
@@ -602,11 +753,12 @@ class BrainApiClient:
                     return {"status": "ERROR", "error": "non-JSON body", "body": text[:300]}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                out = {"status": "PENDING", "retry_after_seconds": max(ra, 5.0 if busy else 1.0)}
+                out = {"status": "PENDING", "retry_after_seconds": max(ra, _PENDING_RETRY_SECONDS)}
                 if busy:
                     out["busy"] = net_error if resp is None else f"HTTP {resp.status_code}"
                 return out
-            await asyncio.sleep(max(1.0, min(ra or 5.0, remaining)))
+            await asyncio.sleep(_poll_delay(ra, polls, remaining))
+            polls += 1
 
     async def _check_once(self, location: str, compact: bool = True) -> Dict[str, Any]:
         """One status check of a simulation location — single or multi.
@@ -1151,13 +1303,13 @@ class BrainApiClient:
             if alpha_type:
                 params["type"] = alpha_type
             if start_date:
-                params["dateCreated>"] = start_date
+                params["dateCreated>"] = _iso_datetime(start_date)
             if end_date:
-                params["dateCreated<"] = end_date
+                params["dateCreated<"] = _iso_datetime(end_date, end_of_day=True)
             if submission_start_date:
-                params["dateSubmitted>"] = submission_start_date
+                params["dateSubmitted>"] = _iso_datetime(submission_start_date)
             if submission_end_date:
-                params["dateSubmitted<"] = submission_end_date
+                params["dateSubmitted<"] = _iso_datetime(submission_end_date, end_of_day=True)
             if order:
                 params["order"] = order
             if hidden is not None:
@@ -1611,7 +1763,66 @@ class BrainApiClient:
             raise Exception(f"yearly stats failed for {alpha_id}: {r.get('error')}")
         return (r.get("data") or {}) if r["status"] == "DONE" else {}
 
+    async def _wait_for_slot(self, alpha_id: str, kind: str, deadline: float) -> Optional[Dict[str, Any]]:
+        """Queue for a CorrelationGate slot. None = admitted; otherwise the PENDING
+        result to return because the wait budget ran out while still queued."""
+        gate = self.correlation_gate
+        ticket = gate.enqueue(alpha_id)
+        try:
+            while not gate.admit(ticket, kind):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"status": "PENDING", "queued": True, "queue_position": gate.position(ticket),
+                            "retry_after_seconds": 20.0,
+                            "note": (f"Not started yet: {len(gate.computing())} alphas are already being "
+                                     f"computed (at most {gate.max_alphas} at a time, to stay under "
+                                     "BRAIN's rate limit). Call again later.")}
+                await asyncio.sleep(min(1.0, remaining))
+            return None
+        finally:
+            gate.leave(ticket)
+
     async def _poll_correlation(self, alpha_id: str, kind: str, max_wait: float) -> Dict[str, Any]:
+        """Correlation of one alpha through the CorrelationGate: cached result,
+        else join an identical poll already running, else queue for a slot and poll."""
+        gate = self.correlation_gate
+        key = (str(alpha_id), kind)
+        hit = gate.cached(key)
+        if hit is not None:
+            return {**hit, "cached": True}
+        budget = max(0.0, min(float(max_wait or 0), 300.0))
+        task = gate.inflight.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._correlation_job(str(alpha_id), kind, budget))
+            gate.inflight[key] = task
+            task.add_done_callback(
+                lambda t, k=key: gate.inflight.pop(k, None) if gate.inflight.get(k) is t else None)
+        try:
+            # shield: one caller giving up must not cancel the poll others wait on
+            return dict(await asyncio.wait_for(asyncio.shield(task), timeout=budget + 10.0))
+        except asyncio.TimeoutError:
+            return {"status": "PENDING", "retry_after_seconds": _PENDING_RETRY_SECONDS}
+
+    async def _correlation_job(self, alpha_id: str, kind: str, budget: float) -> Dict[str, Any]:
+        gate = self.correlation_gate
+        deadline = time.monotonic() + budget
+        queued = await self._wait_for_slot(alpha_id, kind, deadline)
+        if queued is not None:
+            return queued
+        try:
+            result = await self._poll_correlation_now(alpha_id, kind, max(0.0, deadline - time.monotonic()))
+        except BaseException:
+            gate.release(alpha_id, kind)
+            raise
+        if result["status"] == "PENDING" and not result.get("busy"):
+            gate.touch(alpha_id, kind)      # BRAIN keeps computing: the slot stays taken
+        else:
+            gate.release(alpha_id, kind)
+            if result["status"] == "DONE":
+                gate.remember((alpha_id, kind), result)
+        return result
+
+    async def _poll_correlation_now(self, alpha_id: str, kind: str, max_wait: float) -> Dict[str, Any]:
         """Poll GET /alphas/{id}/correlations/{kind} ("prod" or "self") until it
         settles or max_wait runs out, keeping the three outcomes apart:
 
@@ -1624,7 +1835,11 @@ class BrainApiClient:
         """
         url = f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/correlations/{kind}"
         deadline = time.monotonic() + max(0.0, min(float(max_wait or 0), 300.0))
+        gate = self.correlation_gate
+        polls = 0
         while True:
+            await gate.pace()
+            gate.touch(str(alpha_id), kind)
             try:
                 resp = await self._request('get', url)
             except requests.RequestException as e:
@@ -1638,7 +1853,7 @@ class BrainApiClient:
             if busy and deadline - time.monotonic() <= 0:
                 # Throttled (the catalog lists 429/503 for this polling endpoint):
                 # report "not ready yet", not a failure.
-                return {"status": "PENDING", "retry_after_seconds": ra or 10.0,
+                return {"status": "PENDING", "retry_after_seconds": max(ra, _PENDING_RETRY_SECONDS),
                         "busy": net_error if resp is None else f"HTTP {resp.status_code}"}
             if text and "Retry-After" not in resp.headers:
                 try:
@@ -1654,8 +1869,9 @@ class BrainApiClient:
                             "max": (stats or {}).get("max"), "min": (stats or {}).get("min")}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return {"status": "PENDING", "retry_after_seconds": ra or 10.0}
-            await asyncio.sleep(max(1.0, min(ra or 5.0, remaining)))
+                return {"status": "PENDING", "retry_after_seconds": max(ra, _PENDING_RETRY_SECONDS)}
+            await asyncio.sleep(_poll_delay(ra, polls, remaining))
+            polls += 1
 
     async def get_production_correlation(self, alpha_id: str, max_wait: float = 100) -> Dict[str, Any]:
         """Raw production-correlation payload. {} = platform still computing
@@ -1725,11 +1941,14 @@ class BrainApiClient:
                 entry["top"] = _correlation_top_rows(r.get("data") or {}, 3)
                 if include_data:
                     entry["correlation_data"] = r.get("data")
-                if mx is not None and kind in ("prod", "self"):  # ProdMemo keeps prod/self only
+                if r.get("cached"):
+                    entry["cached"] = True      # measured within the last few minutes
+                elif mx is not None and kind in ("prod", "self"):  # ProdMemo keeps prod/self only
                     await self._record_platform_corr(alpha_id, kind, mx, r.get("min"))
             elif r["status"] == "PENDING":
                 entry["retry_after_seconds"] = r.get("retry_after_seconds")
-                entry["note"] = "Platform is still computing; call again later (not a failure)."
+                entry["note"] = r.get("note") or "Platform is still computing; call again later (not a failure)."
+                entry.update({k: r[k] for k in ("queued", "queue_position", "busy") if k in r})
             else:
                 entry.update({k: r[k] for k in ("error", "http_status", "body") if k in r})
             checks[name] = entry
@@ -1752,12 +1971,42 @@ class BrainApiClient:
         await self.ensure_authenticated()
         url = f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/check"
         deadline = time.monotonic() + max(0.0, min(float(max_wait or 0), 300.0))
-        data: Any = None
+        # /check makes BRAIN compute the self and prod correlation too, so it
+        # queues with the correlation endpoints.
+        gate = self.correlation_gate
+        queued = await self._wait_for_slot(str(alpha_id), "check", deadline)
+        if queued is not None:
+            return {"alpha_id": alpha_id, **queued}
+        try:
+            data = await self._poll_check(url, alpha_id, deadline)
+        finally:
+            gate.release(str(alpha_id), "check")
+        if isinstance(data, dict) and data.get("status") in ("ERROR", "PENDING") and "alpha_id" in data:
+            if data["status"] == "PENDING":
+                gate.touch(str(alpha_id), "check")   # still computing on BRAIN's side
+            return data
+        report = await self._submission_report(alpha_id, data, max_wait)
+        if report.get("status") == "PENDING":
+            gate.touch(str(alpha_id), "check")       # its correlation checks are still running
+        return report
+
+    async def _poll_check(self, url: str, alpha_id: str, deadline: float) -> Any:
+        """GET /alphas/{id}/check until it settles: the JSON body, or an
+        {"alpha_id", "status": ERROR / PENDING, ...} result."""
+        gate = self.correlation_gate
+        polls = 0
         while True:
+            await gate.pace()
+            gate.touch(str(alpha_id), "check")
             resp = await self._request('get', url)
             if resp.status_code >= 400:
-                return {"alpha_id": alpha_id, "status": "ERROR", "http_status": resp.status_code,
-                        "error": _http_error_detail(resp)}
+                out = {"alpha_id": alpha_id, "status": "ERROR", "http_status": resp.status_code,
+                       "error": _http_error_detail(resp)}
+                if "QUICK" in (resp.text or ""):
+                    out["note"] = ("This alpha came from a QUICK simulation, which BRAIN cannot check "
+                                   "or submit. Re-run the expression with simulation_mode=\"FULL\" "
+                                   "(or omit simulation_mode) and check the new alpha.")
+                return out
             ra = _retry_after_seconds(resp)
             text = (resp.text or "").strip()
             if text and "Retry-After" not in resp.headers:
@@ -1766,13 +2015,17 @@ class BrainApiClient:
                 except ValueError:
                     return {"alpha_id": alpha_id, "status": "ERROR", "error": "non-JSON body",
                             "body": text[:300]}
-                break
+                return data
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return {"alpha_id": alpha_id, "status": "PENDING", "retry_after_seconds": ra or 10.0,
+                return {"alpha_id": alpha_id, "status": "PENDING", "retry_after_seconds": max(ra, _PENDING_RETRY_SECONDS),
                         "note": "Platform is still running the checks; call again later."}
-            await asyncio.sleep(max(1.0, min(ra or 5.0, remaining)))
+            await asyncio.sleep(_poll_delay(ra, polls, remaining))
+            polls += 1
 
+    async def _submission_report(self, alpha_id: str, data: Any, max_wait: float) -> Dict[str, Any]:
+        """Summarise a finished /check body; fall back to the prod-correlation
+        endpoint when /check lost that value."""
         is_ = (data or {}).get("is") or {}
         checks = [c for c in (is_.get("checks") or []) if isinstance(c, dict)]
         rows = [{k: c.get(k) for k in ("name", "result", "value", "limit") if c.get(k) is not None}
@@ -1838,6 +2091,8 @@ class BrainApiClient:
                 "combo": {"description": combo_desc} if combo_desc is not None else None,
             }
             data = {k: v for k, v in option_map.items() if v is not None}
+            if name is not None and not name.strip():
+                data["name"] = None   # BRAIN refuses "" ("may not be blank"); null clears it
 
             response = await self._request('patch', f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}", json=data)
             response.raise_for_status()
@@ -2864,8 +3119,10 @@ async def list_alphas(
         alpha_type: "REGULAR", "SUPER", "RA_PARENT" or "RA_CHILD"
         limit / offset: page size (1-100) and number of alphas to skip; the answer
             carries count (total) and next_offset (None on the last page)
-        start_date / end_date: creation-date window, e.g. "2025-01-01T00:00:00Z"
-        submission_start_date / submission_end_date: submission-date window (OS)
+        start_date / end_date: creation-date window: "2025-01-01" (whole days, UTC)
+            or a full ISO datetime such as "2025-01-01T00:00:00-04:00"
+        submission_start_date / submission_end_date: submission-date window (OS),
+            same formats
         order: e.g. "-dateCreated", "-dateSubmitted", "name" (prefix - = descending)
         hidden: True = only hidden alphas, False = only visible ones, None = both
         compact: One short row per alpha (metrics, failed checks, settings, code);
@@ -3198,8 +3455,8 @@ async def get_activity(kind: str, grouping: Optional[str] = None, start_date: Op
             "payments" — base payments (daily) and other payments (quarterly,
                 competitions, referrals).
             "diversity-score" — client-side estimate of the value-factor trend for
-                the REGULAR alphas submitted between start_date and end_date (ISO,
-                both required): diversity_score = S_A * S_P * S_H with N, A, P,
+                the REGULAR alphas submitted between start_date and end_date
+                (YYYY-MM-DD or ISO datetime, both required): diversity_score = S_A * S_P * S_H with N, A, P,
                 P_max and per-pyramid counts.
             "profile" — your full record (user_id "self") or another user's public
                 profile.

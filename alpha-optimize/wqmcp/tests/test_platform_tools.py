@@ -248,7 +248,8 @@ async def test_raa_single_concurrent_and_rules(mcp_session, fake):
         sweep = await call(s, "create_simulation", expressions="rank(x)", type="ra",
                            per_alpha_settings=[{"universe": "large"}, {"universe": "SMALL"}])
         assert sweep["mode"] == "concurrent" and sweep["status"] == "SUBMITTED"
-        assert [b["settings"]["universe"] for b in posted(fake)[1:]] == ["LARGE", "SMALL"]
+        # concurrent POSTs race each other, so only the set of universes is fixed
+        assert sorted(b["settings"]["universe"] for b in posted(fake)[1:]) == ["LARGE", "SMALL"]
 
         for args, msg in (({"universe": "TOP3000"}, "RAA universe must be one of"),
                           ({"region": "USA"}, "region='ALL'"),
@@ -639,3 +640,30 @@ async def test_credd_backoff_does_not_stampede(client, fake):
                                    return_exceptions=True)
     assert all(isinstance(r, Exception) for r in results)
     assert fake.state.credd_calls == 2 and time.monotonic() - t0 < 3
+
+
+async def test_plain_dates_become_iso_datetimes(mcp_session, fake):
+    async with mcp_session() as s:
+        page = await call(s, "list_alphas", stage="OS", limit=1, start_date="2026-06-29",
+                          end_date="2026-09-27", submission_start_date="2026-06-29T08:00:00",
+                          submission_end_date="2026-09-27T23:00:00-04:00")
+        assert page["count"] == 250
+        score = await call(s, "get_activity", kind="diversity-score", start_date="2026-06-29",
+                           end_date="2026-09-27")
+        assert "error" not in score
+    q = fake.state.calls("GET", "/users/self/alphas")
+    assert q[0]["query"]["dateCreated>"] == "2026-06-29T00:00:00Z"
+    assert q[0]["query"]["dateCreated<"] == "2026-09-27T23:59:59Z"
+    assert q[0]["query"]["dateSubmitted>"] == "2026-06-29T08:00:00Z"
+    assert q[0]["query"]["dateSubmitted<"] == "2026-09-27T23:00:00-04:00"
+    assert q[1]["query"]["dateSubmitted<"] == "2026-09-27T23:59:59Z"
+
+
+def test_poll_delay_grows_and_respects_bounds():
+    import platform_functions as pf
+    waits = [pf._poll_delay(1.0, n, 300) for n in range(12)]
+    assert waits[0] == 1.0 and waits == sorted(waits) and waits[-1] == 15.0
+    assert sum(1 for _ in waits) and sum(waits[:9]) > 60   # <= ~10 polls per 90s, not 90
+    assert pf._poll_delay(30.0, 0, 300) == 30.0             # a longer Retry-After wins
+    assert pf._poll_delay(1.0, 8, 4.0) == 4.0               # never past the wait budget
+    assert pf._poll_delay(0.0, 0, 0.2) == 1.0

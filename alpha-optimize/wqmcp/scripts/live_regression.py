@@ -157,11 +157,19 @@ async def main() -> int:
 
         for stage in ("IS", "OS"):
             res = await run.check(f"list_alphas(stage={stage})",
-                                  lambda s=stage: T("list_alphas", stage=s, limit=5),
+                                  lambda s=stage: T("list_alphas", stage=s, limit=50, compact=False),
                                   ok(lambda p: "results" in p, "results"), "ALPHA-9")
             if isinstance(res, dict) and res.get("results"):
-                ctx[stage] = res["results"][0]["id"]
+                # BRAIN refuses /check for QUICK-mode alphas, so prefer a FULL one.
+                full = [a for a in res["results"]
+                        if (a.get("settings") or {}).get("simulationMode") in (None, "FULL")
+                        and a.get("type") == "REGULAR"]
+                ctx[stage] = (full or res["results"])[0]["id"]
                 ctx[f"count_{stage}"] = res.get("count")
+                quick = [a for a in res["results"]
+                         if (a.get("settings") or {}).get("simulationMode") == "QUICK"]
+                if quick:
+                    ctx.setdefault("quick", quick[0]["id"])
         if "count_IS" in ctx:
             far = (today + dt.timedelta(days=3650)).isoformat()
             async def probe():
@@ -192,6 +200,16 @@ async def main() -> int:
             await run.check("check_alpha(submission)",
                             lambda: T("check_alpha", alpha_id=alpha, wait_seconds=args.wait),
                             ok(lambda p: p["status"] in ("DONE", "PENDING"), "status"), "ALPHA-1")
+            if ctx.get("quick"):
+                await run.check("check_alpha(submission) on a QUICK alpha explains itself",
+                                lambda: T("check_alpha", alpha_id=ctx["quick"], wait_seconds=5),
+                                lambda p: ("PASS", "ERROR with a FULL-mode hint")
+                                if p.get("status") == "ERROR" and "FULL" in str(p.get("note"))
+                                else ("FAIL", json.dumps(p, ensure_ascii=False)[:200]))
+            await run.check("list_alphas(date-only window)",
+                            lambda: T("list_alphas", stage="OS", limit=1, submission_start_date=d90,
+                                      submission_end_date=today.isoformat()),
+                            ok(lambda p: isinstance(p.get("count"), int), "plain dates accepted"), "ALPHA-12")
             await run.check("get_alpha_performance", lambda: T("get_alpha_performance", alpha_id=alpha),
                             ok(lambda p: isinstance(p, dict), "before/after"), "ANLY-6")
 
