@@ -759,8 +759,9 @@ class ProdMemoService:
         return out
 
     @staticmethod
-    def _calibration_pairs(snapshot):
-        """(local POOL max, platform Prod max) for every alpha that has both."""
+    def _calibration_pairs(snapshot, region=None):
+        """(local POOL max, platform Prod max) for every alpha that has both;
+        only the alphas of `region` when one is given."""
         pool_by_id = {}
         for rec in snapshot['localCorrs']:
             result = rec.get('result') or {}
@@ -768,25 +769,60 @@ class ProdMemoService:
                 value = finite_number(result.get('max'))
                 if value is not None:
                     pool_by_id[rec['alphaId']] = value
+        region_of = {}
+        if region:
+            region_of = {a['id']: str((a.get('settings') or {}).get('region') or '').upper()
+                         for a in snapshot.get('alphas') or []}
         pairs = []
         for alpha_id, buckets in snapshot['platformCorrs'].items():
             prod = finite_number(((buckets or {}).get('prod') or {}).get('max'))
-            if prod is not None and alpha_id in pool_by_id:
-                pairs.append((pool_by_id[alpha_id], prod))
+            if prod is None or alpha_id not in pool_by_id:
+                continue
+            if region and region_of.get(alpha_id) != str(region).upper():
+                continue
+            pairs.append((pool_by_id[alpha_id], prod))
         return pairs
 
-    def _prod_estimate(self, snapshot, pool_record):
-        """prod_est from this alpha's fresh local POOL max, or None."""
+    async def platform_corr(self, alpha_id, corr_type='prod'):
+        """The stored platform value {'max', 'min', 'updated', 'source'} or None."""
+        await self.ensure_ready()
+        snapshot = await self._db(self.dao.light_snapshot)
+        stat = ((snapshot['platformCorrs'].get(alpha_id) or {}).get(corr_type)) or None
+        if not stat or finite_number(stat.get('max')) is None:
+            return None
+        return stat
+
+    def _prod_estimate(self, snapshot, pool_record, region=None):
+        """prod_est from this alpha's fresh local POOL max, or None.
+
+        Fitted on the alphas of the same region when it has PROD_EST_MIN_FIT of
+        them: regions differ a lot (EUR sits ~0.09 above the all-region line, and
+        there pool barely moves prod at all). `range` is the 90% band of the fit's
+        own residuals. Too few calibration points: no single value, only a note."""
         result = (pool_record or {}).get('result') or {}
         pool = finite_number(result.get('max')) if result.get('available') else None
         if pool is None or (pool_record or {}).get('stale'):
             return None
-        pairs = self._calibration_pairs(snapshot)
+        region = str(region or '').upper() or None
+        pairs = self._calibration_pairs(snapshot, region) if region else []
+        scope = region
+        if len(pairs) < PROD_EST_MIN_FIT:
+            pairs, scope = self._calibration_pairs(snapshot), 'ALL'
         a, b, n, resid_sd, source = fit_prod_estimate(pairs)
+        if source != 'fitted':
+            return {'value': None, 'pool': pool, 'calibration_points': n, 'confidence': 'low',
+                    'over_threshold': None,
+                    'note': (f'Only {n} alphas have both a measured Prod and a local pool value: too few to '
+                             'estimate Prod. Measure it on the platform.')}
         value = max(-1.0, min(1.0, a + b * pool))
+        spread = 1.645 * resid_sd
         out = {'value': round(value, 4), 'pool': pool, 'a': round(a, 4), 'b': round(b, 4),
-               'calibration_points': n, 'resid_sd': None if resid_sd is None else round(resid_sd, 4),
+               'region': scope, 'calibration_points': n, 'resid_sd': round(resid_sd, 4),
+               'range': [round(max(-1.0, value - spread), 3), round(min(1.0, value + spread), 3)],
                'source': source, 'over_threshold': value > PROD_THRESHOLD}
+        if region and scope == 'ALL':
+            out['region_fallback'] = (f'fewer than {PROD_EST_MIN_FIT} calibration points in {region}: '
+                                      'fitted on all regions, which can be off by 0.1 for one region')
         # The estimate reads Prod off the closest alpha of the local pool. When the
         # pool holds nothing close (a data axis it has never seen), there is nothing
         # to read it off: measured Prod was .76-.96 where this said .50-.61.
@@ -797,12 +833,17 @@ class ProdMemoService:
             reasons.append(f'the closest pool alpha correlates only {pool:.2f}')
         if floor is not None and pool < floor:
             reasons.append(f'pool {pool:.2f} is below what the estimate was calibrated on (from {floor:.2f})')
+        if abs(b) < 0.2:
+            reasons.append(f'in {scope} the pool value barely moves Prod (slope {b:.2f}): the estimate is '
+                           'about the average Prod there, not specific to this alpha')
+        if spread >= 0.25:
+            reasons.append(f'the fit is loose (90% band ±{spread:.2f})')
         out['confidence'] = 'low' if reasons else 'normal'
         if reasons:
-            out['over_threshold'] = None
-            out['note'] = ('Low confidence: ' + '; '.join(reasons) + '. The local pool has no close peer '
-                           '(probably no alpha on the same data), so Prod can be far HIGHER than this '
-                           'value. Run the platform check instead of trusting it.')
+            out['over_threshold'] = None if out['range'][0] <= PROD_THRESHOLD < out['range'][1] \
+                else out['over_threshold']
+            out['note'] = ('Low confidence: ' + '; '.join(reasons) + '. Prod can be well outside this '
+                           'value; run the platform check before relying on it.')
         return out
 
     async def record_platform_corr(self, alpha_id, corr_type, max_value, min_value=None,
@@ -860,6 +901,7 @@ class ProdMemoService:
             'recommendation': full['recommendation'],
             'prod_est': est['value'] if est else None,
             'prod_est_confidence': est['confidence'] if est else None,
+            'prod_est_range': est.get('range') if est else None,
             'pool': (local.get('pool') or {}).get('max'),
             'self': (local.get('self') or {}).get('max'),
             'prod_lower_bound': (local.get('prod_lower_bound') or {}).get('max'),
@@ -893,7 +935,9 @@ class ProdMemoService:
         lower_max = finite_number(lower_result.get('max')) if lower_result.get('available') else None
         lower_fresh = bool(lower and not lower['stale'])
 
-        prod_est = self._prod_estimate(snapshot, local.get('POOL'))
+        region = next((((a.get('settings') or {}).get('region')) for a in snapshot['alphas']
+                       if a['id'] == alpha_id), None)
+        prod_est = self._prod_estimate(snapshot, local.get('POOL'), region)
 
         if lower_max is None or not lower_fresh:
             recommendation = 'insufficient_data' if lower_max is None and prod_est is None else 'check'

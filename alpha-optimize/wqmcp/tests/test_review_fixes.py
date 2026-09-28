@@ -224,7 +224,8 @@ async def test_raa_with_unfinished_children_is_not_complete(client, fake):
     ("bucket(rank(cap), range='0.1,1,0.1')", True),
     ("rank(x) # a note with (", True),
     ("ts_backfill(x, lookback=250)", True),
-    ("ts_backfill(x, 250)", False),
+    ("ts_backfill(x, 250)", True),
+    ("hump(x, 0.01)", False),
     ("rank((x)", False),
 ])
 def test_lint(expr, ok):

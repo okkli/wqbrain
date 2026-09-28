@@ -100,7 +100,7 @@ ALPHA = {
 def test_lint_flags_positional_optional_args_and_parens():
     assert pf._lint_expression("ts_backfill(x, lookback=250)") == []
     assert pf._lint_expression("ts_rank(x, 20)") == []
-    assert "lookback=" in pf._lint_expression("ts_backfill(x, 250)")[0]
+    assert "hump=" in pf._lint_expression("hump(x, 0.01)")[0]
     assert "hump=" in pf._lint_expression("rank(hump(x, 0.01))")[0]
     assert pf._lint_expression("rank(x") == ["unbalanced parentheses"]
     assert pf._lint_expression('bucket(rank(x), range="0,1,0.1")') == []
@@ -564,10 +564,13 @@ async def test_nothing_is_sent_during_a_cooldown_and_the_queue_survives(bg_clien
     assert entry["cooling_down"] is True and entry["resumes_in_seconds"] >= 1 and entry["queue_position"] == 2
     assert out["queue"]["cooling_down"] and out["queue"]["computing"] == []
     assert [r["alpha_id"] for r in out["queue"]["waiting"]] == ["A1", "B2"]   # A1 keeps its turn
-    check = await client.get_submission_check("C3", max_wait=30)
-    assert check["status"] == "PENDING" and check["cooling_down"] is True
+    corr_calls = lambda: [c for c in s.calls if "/correlations/" in c[1]]  # noqa: E731
+    sent_corr = len(corr_calls())
+    check = await client.get_submission_check("C3", max_wait=30)  # the check lane keeps working
+    assert check["status"] == "DONE" and check["is_passed"] is True and "cooling_down" not in check
     await client.real_sleep(0.2)
-    assert len(s.calls) == sent and gate.cooling() > 0            # silence during the cooldown
+    assert len(corr_calls()) == sent_corr and gate.cooling() > 0  # no correlation request in the cooldown
+    sent = len(s.calls)
 
     answers["on"] = True
     await until(client, lambda: gate.cached(("A1", "prod")) and gate.cached(("B2", "prod")))
@@ -656,3 +659,176 @@ async def test_a_pending_submission_check_does_not_hold_the_lane(client):
     second = await client.get_submission_check("B2", max_wait=0)      # straight away, not queued
     assert second["status"] == "ERROR" and "FULL" in second["note"] and "queued" not in second
     assert len(s.calls) == 2
+
+
+# --- field report 2026-09-28: P0 ---------------------------------------------------
+
+def test_priority_aging_and_abandon(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(pf.time, "monotonic", lambda: clock[0])
+    gate = pf.CorrelationGate()
+    gate.aging_seconds, gate.abandon_seconds = 300.0, 1200.0
+    gate.enqueue("OLD", "prod"); gate.enqueue("OLD", "self")          # prod + self, asked first
+    clock[0] += 10
+    gate.enqueue("NEW", "prod")                                        # prod only, later
+    assert [t[1] for t in gate._order("corr")][0] == "NEW"             # prod-only goes first ...
+    clock[0] += 300
+    assert [t[1] for t in gate._order("corr")][0] == "OLD"             # ... until the other waited 5 min
+    gate.enqueue("VIP", "self"); gate.asked("VIP", "self", "high")
+    assert [t[1] for t in gate._order("corr")][0] == "VIP"             # priority beats both
+    gate.asked("OLD", "prod")
+    assert not gate.abandoned("OLD", "prod")
+    clock[0] += 1201
+    assert gate.abandoned("OLD", "prod") and not gate.abandoned("NEVER", "prod")
+
+
+def test_a_cooldown_does_not_stop_the_check_lane(monkeypatch):
+    gate = pf.CorrelationGate()
+    gate.start_cooldown(300, reason="test")
+    assert gate.limit("corr") == 0 and gate.limit("check") == gate.check_max
+    assert not gate.admit(gate.enqueue("A1", "prod"), "prod")
+    assert gate.admit(gate.enqueue("B2", "check"), "check")
+    assert "cooling_down" not in gate.describe("C3", "check")
+    assert gate.describe("C3", "prod")["cooling_down"] is True
+    before = gate._pending_since
+    gate.touch("B2", "check", polled=True)
+    assert gate._pending_since == before                               # checks do not start the stall clock
+
+
+@pytest.mark.asyncio
+async def test_abandoned_queued_job_is_dropped(bg_client):
+    client, gate = bg_client, bg_client.correlation_gate
+    gate.max_alphas, gate.abandon_seconds = 1, 0.05
+    s = install(client, {"/correlations/prod": [COMPUTING()]})
+    await client.check_correlation("A1", "prod", max_wait=0, estimate=False)
+    await client.check_correlation("B2", "prod", max_wait=0, estimate=False)
+    assert [r["alpha_id"] for r in gate.snapshot()["waiting"]] == ["B2"]
+    await until(client, lambda: not gate.snapshot()["waiting"])
+    assert not [c for c in s.calls if "/alphas/B2/" in c[1]]           # dropped without a request
+    assert ("B2", "prod") not in gate.inflight
+
+
+@pytest.mark.asyncio
+async def test_partial_correlation_result_is_returned(client):
+    install(client, {"/correlations/prod": [resp(200, {"max": 0.81})], "/correlations/self": [COMPUTING()]})
+    out = await client.check_correlation("A1", "both", max_wait=0, estimate=False)
+    assert out["status"] == "PARTIAL" and out["checks"]["production"]["max_correlation"] == 0.81
+    assert out["checks"]["self"]["status"] == "PENDING"
+    assert out["all_passed"] is False                                   # 0.81 already fails it
+    install(client, {"/correlations/prod": [resp(200, {"max": 0.31})], "/correlations/self": [COMPUTING()]})
+    client.correlation_gate.reset()
+    out = await client.check_correlation("A2", "both", max_wait=0, estimate=False)
+    assert out["status"] == "PARTIAL" and out["all_passed"] is None
+
+
+@pytest.mark.asyncio
+async def test_check_reports_is_results_while_brain_still_computes(client):
+    running = {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "value": 1.9, "limit": 1.58},
+                                 {"name": "LOW_FITNESS", "result": "FAIL", "value": 0.8, "limit": 1.0},
+                                 {"name": "PROD_CORRELATION", "result": "PENDING"}]}}
+    install(client, {"/check": [resp(200, running, {"Retry-After": "1"})]})
+    out = await client.get_submission_check("A1", max_wait=0)
+    assert out["status"] == "PENDING" and out["is_passed"] is False and out["failed"] == ["LOW_FITNESS"]
+    assert out["pending"] == ["PROD_CORRELATION"]
+    install(client, {"/check": [resp(200, b"", {"Retry-After": "1"})]})      # nothing to show yet
+    out = await client.get_submission_check("A2", max_wait=0)
+    assert out["status"] == "PENDING" and "is_passed" not in out
+
+
+@pytest.mark.asyncio
+async def test_prod_error_uses_a_measured_value_and_derives_a_verdict(client, monkeypatch):
+    errored = {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "value": 1.9, "limit": 1.58},
+                                 {"name": "CLUSTER_TEST", "result": "WARNING"},
+                                 {"name": "PROD_CORRELATION", "result": "ERROR"}]}}
+    s = install(client, {"/check": [resp(200, errored)]})
+
+    async def stored(alpha_id, kind="prod"):
+        return {"max": 0.6642, "updated": 1727500000000} if alpha_id == "A1" else None
+    monkeypatch.setattr(pf.prodmemo_client, "platform_corr", stored)
+    out = await client.get_submission_check("A1", max_wait=0)
+    assert out["all_passed"] is None and out["is_passed"] is True
+    assert out["prod_fallback"]["max_correlation"] == 0.6642 and "ProdMemo" in out["prod_fallback"]["source"]
+    assert out["all_passed_with_fallback"] is True and out["prod_correlation"] == 0.6642
+    assert not [c for c in s.calls if "/correlations/" in c[1]]        # no request needed for it
+
+    client.correlation_gate.remember(("A3", "prod"), {"status": "DONE", "max": 0.74})
+    out = await client.get_submission_check("A3", max_wait=0)
+    assert "cache" in out["prod_fallback"]["source"] and out["all_passed_with_fallback"] is False
+
+
+@pytest.mark.asyncio
+async def test_pending_prod_comes_with_a_local_estimate(client, monkeypatch):
+    async def check(alpha_id, run_platform_check=False):
+        return {"alpha_id": alpha_id, "recommendation": "check", "platform_status": "not_requested",
+                "platform": {}, "local": {"pool": {"max": 0.31}, "self": {"max": 0.4}},
+                "prod_est": {"value": 0.73, "confidence": "low", "range": [0.6, 0.86], "region": "EUR",
+                             "note": "slope 0.03"}}
+    monkeypatch.setattr(pf.prodmemo_client, "check", check)
+    install(client, {"/correlations/prod": [COMPUTING()]})
+    out = await client.check_correlation("A1", "prod", max_wait=0)
+    local = out["local_estimate"]
+    assert local["prod_est"] == 0.73 and local["range"] == [0.6, 0.86] and local["region"] == "EUR"
+    assert local["note"].startswith("ESTIMATE ONLY") and "slope 0.03" in local["note"]
+
+
+# --- field report 2026-09-28: P1-1 / P1-2 lint --------------------------------------
+
+OPS = {"rank": "Cross Sectional", "ts_rank": "Time Series", "ts_backfill": "Time Series", "vec_avg": "Vector",
+       "vec_min": "Vector", "densify": "Arithmetic", "bucket": "Transformational", "group_neutralize": "Group",
+       "group_rank": "Group", "group_mean": "Group", "days_from_last_change": "Time Series", "add": "Arithmetic",
+       "hump": "Transformational"}
+TYPES = {"close": "MATRIX", "volume": "MATRIX", "cap": "MATRIX", "subindustry": "GROUP", "industry": "GROUP",
+         "evt": "VECTOR"}
+
+
+@pytest.mark.parametrize("expr, expected", [
+    ("vec_median(evt)", "unknown operator vec_median() (did you mean vec_avg, vec_min?)"),
+    ("days_from_last_change(evt)", "VECTOR field 'evt' is used in days_from_last_change()"),
+    ("a = evt; ts_rank(a, 20)", "VECTOR field 'evt' (via a) is used in ts_rank()"),
+    ("densify(rank(close))", "densify: argument 1 'rank(close)' must be a group"),
+    ("densify(close)", "densify: argument 1 'close' must be a group"),
+    ("group_rank(close, rank(volume))", "group_rank: argument 2 'rank(volume)' must be a group"),
+    ("group_mean(close, volume, close * 2)", "group_mean: argument 3 'close * 2' must be a group"),
+    ("g = rank(cap); group_neutralize(close, g)", "group_neutralize: argument 2 'g' must be a group"),
+])
+def test_semantic_lint_finds_what_brain_refuses(expr, expected):
+    issues = pf._semantic_issues(expr, OPS, TYPES)
+    assert any(i.startswith(expected) for i in issues), issues
+
+
+@pytest.mark.parametrize("expr", [
+    "group_neutralize(rank(close), subindustry)",
+    "group_neutralize(rank(close), bucket(rank(cap), range=\"0,1,0.1\"))",
+    "g = bucket(rank(cap), range=\"0,1,0.1\"); group_rank(close, g)",
+    "group_mean(close, volume, industry)",
+    "densify(industry)",
+    "ts_rank(vec_avg(evt), 20)",
+    "a = evt; ts_rank(vec_avg(a), 20)",
+    "rank(ts_backfill(vec_avg(evt), lookback=20))",
+    "group_neutralize(close, unknown_thing)",        # unknown type: no verdict
+    "add(close, volume, filter=true)",
+    "stats = generate_stats(alpha); stats.returns",  # methods are no operators
+])
+def test_semantic_lint_leaves_good_expressions_alone(expr):
+    ops = {**OPS, "generate_stats": "Special"}
+    assert pf._semantic_issues(expr, ops, TYPES) == []
+
+
+def test_without_the_operator_list_names_are_not_judged():
+    assert pf._semantic_issues("vec_median(close)", {}, TYPES) == []
+
+
+@pytest.mark.parametrize("expr, count", [
+    ("rank(close)", 1), ("rank(-returns)", 2), ("rank(close) - rank(open)", 3),
+    ("ts_backfill(close, 10)", 1), ("a = rank(close); b = a * 2; -b", 3),
+    ("group_neutralize(rank(close), bucket(rank(cap), range=\"0,1,0.1\"))", 4),
+    ("if_else(close > open, 1, -1)", 3), ("rank(close) * 1e-5", 2),
+    ("hump(x, hump=0.01)", 1),
+])
+def test_estimated_ops_counts_like_brain(expr, count):
+    assert pf._estimated_ops(expr) == count
+
+
+def test_ts_backfill_takes_lookback_positionally():
+    assert pf._lint_expression("ts_backfill(close, 10)") == []
+    assert pf._lint_expression("ts_backfill(close, 10, 2)")[0].startswith("ts_backfill: argument 3")

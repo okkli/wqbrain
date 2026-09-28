@@ -429,26 +429,45 @@ def test_fit_prod_estimate_defaults_until_enough_points_then_refits():
     assert abs(a - 0.3) < 1e-9 and abs(b - 2.0) < 1e-9 and sd < 1e-9
 
 
+def calibrated(dao, region='USA', n=10, slope=0.5, base=0.3, pool_from=0.3):
+    """n alphas of `region` with a local POOL value and a measured Prod on a line."""
+    for i in range(n):
+        alpha_id = f'cal-{region}-{i}'
+        raw = {'id': alpha_id, 'name': alpha_id, 'stage': 'OS', 'status': 'ACTIVE',
+               'dateSubmitted': '2026-08-01T00:00:00+00:00',
+               'settings': {'region': region, 'universe': 'TOP3000', 'delay': 1, 'instrumentType': 'EQUITY'},
+               'classifications': [{'id': 'REGULAR:REGULAR'}], 'is': {'sharpe': 1.0}}
+        dao.save_alpha_batch([normalize_alpha_record(raw, True)])
+        pool = pool_from + i * 0.04
+        dao.local[(alpha_id, 'POOL')] = {'alphaId': alpha_id, 'corrType': 'POOL', 'groupKey': '',
+                                         'result': {'available': True, 'max': pool},
+                                         'algorithmVersion': 0, 'inputFingerprint': '',
+                                         'calculatedAt': None}
+        dao.save_platform_corr(alpha_id, 'prod', {'max': round(base + slope * pool + (0.01 if i % 2 else -0.01), 4),
+                                                  'min': 0, 'updated': 1, 'source': 'platform'})
+
+
 @pytest.mark.asyncio
 async def test_check_reports_prod_est_from_local_pool_and_compacts():
     dao = StubDao()
     seed_alpha(dao, 'target', values=(0.0, 1.0, 3.0, 6.0))
     seed_alpha(dao, 'pp', values=(0.0, 2.0, 6.0, 12.0),
                classifications=[{'id': 'POWER_POOL:POWER_POOL_ELIGIBLE'}])
+    calibrated(dao, 'USA', slope=0.5, base=0.3)
     service = make_service(StubFetcher(total=2), dao)
 
     full = await service.check('target')
     pool = full['local']['pool']['max']
     assert pool is not None
     est = full['prod_est']
-    assert est['source'] == 'default'
-    assert est['value'] == round(min(1.0, 0.428 + 1.139 * pool), 4)
+    assert est['source'] == 'fitted' and est['region'] == 'USA' and est['calibration_points'] == 10
+    assert abs(est['value'] - (0.3 + 0.5 * pool)) < 0.02
+    assert est['range'][0] < est['value'] < est['range'][1]
 
     row = service.compact_check(full)
-    assert row['prod_est'] == est['value'] and row['pool'] == pool
-    assert set(row) == {'alpha_id', 'recommendation', 'prod_est', 'prod_est_confidence', 'pool',
-                        'self', 'prod_lower_bound', 'platform_prod', 'platform_status'}
-    assert est['confidence'] == 'normal' and 'note' not in est
+    assert row['prod_est'] == est['value'] and row['pool'] == pool and row['prod_est_range'] == est['range']
+    assert set(row) == {'alpha_id', 'recommendation', 'prod_est', 'prod_est_confidence', 'prod_est_range',
+                        'pool', 'self', 'prod_lower_bound', 'platform_prod', 'platform_status'}
 
 
 @pytest.mark.asyncio
@@ -469,24 +488,39 @@ async def test_record_platform_corr_writes_back_and_check_many_batches():
         await service.check_many([])
 
 
-def test_prod_estimate_says_when_the_pool_has_no_peer():
-    service = make_service(StubFetcher(total=2), StubDao())
-    snapshot = {'localCorrs': [], 'platformCorrs': {}}
-    def estimate(pool):
-        return service._prod_estimate(snapshot, {'result': {'available': True, 'max': pool}, 'stale': False})
-    far = estimate(0.12)
-    assert far['confidence'] == 'low' and far['over_threshold'] is None
-    assert 'correlates only 0.12' in far['note'] and 'far HIGHER' in far['note']
-    near = estimate(0.45)
-    assert near['confidence'] == 'normal' and 'note' not in near and near['over_threshold'] is True
+def test_prod_estimate_is_fitted_per_region_and_says_when_it_cannot_be_trusted():
+    dao = StubDao()
+    service = make_service(StubFetcher(total=2), dao)
 
-    pairs = {f'r{i}': 0.4 + i * 0.05 for i in range(10)}           # calibrated on pools from 0.4 up
-    snapshot = {'localCorrs': [{'alphaId': k, 'corrType': 'POOL', 'result': {'available': True, 'max': v}}
-                               for k, v in pairs.items()],
-                'platformCorrs': {k: {'prod': {'max': min(0.99, 0.3 + v)}} for k, v in pairs.items()}}
-    below = estimate(0.35)
-    assert below['source'] == 'fitted' and below['confidence'] == 'low'
-    assert 'below what the estimate was calibrated on' in below['note']
-    row = service.compact_check({'alpha_id': 'x', 'recommendation': 'check', 'prod_est': below,
+    def estimate(pool, region='USA'):
+        return service._prod_estimate(dao.light_snapshot(),
+                                      {'result': {'available': True, 'max': pool}, 'stale': False}, region)
+
+    none = estimate(0.5)                                        # nothing measured yet
+    assert none['value'] is None and 'too few' in none['note'] and none['calibration_points'] == 0
+
+    calibrated(dao, 'USA', slope=0.5, base=0.3)                 # USA: prod = 0.3 + 0.5 pool
+    calibrated(dao, 'EUR', slope=0.0, base=0.72)                # EUR: prod ~ 0.72 whatever the pool
+    usa, eur = estimate(0.5), estimate(0.5, 'EUR')
+    assert usa['region'] == 'USA' and abs(usa['value'] - 0.55) < 0.02 and usa['confidence'] == 'normal'
+    assert eur['region'] == 'EUR' and abs(eur['value'] - 0.72) < 0.02
+    assert eur['confidence'] == 'low' and 'barely moves Prod' in eur['note']
+    other = estimate(0.5, 'JPN')                                # JPN has no calibration of its own
+    assert other['region'] == 'ALL' and 'fitted on all regions' in other['region_fallback']
+
+    far = estimate(0.12)
+    assert far['confidence'] == 'low' and 'correlates only 0.12' in far['note']
+    assert 'below what the estimate was calibrated on' in far['note']
+    row = service.compact_check({'alpha_id': 'x', 'recommendation': 'check', 'prod_est': far,
                                  'local': {}, 'platform': {}, 'platform_status': 'not_requested'})
     assert row['prod_est_confidence'] == 'low'
+
+
+@pytest.mark.asyncio
+async def test_platform_corr_reads_the_stored_value():
+    dao = StubDao()
+    service = make_service(StubFetcher(total=2), dao)
+    assert await service.platform_corr('a1') is None
+    dao.save_platform_corr('a1', 'prod', {'max': 0.6642, 'min': 0.1, 'updated': 5, 'source': 'platform'})
+    assert (await service.platform_corr('a1'))['max'] == 0.6642
+    assert await service.platform_corr('a1', 'self') is None
