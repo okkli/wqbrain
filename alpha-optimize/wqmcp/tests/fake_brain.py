@@ -65,6 +65,9 @@ class FakeState:
     saved_language: str = "FASTEXPR"
     raa_children_pending: bool = False
     sim_post_limit: int = 0  # >0: POST /simulations answers 429 after this many accepted
+    check_prod_error: bool = False          # /check: PROD_CORRELATION comes back as ERROR
+    alpha_checks: Optional[List[Dict[str, Any]]] = None   # is.checks of every simulated alpha
+    pnl: Dict[str, List[List[Any]]] = field(default_factory=dict)   # alpha id -> pnl records
 
     def tick(self, key: str) -> int:
         with self.lock:
@@ -221,14 +224,16 @@ def _create_sim(fb: FakeBrain, q, body) -> Response:
         children = []
         for i, it in enumerate(body):
             cid = f"{sid}C{i}"
-            st.sims[cid] = {"polls": 0, "alpha": f"A-{cid}", "regular": it.get("regular")}
+            reused = {"alias(x)": "OLD1", "dup()": "DUP1"}.get(it.get("regular"))
+            st.sims[cid] = {"polls": 0, "alpha": reused or f"A-{cid}", "regular": it.get("regular"),
+                            "settings": it.get("settings") or {}}
             children.append(cid)
         st.sims[sid] = {"children": children}
     elif body.get("type") == "REGION_AGNOSTIC":
         st.sims[sid] = {"polls": 0, "raa": True, "alpha": f"RAP{sid}", "type": "REGION_AGNOSTIC"}
     else:
         st.sims[sid] = {"polls": 0, "alpha": f"A-{sid}", "regular": body.get("regular"),
-                        "type": body.get("type")}
+                        "type": body.get("type"), "settings": body.get("settings") or {}}
     return 201, {"Location": f"{fb.url}/simulations/{sid}"}, None
 
 
@@ -324,6 +329,20 @@ def _get_alpha(fb, q, body, aid) -> Response:
         return 200, {}, alpha(aid, type="RA_PARENT", children=[])
     if aid.startswith("RAP"):
         return 200, {}, alpha(aid, type="RA_PARENT", children=[f"{aid}C{r}" for r in ("USA", "EUR", "ASI", "GLB")])
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if aid == "OLD1":   # what BRAIN answers with when it takes a new expression for an old alpha
+        return 200, {}, alpha(aid, regular={"code": "rank(old_name)", "operatorCount": 1},
+                              dateCreated="2025-03-01T00:00:00Z")
+    if aid == "DUP1":
+        return 200, {}, alpha(aid, regular={"code": "dup()", "operatorCount": 1}, dateCreated=now)
+    sim = fb.state.sims.get(aid[2:]) if aid.startswith("A-") else None
+    if sim is not None:   # the alpha of a simulation: what was sent, made just now
+        made = alpha(aid, dateCreated=now)
+        made["regular"] = {"code": sim.get("regular"), "description": None, "operatorCount": 1}
+        made["settings"] = {**made["settings"], **(sim.get("settings") or {})}
+        if fb.state.alpha_checks is not None:
+            made["is"] = {**made["is"], "checks": fb.state.alpha_checks}
+        return 200, {}, made
     return 200, {}, alpha(aid)
 
 
@@ -344,6 +363,14 @@ def _check(fb: FakeBrain, q, body, aid) -> Response:
         return 200, {"Retry-After": "0"}, None  # present-but-zero still means "running"
     if n < 2:
         return 200, {"Retry-After": "1"}, None
+    if fb.state.check_prod_error:
+        return 200, {}, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
+                                           {"name": "SELF_CORRELATION", "result": "PASS", "limit": 0.7, "value": 0.3},
+                                           {"name": "PROD_CORRELATION", "result": "ERROR"}]}}
+    if aid == "PRODOK":
+        return 200, {}, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
+                                           {"name": "PROD_CORRELATION", "result": "PASS", "limit": 0.7,
+                                            "value": 0.55}]}}
     return 200, {}, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
                                        {"name": "SELF_CORRELATION", "result": "FAIL", "limit": 0.7, "value": 0.82}],
                             "selfCorrelation": {"max": 0.82, "min": 0.1}}}
@@ -388,6 +415,9 @@ def _recordsets(fb, q, body, aid) -> Response:
 
 @route("GET", r"/alphas/([^/]+)/recordsets/([^/]+)")
 def _recordset(fb: FakeBrain, q, body, aid, name) -> Response:
+    if name == "pnl" and aid in fb.state.pnl:
+        return 200, {}, {"schema": {"name": "pnl", "properties": [{"name": "date"}, {"name": "pnl"}]},
+                         "records": fb.state.pnl[aid]}
     if fb.state.tick(f"rs:{aid}:{name}") < 2:
         return 200, {"Retry-After": "1"}, None
     rows = [[f"2020-01-{(i % 28) + 1:02d}", i * 10, i * 9] for i in range(500)]
@@ -417,7 +447,12 @@ def _datasets(fb, q, body) -> Response:
 
 @route("GET", r"/data-fields/([^/]+)")
 def _field(fb, q, body, fid) -> Response:
-    return 200, {}, {"id": fid, "type": "MATRIX", "data": [{"region": "USA", "coverage": 0.9}]}
+    if fid.startswith("nofield"):
+        return 404, {}, {"detail": "Not found."}
+    regions = ["IND"] if fid.startswith("ind_only") else ["USA", "EUR", "ASI", "GLB", "IND", "CHN"]
+    return 200, {}, {"id": fid, "type": "MATRIX",
+                     "data": [{"region": r, "delay": d, "universe": "TOP3000", "coverage": 0.9}
+                              for r in regions for d in (0, 1)]}
 
 
 @route("GET", r"/data-fields")
@@ -425,6 +460,8 @@ def _fields(fb, q, body) -> Response:
     for k in ("instrumentType", "region", "delay", "universe"):
         if k not in q:
             return 400, {}, {"detail": f"{k} is required"}
+    if int(q.get("limit", 20)) > 50:
+        return 400, {}, ["Invalid query: pagination limit too high."]
     return 200, {}, {"count": 120, "results": [{"id": f"f{i}", "type": "MATRIX", "dataset": {"id": "ds1"}}
                                                for i in range(int(q.get("limit", 20)))]}
 

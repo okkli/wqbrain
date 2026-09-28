@@ -23,7 +23,15 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_CORR_MIN_INTERVAL` | `0.5` | 相关性和提交检查接口的请求之间至少间隔几秒 |
 | `WQMCP_CORR_BACKGROUND` | `1` | 查询在后台继续排队和轮询，不随那次工具调用结束。设为 `0` 时查询随调用结束 |
 | `WQMCP_CORR_QUEUE_SECONDS` | `3600` | 一个查询在后台最多存活多久，超时仍无结果就放弃 |
-| `WQMCP_CORR_MAX_SLOT_SECONDS` | `600` | 一个 alpha 连续占用名额的上限。到时间还没结果就排到队尾，让后面的先算 |
+| `WQMCP_CORR_ROTATE` | `0` | 默认查询不会丢位置，一直占着名额等结果。设为 `1` 时，占满 `WQMCP_CORR_MAX_SLOT_SECONDS`（默认 600）还没结果就排到队尾 |
+| `WQMCP_CHECK_MAX_ALPHAS` | `1` | 提交检查单独一条通道，同一时刻最多算几个 |
+| `WQMCP_CORR_COOLDOWN_SECONDS` / `WQMCP_CORR_COOLDOWN_MAX` | `300` / `1800` | 判定限流后完全停止请求的时长，连续无结果时逐次加倍到上限。设为 `0` 则只降速、不停 |
+| `WQMCP_SUBMIT_QUEUE` | `1` | 模拟名额满时，请求进入本服务的先进先出队列等待。设为 `0` 则直接返回 `RATE_LIMITED` |
+| `WQMCP_SUBMIT_QUEUE_MAX` / `WQMCP_SUBMIT_QUEUE_SECONDS` | `50` / `7200` | 发枪队列最多排几个请求、一个请求最多等多久 |
+| `WQMCP_SUBMIT_QUEUE_INTERVAL` | `15` | 名额满时每隔几秒重试队首的请求 |
+| `WQMCP_MAX_WAIT_SECONDS` | `40` | 任何工具单次调用最多等多久。连接在静默约 45 秒后会断开，所以 `wait_seconds` 超过这个值会被截到这个值 |
+| `WQMCP_TOOL_DEADLINE_SECONDS` | `75` | 只读工具超过这个时间没有结果就放弃并返回 `timed_out`，不会一直挂着 |
+| `WQMCP_COMPACT_EXPR_CHARS` | `1500` | 精简行里表达式最多保留多少字符，`0` 表示不截断 |
 | `WQMCP_CORR_STALL_SECONDS` | `180` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
 | `WQMCP_CORR_THROTTLED_INTERVAL` | `60` | 被限流期间每个查询的轮询间隔（秒） |
 | `WQMCP_CORR_HOLD_SECONDS` | `90` | 只在关闭后台模式时有用：返回 PENDING 之后名额为这个 alpha 保留多久 |
@@ -89,13 +97,13 @@ create_simulation(type="SA", combo="combo_expr", selection=["sel_a", "sel_b"])  
 
 `cancel_simulation` 可以取消排队中或运行中的模拟，释放名额。
 
-## 工具一览（30 个）
+## 工具一览（31 个）
 
 | 分组 | 工具 |
 |---|---|
 | 账户 | `brain_status` |
 | 回测 | `create_simulation` · `get_simulation` · `cancel_simulation` · `get_platform_setting_options` · `preview_super_selection` |
-| Alpha | `list_alphas` · `get_alpha` · `get_alpha_recordset` · `check_alpha` · `submit_alpha` · `update_alpha` · `get_alpha_performance` |
+| Alpha | `list_alphas` · `get_alpha` · `get_alpha_recordset` · `check_alpha` · `submit_alpha` · `update_alpha` · `get_alpha_performance` · `compare_alphas` |
 | 数据 | `get_datasets` · `get_datafields` · `get_operators` |
 | 账户活动 / 社区 | `get_activity` · `get_leaderboard` · `get_competitions` · `get_events` · `get_messages` · `get_documentation` |
 | 论坛 | `search_forum_posts` · `read_forum_post` · `get_glossary_terms` |
@@ -176,14 +184,59 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
   - 填 `"all"`：全部取消。
   - 取消只是让本服务停止排队和轮询。BRAIN 已经开始的计算不会因此停止，只是结果不再被取走。
   - 正在等这个查询的调用会收到 `status: CANCELLED`。取消之后可以重新提交。
-- **识别限流并降速**：有 alpha 在算却连续 `WQMCP_CORR_STALL_SECONDS` 秒没有任何结果，或者收到 429，就判定为被限流。
-  - 限流期间只允许 1 个 alpha 新进入计算，每个查询每 `WQMCP_CORR_THROTTLED_INTERVAL` 秒才轮询一次。
-  - BRAIN 一旦返回结果，立即恢复正常速度。
-- **轮流**：一个 alpha 连续占用名额满 `WQMCP_CORR_MAX_SLOT_SECONDS` 还没结果，就排到队尾，后面的先算。
+- **识别限流并冷却**：有 alpha 在算却连续 `WQMCP_CORR_STALL_SECONDS` 秒没有任何结果，或者收到 429，就判定为被限流。限流时继续请求只会让 BRAIN 更慢，所以：
+  - 冷却：完全停止相关性和提交检查的请求 5 分钟，队列原样保留，被打断的 alpha 排在最前面。
+  - 试探：冷却结束后只放 1 个 alpha，每 `WQMCP_CORR_THROTTLED_INTERVAL` 秒查一次。
+  - 有结果就恢复正常速度；`WQMCP_CORR_STALL_SECONDS` 秒内还没结果就再冷却，时长加倍（5、10、20、30 分钟）。
+  - 冷却期间的调用立即返回 `cooling_down` 和 `resumes_in_seconds`，不向 BRAIN 发请求。冷却的时间不计入查询的存活时间。
+  - 手动控制：`check_alpha(check="cooldown", wait_seconds=600)` 立即开始冷却，`check_alpha(check="resume")` 立即恢复。
+- **不丢位置**：查询一直占着名额等结果，不会因为等得久被挪到队尾。
+- **只查 PROD 的优先**：只请求 prod 相关性的 alpha 排在同时请求 self 的前面。
+- **提交检查单独排队**：`check_alpha(check="submission")` 有自己的通道，不和相关性互相挡路。冷却对两条通道都生效。
+- **预计等待时间**：有查询算完之后，排队中的回答带 `estimated_wait_seconds`，正在算的带 `estimated_remaining_seconds`，按最近查询的耗时中位数估算。被限流时这个估计不可靠。
 - 正常情况下轮询间隔从 1 秒逐步拉长到 15 秒；同一个 alpha 的相同查询共用一个任务。
 - `check_alpha(check="submission")` 也会让 BRAIN 计算相关性，所以走同一个队列，但它随调用结束，不在后台继续。
 
+**发枪排队**
+
+账户的模拟名额满时，`create_simulation` 不再返回 `RATE_LIMITED`，而是把请求放进本服务的队列：
+- 回答是 `status: QUEUED`，带 `queue_id`（如 `Q7`）和 `queue_position`。
+- 队列先进先出：队首的请求被 BRAIN 接受之前，后面的不会发出；队列非空时新请求直接排到队尾。
+- `queue_id` 可以当模拟 id 用：`get_simulation("Q7")` 在排队时返回位置和已等时长，发出后返回模拟的进度和结果；`cancel_simulation("Q7")` 把它从队列里取出。
+- 不带参数的 `get_simulation()` 列出队列里的全部请求。
+- `mode="concurrent"` 时，被接受的项是 `SUBMITTED`，没名额的项是 `QUEUED`。
+- `queue=False` 保持原来的行为。队列只在内存里，服务重启后丢失。
+
+**多枪结果**
+- 每行带 `index`，即它是请求里的第几项。
+- BRAIN 用一个已存在的 alpha 作答时（表达式被它视为相同，例如字段别名），该行带 `reused_alpha: true` 和 `submitted_expr`（提交时的原始表达式）；这时 `id` 和 `expr` 是旧 alpha 的。
+- 两项得到同一个 alpha 时，后一行带 `duplicate_of_index`。缺少子项时有 `missing_children`。
+- 有子项失败时，`errors[]` 列出失败项的序号、BRAIN 的原因和出错位置；没有原因的子项是被连带取消的。
+
+**发枪前检查**
+
+除了括号和参数写法，还会检查表达式里的数据字段：BRAIN 没有这个字段，或者字段在该项的 region / delay 下没有数据。multi 模式下有问题就整批不发；single / concurrent 只警告。查过的字段会缓存。
+
+**精简行**
+- `fails`：BRAIN 判为 FAIL 的检查项。
+- `warns`：BRAIN 判为 WARNING 的检查项，以及数值没达到门槛但没被判 FAIL 的项，写成 `SHARPE 1.4<1.58`。
+- `expr` 不再截到 110 个字符。
+- 说明文字每次调用只出现一次，不在每行重复。
+
+**提交检查的结论**
+- 有检查项是 ERROR 时，`all_passed` 为 null，不给结论。
+- PROD_CORRELATION 是 ERROR 时，备用端点的值放在 `prod_fallback` 里并注明来源，不计入 `all_passed`。
+- `prod_source` 说明 `prod_correlation` 来自提交检查还是备用端点。
+
+**QUICK 模式忽略 maxTrade**
+
+实测 QUICK 下 `max_trade="ON"` 和 `"OFF"` 的结果逐位相同，而 FULL 下差别很大（Sharpe 6.39 → 2.33）。这样的项会出现在 `create_simulation` 返回的 `warnings` 里。
+
 **其他**
+- `compare_alphas(alpha_ids=[...])`：用各自的 PnL 在本地算 2–10 条 alpha 之间的相关性，未提交的 alpha 也可以，不消耗相关性请求。
+- `prodmemo_check` 的 `prod_est` 带 `confidence`。本地池里没有接近的 alpha 时（pool 相关性低于 0.3，或低于标定范围）为 `low`，实际 PROD 可能高得多。
+- `get_datasets` 每页 20 条、默认只返回关键字段，`detail=True` 返回完整对象。`get_datafields` 每页最多 50 条（BRAIN 的上限）。
+- `get_alpha_recordset(alpha_id, "yearly-stats")` 是这条 alpha 自己的逐年数据；`get_alpha_performance` 是加入前后的组合数据。
 - `list_alphas` 和 `get_activity(kind="diversity-score")` 的日期可以只写 `2026-06-29`。BRAIN 只接受带时区的完整时间，工具会补成当天 00:00:00 或 23:59:59（UTC）。
 - `check_alpha` 查 QUICK 模式的 alpha 时，会说明 BRAIN 不支持检查这类 alpha，需要用 FULL 模式重跑。
 - `update_alpha(name="")` 清空名字。BRAIN 不接受空字符串，工具改发 null。

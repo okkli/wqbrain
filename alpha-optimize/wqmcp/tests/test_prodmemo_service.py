@@ -446,8 +446,9 @@ async def test_check_reports_prod_est_from_local_pool_and_compacts():
 
     row = service.compact_check(full)
     assert row['prod_est'] == est['value'] and row['pool'] == pool
-    assert set(row) == {'alpha_id', 'recommendation', 'prod_est', 'pool', 'self',
-                        'prod_lower_bound', 'platform_prod', 'platform_status'}
+    assert set(row) == {'alpha_id', 'recommendation', 'prod_est', 'prod_est_confidence', 'pool',
+                        'self', 'prod_lower_bound', 'platform_prod', 'platform_status'}
+    assert est['confidence'] == 'normal' and 'note' not in est
 
 
 @pytest.mark.asyncio
@@ -466,3 +467,26 @@ async def test_record_platform_corr_writes_back_and_check_many_batches():
     assert out['results'][0]['platform_prod'] == 0.6333
     with pytest.raises(ValueError):
         await service.check_many([])
+
+
+def test_prod_estimate_says_when_the_pool_has_no_peer():
+    service = make_service(StubFetcher(total=2), StubDao())
+    snapshot = {'localCorrs': [], 'platformCorrs': {}}
+    def estimate(pool):
+        return service._prod_estimate(snapshot, {'result': {'available': True, 'max': pool}, 'stale': False})
+    far = estimate(0.12)
+    assert far['confidence'] == 'low' and far['over_threshold'] is None
+    assert 'correlates only 0.12' in far['note'] and 'far HIGHER' in far['note']
+    near = estimate(0.45)
+    assert near['confidence'] == 'normal' and 'note' not in near and near['over_threshold'] is True
+
+    pairs = {f'r{i}': 0.4 + i * 0.05 for i in range(10)}           # calibrated on pools from 0.4 up
+    snapshot = {'localCorrs': [{'alphaId': k, 'corrType': 'POOL', 'result': {'available': True, 'max': v}}
+                               for k, v in pairs.items()],
+                'platformCorrs': {k: {'prod': {'max': min(0.99, 0.3 + v)}} for k, v in pairs.items()}}
+    below = estimate(0.35)
+    assert below['source'] == 'fitted' and below['confidence'] == 'low'
+    assert 'below what the estimate was calibrated on' in below['note']
+    row = service.compact_check({'alpha_id': 'x', 'recommendation': 'check', 'prod_est': below,
+                                 'local': {}, 'platform': {}, 'platform_status': 'not_requested'})
+    assert row['prod_est_confidence'] == 'low'

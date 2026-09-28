@@ -57,6 +57,8 @@ PNL_PENDING_DELAY = 8
 # every measured Prod written back improves the estimate.
 PROD_EST_DEFAULT = (0.428, 1.139)
 PROD_EST_MIN_FIT = 8
+# Below this pool correlation the local pool has no real peer for the alpha.
+PROD_EST_MIN_POOL = 0.3
 CHECK_MANY_LIMIT = 20
 CHECK_MANY_CONCURRENCY = 2
 
@@ -779,11 +781,29 @@ class ProdMemoService:
         pool = finite_number(result.get('max')) if result.get('available') else None
         if pool is None or (pool_record or {}).get('stale'):
             return None
-        a, b, n, resid_sd, source = fit_prod_estimate(self._calibration_pairs(snapshot))
+        pairs = self._calibration_pairs(snapshot)
+        a, b, n, resid_sd, source = fit_prod_estimate(pairs)
         value = max(-1.0, min(1.0, a + b * pool))
-        return {'value': round(value, 4), 'pool': pool, 'a': round(a, 4), 'b': round(b, 4),
-                'calibration_points': n, 'resid_sd': None if resid_sd is None else round(resid_sd, 4),
-                'source': source, 'over_threshold': value > PROD_THRESHOLD}
+        out = {'value': round(value, 4), 'pool': pool, 'a': round(a, 4), 'b': round(b, 4),
+               'calibration_points': n, 'resid_sd': None if resid_sd is None else round(resid_sd, 4),
+               'source': source, 'over_threshold': value > PROD_THRESHOLD}
+        # The estimate reads Prod off the closest alpha of the local pool. When the
+        # pool holds nothing close (a data axis it has never seen), there is nothing
+        # to read it off: measured Prod was .76-.96 where this said .50-.61.
+        seen = sorted(x for x, _ in pairs)
+        floor = seen[len(seen) // 10] if len(seen) >= PROD_EST_MIN_FIT else None
+        reasons = []
+        if pool < PROD_EST_MIN_POOL:
+            reasons.append(f'the closest pool alpha correlates only {pool:.2f}')
+        if floor is not None and pool < floor:
+            reasons.append(f'pool {pool:.2f} is below what the estimate was calibrated on (from {floor:.2f})')
+        out['confidence'] = 'low' if reasons else 'normal'
+        if reasons:
+            out['over_threshold'] = None
+            out['note'] = ('Low confidence: ' + '; '.join(reasons) + '. The local pool has no close peer '
+                           '(probably no alpha on the same data), so Prod can be far HIGHER than this '
+                           'value. Run the platform check instead of trusting it.')
+        return out
 
     async def record_platform_corr(self, alpha_id, corr_type, max_value, min_value=None,
                                    source='platform'):
@@ -839,6 +859,7 @@ class ProdMemoService:
             'alpha_id': full['alpha_id'],
             'recommendation': full['recommendation'],
             'prod_est': est['value'] if est else None,
+            'prod_est_confidence': est['confidence'] if est else None,
             'pool': (local.get('pool') or {}).get('max'),
             'self': (local.get('self') or {}).get('max'),
             'prod_lower_bound': (local.get('prod_lower_bound') or {}).get('max'),
