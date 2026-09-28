@@ -19,6 +19,15 @@ from urllib.parse import parse_qs, urlsplit
 USER_ID = "U123"
 
 
+def fake_alpha(alpha_id: str, code: str, decay: int) -> Dict[str, Any]:
+    """An alpha as the alpha list shows it: what a simulation of `code` produced."""
+    made = alpha(alpha_id, dateCreated=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    made["regular"] = {"code": code, "operatorCount": 1}
+    made["settings"] = {**made["settings"], "decay": decay, "neutralization": "NONE", "truncation": 0.0,
+                        "maxTrade": "OFF", "maxPosition": "OFF", "pasteurization": "ON", "nanHandling": "OFF"}
+    return made
+
+
 def alpha(alpha_id: str, **extra: Any) -> Dict[str, Any]:
     base = {
         "id": alpha_id, "type": "REGULAR", "author": USER_ID, "stage": "IS", "status": "UNSUBMITTED",
@@ -68,6 +77,10 @@ class FakeState:
     check_prod_error: bool = False          # /check: PROD_CORRELATION comes back as ERROR
     alpha_checks: Optional[List[Dict[str, Any]]] = None   # is.checks of every simulated alpha
     pnl: Dict[str, List[List[Any]]] = field(default_factory=dict)   # alpha id -> pnl records
+    cancel_others: bool = False   # a failing multi child makes BRAIN cancel the others
+    glitch_batches: int = 0       # this many next multis fail every child without a message
+    forgotten: set = field(default_factory=set)   # simulations BRAIN answers 404 for
+    listed: Optional[List[Dict[str, Any]]] = None  # what /users/self/alphas lists instead
 
     def tick(self, key: str) -> int:
         with self.lock:
@@ -221,12 +234,15 @@ def _create_sim(fb: FakeBrain, q, body) -> Response:
     sid = f"S{st.next_sim}"
     st.next_sim += 1
     if isinstance(body, list):
+        glitch = st.glitch_batches > 0
+        if glitch:
+            st.glitch_batches -= 1
         children = []
         for i, it in enumerate(body):
             cid = f"{sid}C{i}"
             reused = {"alias(x)": "OLD1", "dup()": "DUP1"}.get(it.get("regular"))
             st.sims[cid] = {"polls": 0, "alpha": reused or f"A-{cid}", "regular": it.get("regular"),
-                            "settings": it.get("settings") or {}}
+                            "settings": it.get("settings") or {}, "glitch": glitch}
             children.append(cid)
         st.sims[sid] = {"children": children}
     elif body.get("type") == "REGION_AGNOSTIC":
@@ -246,7 +262,7 @@ def _super_sel(fb, q, body) -> Response:
 def _get_sim(fb: FakeBrain, q, body, sid: str) -> Response:
     st = fb.state
     sim = st.sims.get(sid)
-    if sim is None:
+    if sim is None or sid in st.forgotten:
         return 404, {}, {"detail": "Not found."}
     if sim.get("raa"):
         sim["polls"] += 1
@@ -268,6 +284,12 @@ def _get_sim(fb: FakeBrain, q, body, sid: str) -> Response:
     sim["polls"] += 1
     if sim["polls"] < st.child_polls_needed:
         return 200, {"Retry-After": "1"}, {"progress": 0.5}
+    if sim.get("glitch"):
+        return 200, {}, {"id": sid, "status": "FAIL", "message": None, "alpha": None}
+    if st.cancel_others and sim.get("regular") != "fail()" and "C" in sid:
+        parent = sid.split("C")[0]
+        if any(st.sims.get(c, {}).get("regular") == "fail()" for c in st.sims.get(parent, {}).get("children", [])):
+            return 200, {}, {"id": sid, "status": "CANCELLED", "message": None, "alpha": None}
     if sim.get("regular") == "fail()":
         return 200, {}, {"id": sid, "status": "ERROR", "message": "Attempted to use unknown variable \"foo\"",
                          "alpha": None}
@@ -302,6 +324,8 @@ def _alpha_summary(fb, q, body) -> Response:
 
 @route("GET", r"/users/self/alphas")
 def _list_alphas(fb: FakeBrain, q, body) -> Response:
+    if fb.state.listed is not None:
+        return 200, {}, {"count": len(fb.state.listed), "results": fb.state.listed}
     for key in ("dateCreated>", "dateCreated<", "dateSubmitted>", "dateSubmitted<"):
         # like BRAIN: a bare date is refused
         if key in q and not re.fullmatch(r"\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}:?\d{2})", str(q[key])):
@@ -450,7 +474,14 @@ def _field(fb, q, body, fid) -> Response:
     if fid.startswith("nofield"):
         return 404, {}, {"detail": "Not found."}
     regions = ["IND"] if fid.startswith("ind_only") else ["USA", "EUR", "ASI", "GLB", "IND", "CHN"]
-    return 200, {}, {"id": fid, "type": "MATRIX",
+    if fid.startswith("wide"):   # BRAIN cuts this list at 50 rows: MEA is not among them
+        return 200, {}, {"id": fid, "type": "MATRIX",
+                         "data": [{"region": r, "delay": 1, "universe": f"U{i}"} for i in range(10)
+                                  for r in ("USA", "EUR", "ASI", "GLB", "JPN")]}
+    kind = {"subindustry": "GROUP", "industry": "GROUP", "sector": "GROUP"}.get(fid, "MATRIX")
+    if fid.startswith("evt"):
+        kind = "VECTOR"
+    return 200, {}, {"id": fid, "type": kind,
                      "data": [{"region": r, "delay": d, "universe": "TOP3000", "coverage": 0.9}
                               for r in regions for d in (0, 1)]}
 
@@ -462,16 +493,32 @@ def _fields(fb, q, body) -> Response:
             return 400, {}, {"detail": f"{k} is required"}
     if int(q.get("limit", 20)) > 50:
         return 400, {}, ["Invalid query: pagination limit too high."]
-    return 200, {}, {"count": 120, "results": [{"id": f"f{i}", "type": "MATRIX", "dataset": {"id": "ds1"}}
-                                               for i in range(int(q.get("limit", 20)))]}
+    offset, limit = int(q.get("offset", 0)), int(q.get("limit", 20))
+    return 200, {}, {"count": 120, "results": [{"id": f"f{i}", "type": "MATRIX", "dataset": {"id": "ds1"},
+                                                "description": "d" * 300, "coverage": 0.9, "region": "USA",
+                                                "themes": [{"id": "t"}]}
+                                               for i in range(offset, min(120, offset + limit))]}
 
 
 @route("GET", r"/operators")
 def _operators(fb, q, body) -> Response:
+    extra = [(n, c) for c, names in {
+        "Time Series": "ts_mean ts_delta ts_backfill ts_zscore ts_sum ts_delay ts_decay_linear ts_std_dev",
+        "Arithmetic": "add subtract multiply divide abs densify",
+        "Transformational": "bucket hump tail",
+        "Cross Sectional": "zscore scale quantile winsorize normalize",
+        "Group": "group_neutralize group_rank group_mean",
+        "Vector": "vec_avg vec_sum",
+        "Logical": "if_else",
+        # expressions the fake platform itself answers in special ways
+        "Special": "fail alias dup bad f g h ex x_op",
+    }.items() for n in names.split()]
     return 200, {}, [{"name": "ts_rank", "category": "Time Series", "scope": ["REGULAR"], "definition": "ts_rank(x, d)",
                       "description": "Rank over time"},
                      {"name": "rank", "category": "Cross Sectional", "scope": ["REGULAR", "COMBO"],
-                      "definition": "rank(x)", "description": "Cross-sectional rank"}]
+                      "definition": "rank(x)", "description": "Cross-sectional rank"}] + [
+        {"name": n, "category": c, "scope": ["REGULAR"], "definition": f"{n}(x)", "description": n}
+        for n, c in extra]
 
 
 @route("GET", r"/users/self/activities")

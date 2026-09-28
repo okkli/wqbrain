@@ -32,6 +32,12 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_MAX_WAIT_SECONDS` | `40` | 任何工具单次调用最多等多久。连接在静默约 45 秒后会断开，所以 `wait_seconds` 超过这个值会被截到这个值 |
 | `WQMCP_TOOL_DEADLINE_SECONDS` | `75` | 只读工具超过这个时间没有结果就放弃并返回 `timed_out`，不会一直挂着 |
 | `WQMCP_COMPACT_EXPR_CHARS` | `1500` | 精简行里表达式最多保留多少字符，`0` 表示不截断 |
+| `WQMCP_CORR_AGING_SECONDS` | `300` | 排队超过这个时间的查询，和只查 PROD 的查询同等优先 |
+| `WQMCP_CORR_ABANDON_SECONDS` | `1200` | 排队中的查询这么久没人再来问，就自动出队 |
+| `WQMCP_RESULTS_DIR` | `<wqmcp>/results` | 带 `tag` 的模拟结果写到这里的 `<tag>.jsonl` |
+| `WQMCP_WATCH_SECONDS` / `WQMCP_WATCH_INTERVAL` | `10800` / `30` | 带 `tag` 的模拟在后台最多跟踪多久、每隔几秒查一次 |
+| `WQMCP_STALE_MULTI_SECONDS` / `WQMCP_STALE_SINGLE_SECONDS` | `1200` / `600` | 模拟的进度这么久没动，就标为 `stale` |
+| `WQMCP_AUTO_RETRY_GLITCH` | `1` | multi 的子项全部失败且没有任何原因时，自动重发一次。设为 `0` 关闭 |
 | `WQMCP_CORR_STALL_SECONDS` | `180` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
 | `WQMCP_CORR_THROTTLED_INTERVAL` | `60` | 被限流期间每个查询的轮询间隔（秒） |
 | `WQMCP_CORR_HOLD_SECONDS` | `90` | 只在关闭后台模式时有用：返回 PENDING 之后名额为这个 alpha 保留多久 |
@@ -185,17 +191,21 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
   - 取消只是让本服务停止排队和轮询。BRAIN 已经开始的计算不会因此停止，只是结果不再被取走。
   - 正在等这个查询的调用会收到 `status: CANCELLED`。取消之后可以重新提交。
 - **识别限流并冷却**：有 alpha 在算却连续 `WQMCP_CORR_STALL_SECONDS` 秒没有任何结果，或者收到 429，就判定为被限流。限流时继续请求只会让 BRAIN 更慢，所以：
-  - 冷却：完全停止相关性和提交检查的请求 5 分钟，队列原样保留，被打断的 alpha 排在最前面。
+  - 冷却：完全停止相关性请求 5 分钟，队列原样保留，被打断的 alpha 排在最前面。提交检查不受冷却影响（见下）。
   - 试探：冷却结束后只放 1 个 alpha，每 `WQMCP_CORR_THROTTLED_INTERVAL` 秒查一次。
   - 有结果就恢复正常速度；`WQMCP_CORR_STALL_SECONDS` 秒内还没结果就再冷却，时长加倍（5、10、20、30 分钟）。
-  - 冷却期间的调用立即返回 `cooling_down` 和 `resumes_in_seconds`，不向 BRAIN 发请求。冷却的时间不计入查询的存活时间。
+  - 冷却期间的相关性调用立即返回 `cooling_down` 和 `resumes_in_seconds`，不向 BRAIN 发请求，并附上 `local_estimate`（ProdMemo 的本地估计，仅供初筛）。冷却的时间不计入查询的存活时间。
   - 手动控制：`check_alpha(check="cooldown", wait_seconds=600)` 立即开始冷却，`check_alpha(check="resume")` 立即恢复。
 - **不丢位置**：查询一直占着名额等结果，不会因为等得久被挪到队尾。
-- **只查 PROD 的优先**：只请求 prod 相关性的 alpha 排在同时请求 self 的前面。
-- **提交检查单独排队**：`check_alpha(check="submission")` 有自己的通道，不和相关性互相挡路。冷却对两条通道都生效。
+- **排队顺序**：被冷却打断的 → `priority="high"` 的 → 只查 PROD 的、或已等满 5 分钟的 → 其余；同一档内先来先算。
+- **自动出队**：排队中的查询 20 分钟没人再来问，就自动出队，不用手动取消。
+- **部分结果**：prod 已经算完、self 还在算时，状态是 `PARTIAL`，已完成的部分照常返回。
+- **提交检查单独排队，且不受冷却影响**：`/check` 里的 IS 检查（Sharpe、fitness、子池、近 2 年、cluster 等）不需要算相关性，所以冷却期间照常请求 BRAIN。
+  - 平台还在算相关性时，先把已有的 IS 结果返回，`is_passed` 是不含相关性的结论。
+  - PROD 是 ERROR 或 PENDING 时，`prod_fallback` 依次取：本服务缓存的测量值、ProdMemo 里存的平台值、prod 相关性接口，并注明来源；`all_passed_with_fallback` 是把它算进去的结论。都没有时附 `local_estimate`。
 - **预计等待时间**：有查询算完之后，排队中的回答带 `estimated_wait_seconds`，正在算的带 `estimated_remaining_seconds`，按最近查询的耗时中位数估算。被限流时这个估计不可靠。
 - 正常情况下轮询间隔从 1 秒逐步拉长到 15 秒；同一个 alpha 的相同查询共用一个任务。
-- `check_alpha(check="submission")` 也会让 BRAIN 计算相关性，所以走同一个队列，但它随调用结束，不在后台继续。
+- `check_alpha(check="submission")` 随调用结束，不在后台继续。
 
 **发枪排队**
 
@@ -207,6 +217,21 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - `mode="concurrent"` 时，被接受的项是 `SUBMITTED`，没名额的项是 `QUEUED`。
 - `queue=False` 保持原来的行为。队列只在内存里，服务重启后丢失。
 
+**结果记到服务器上的文件**
+
+`create_simulation(..., tag="G-r3", labels=[...])`：
+- 每个完成的结果行（序号、label、id、指标、fails、warns、完整设置、完整表达式）追加到服务器的 `results/G-r3.jsonl`。
+- 服务在后台跟踪带 tag 的模拟，没人轮询也会写入。
+- 取回时不经过对话、不耗 token：`curl -s http://<MCP 地址>:<端口>/results/G-r3.jsonl >> results.jsonl`。`?since=<行数>` 跳过已取的行，`?format=tsv` 每行一个 alpha。
+
+**模拟状态**
+- 运行中返回 `running_seconds`，不再返回没有意义的 `progress`（BRAIN 只给 0.1、0.15、0.35 这几档）。
+- 进度 20 分钟（multi）/ 10 分钟（single）没动时标 `stale: true` 和 `stalled_seconds`，建议取消后重发。
+- `create_simulation(resubmit="<模拟 id>")`：把某次提交原样再发一次（设置、tag、label 都相同）。
+- multi 的子项全部失败且都没有原因时，判为平台故障，自动重发一次；原 id 返回 `RETRIED` 和 `retried_as`，之后查原 id 跟随新的一次。
+- BRAIN 对已跑完的模拟返回 404 时，按表达式和设置从 alpha 列表里找回结果（`recovered: true`）。
+- `get_simulation(format="tsv")`：结果压成一段 TSV，是最短的答复。多个 id 共用一个等待预算；等待被截到 40 秒时答复里有 `wait_capped_to`。
+
 **多枪结果**
 - 每行带 `index`，即它是请求里的第几项。
 - BRAIN 用一个已存在的 alpha 作答时（表达式被它视为相同，例如字段别名），该行带 `reused_alpha: true` 和 `submitted_expr`（提交时的原始表达式）；这时 `id` 和 `expr` 是旧 alpha 的。
@@ -215,12 +240,22 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 
 **发枪前检查**
 
-除了括号和参数写法，还会检查表达式里的数据字段：BRAIN 没有这个字段，或者字段在该项的 region / delay 下没有数据。multi 模式下有问题就整批不发；single / concurrent 只警告。查过的字段会缓存。
+按 BRAIN 自己的算子列表和字段目录检查（都会缓存）。multi 模式下有问题就整批不发；single / concurrent 只警告：
+- 括号不配对；带默认值的参数用了位置写法（如 `hump(x, 0.01)`）。`ts_backfill(x, 10)` 是合法写法，实测平台接受。
+- 算子不存在（如 `vec_median`），会给出名字相近的算子。
+- 数据字段不存在，或在该项的 region / delay 下没有数据。字段详情最多列 50 个地区组合，列满时不下结论。
+- VECTOR 字段没有经过 `vec_*` 聚合就用了（平台报 "does not support event inputs"）。字段类型以平台为准。
+- 需要分组的参数给了数值（如 `densify(rank(x))`、`group_rank(x, rank(y))`）。
+- `max_ops`：表达式的算子数超过它时在 `warnings` 里提示，按 BRAIN 的 `operatorCount` 口径计算（在 300 条真实 alpha 上与平台一致）。
+
+在本账户 765 条跑成功的 alpha 上检查，零误报。
 
 **精简行**
-- `fails`：BRAIN 判为 FAIL 的检查项。
-- `warns`：BRAIN 判为 WARNING 的检查项，以及数值没达到门槛但没被判 FAIL 的项，写成 `SHARPE 1.4<1.58`。
-- `expr` 不再截到 110 个字符。
+- `fails`：数值没达到门槛的检查项，写成 `SHARPE 1.4<1.58`，不管 BRAIN 判的是 FAIL 还是 WARNING（BRAIN 在同一批里对同类未达标项判得不一致）。BRAIN 没判 FAIL 的带标记，如 `(W)` 表示它只判了 WARNING。没有数值的 FAIL 项写名字。
+- `warns`：其余的 WARNING 项（如 CLUSTER_TEST）。
+- 没有值的键不输出（如 FULL 模式下的 `robust_sharpe`）。
+- 同一批子项共同的设置只在父级 `set` 出现一次，各行只列不同的项；`nanHandling`、`pasteurization`、`maxPosition`、`unitHandling` 与默认不同时也会列出。
+- 被连带取消的子项压成 `cancelled: [序号]`。
 - 说明文字每次调用只出现一次，不在每行重复。
 
 **提交检查的结论**
@@ -234,8 +269,12 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 
 **其他**
 - `compare_alphas(alpha_ids=[...])`：用各自的 PnL 在本地算 2–10 条 alpha 之间的相关性，未提交的 alpha 也可以，不消耗相关性请求。
-- `prodmemo_check` 的 `prod_est` 带 `confidence`。本地池里没有接近的 alpha 时（pool 相关性低于 0.3，或低于标定范围）为 `low`，实际 PROD 可能高得多。
-- `get_datasets` 每页 20 条、默认只返回关键字段，`detail=True` 返回完整对象。`get_datafields` 每页最多 50 条（BRAIN 的上限）。
+- `prodmemo_check` 的 `prod_est`：
+  - 按区域拟合（该区域标定点不少于 8 个时），否则用全部区域并注明。例如 EUR 的 PROD 平均比全局公式高 0.09，而且 pool 在 EUR 几乎预测不了 PROD。
+  - 带 `range`（90% 区间）和标定点数；标定点不足时不给单点值。
+  - 本地池里没有接近的 alpha、pool 在该区域没有预测力、或区间太宽时，`confidence` 为 `low`。
+- `get_datasets` 每页 20 条、默认只返回关键字段，`detail=True` 返回完整对象，`category` 按类目过滤。
+- `get_datafields` 默认精简（id、type、coverage、dateCoverage、userCount、alphaCount、描述前 80 字），每页最多 500 条（内部按 BRAIN 的上限 50 分页取）。
 - `get_alpha_recordset(alpha_id, "yearly-stats")` 是这条 alpha 自己的逐年数据；`get_alpha_performance` 是加入前后的组合数据。
 - `list_alphas` 和 `get_activity(kind="diversity-score")` 的日期可以只写 `2026-06-29`。BRAIN 只接受带时区的完整时间，工具会补成当天 00:00:00 或 23:59:59（UTC）。
 - `check_alpha` 查 QUICK 模式的 alpha 时，会说明 BRAIN 不支持检查这类 alpha，需要用 FULL 模式重跑。
