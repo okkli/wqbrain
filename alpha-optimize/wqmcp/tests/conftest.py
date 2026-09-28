@@ -24,6 +24,10 @@ os.environ.pop("CREDD_TOKEN", None)
 # Correlation jobs end with the call that started them, so request counts are
 # exact; the background queue has its own tests, which switch it on.
 os.environ["WQMCP_CORR_BACKGROUND"] = "0"
+os.environ["WQMCP_CORR_COOLDOWN_SECONDS"] = "0"   # likewise: the cooldown tests switch it on
+os.environ["WQMCP_SUBMIT_QUEUE"] = "0"            # RATE_LIMITED as such; the queue tests ask for it
+os.environ["WQMCP_SUBMIT_QUEUE_INTERVAL"] = "0.2"
+os.environ["WQMCP_SUBMIT_QUEUE_MAX_INTERVAL"] = "0.2"
 
 
 @pytest.fixture
