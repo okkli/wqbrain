@@ -2669,16 +2669,16 @@ class BrainApiClient:
             data = await self._poll_check(url, alpha_id, deadline)
         finally:
             gate.release(str(alpha_id), "check")
+        # The check ends with this call, and so does its place in the lane: holding
+        # it would make the check of the next alpha wait for nothing.
         if isinstance(data, dict) and data.get("status") in ("ERROR", "PENDING") and "alpha_id" in data:
             if data["status"] == "PENDING":
-                gate.touch(str(alpha_id), "check")   # still computing on BRAIN's side
                 data["queue"] = gate.snapshot()
             else:
                 gate.answered()
             return data
         report = await self._submission_report(alpha_id, data, max_wait)
         if report.get("status") == "PENDING":
-            gate.touch(str(alpha_id), "check")       # its correlation checks are still running
             report["queue"] = gate.snapshot()
         else:
             gate.answered()

@@ -640,3 +640,19 @@ def test_a_request_keeps_its_slot_and_waiting_ones_get_an_estimate(monkeypatch):
     assert gate.computing() == {"A1"} and not gate.admit(b, "prod")   # A1 did not lose its slot
     gate.rotate = True
     assert gate.computing() == set() and gate.admit(b, "prod") and c in gate._waiting
+
+
+@pytest.mark.asyncio
+async def test_a_pending_submission_check_does_not_hold_the_lane(client):
+    gate = client.correlation_gate
+    gate.check_max = 1
+    pending = {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "value": 2, "limit": 1.25},
+                                 {"name": "SELF_CORRELATION", "result": "PENDING"}]}}
+    s = install(client, {"/alphas/A1/check": [resp(200, pending)],
+                         "/alphas/B2/check": [resp(400, {"detail": "Cannot check submission for QUICK mode alphas"})]})
+    first = await client.get_submission_check("A1", max_wait=0)
+    assert first["status"] == "PENDING" and first["pending"] == ["SELF_CORRELATION"]
+    assert first["queue"]["computing"] == []
+    second = await client.get_submission_check("B2", max_wait=0)      # straight away, not queued
+    assert second["status"] == "ERROR" and "FULL" in second["note"] and "queued" not in second
+    assert len(s.calls) == 2
