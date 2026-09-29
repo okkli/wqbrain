@@ -819,6 +819,9 @@ class ProdMemoService:
         out = {'value': round(value, 4), 'pool': pool, 'a': round(a, 4), 'b': round(b, 4),
                'region': scope, 'calibration_points': n, 'resid_sd': round(resid_sd, 4),
                'range': [round(max(-1.0, value - spread), 3), round(min(1.0, value + spread), 3)],
+               # half of the measured alphas lie this close to the line
+               'range50': [round(max(-1.0, value - 0.674 * resid_sd), 3),
+                           round(min(1.0, value + 0.674 * resid_sd), 3)],
                'source': source, 'over_threshold': value > PROD_THRESHOLD}
         if region and scope == 'ALL':
             out['region_fallback'] = (f'fewer than {PROD_EST_MIN_FIT} calibration points in {region}: '
@@ -926,7 +929,9 @@ class ProdMemoService:
 
         await self.calculate_local(alpha_id)
         snapshot = await self._db(self.dao.light_snapshot)
-        local = self._decorate_local(snapshot, alpha_id)
+        # Fingerprinting walks every alpha of the snapshot: off the event loop, so
+        # the other tools of the server keep answering meanwhile.
+        local = await asyncio.to_thread(self._decorate_local, snapshot, alpha_id)
         platform = snapshot['platformCorrs'].get(alpha_id) or {}
         resolved = self._resolved(platform, local)
 
@@ -937,7 +942,7 @@ class ProdMemoService:
 
         region = next((((a.get('settings') or {}).get('region')) for a in snapshot['alphas']
                        if a['id'] == alpha_id), None)
-        prod_est = self._prod_estimate(snapshot, local.get('POOL'), region)
+        prod_est = await asyncio.to_thread(self._prod_estimate, snapshot, local.get('POOL'), region)
 
         if lower_max is None or not lower_fresh:
             recommendation = 'insufficient_data' if lower_max is None and prod_est is None else 'check'
