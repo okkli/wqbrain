@@ -164,7 +164,9 @@ async def main() -> int:
                 full = [a for a in res["results"]
                         if (a.get("settings") or {}).get("simulationMode") in (None, "FULL")
                         and a.get("type") == "REGULAR"]
-                ctx[stage] = (full or res["results"])[0]["id"]
+                # RA_PARENT and QUICK alphas cannot be checked or compared: only a FULL REGULAR one
+                if full:
+                    ctx[stage] = full[0]["id"]
                 ctx[f"count_{stage}"] = res.get("count")
                 quick = [a for a in res["results"]
                          if (a.get("settings") or {}).get("simulationMode") == "QUICK"]
@@ -213,8 +215,11 @@ async def main() -> int:
                             lambda: T("list_alphas", stage="OS", limit=1, submission_start_date=d90,
                                       submission_end_date=today.isoformat()),
                             ok(lambda p: isinstance(p.get("count"), int), "plain dates accepted"), "ALPHA-12")
-            await run.check("get_alpha_performance", lambda: T("get_alpha_performance", alpha_id=alpha),
-                            ok(lambda p: isinstance(p, dict), "before/after"), "ANLY-6")
+            if alpha != ctx.get("IS"):   # BRAIN compares only unsubmitted alphas with the portfolio
+                run.note("get_alpha_performance", "SKIP", "no unsubmitted FULL alpha to compare", "ANLY-6")
+            else:
+                await run.check("get_alpha_performance", lambda: T("get_alpha_performance", alpha_id=alpha),
+                                ok(lambda p: isinstance(p, dict), "before/after"), "ANLY-6")
 
         for label, tool, kw in (
                 ("get_activity(diversity)", "get_activity", {"kind": "diversity", "grouping": "region,delay"}),

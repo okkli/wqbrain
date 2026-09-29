@@ -81,6 +81,7 @@ class FakeState:
     glitch_batches: int = 0       # this many next multis fail every child without a message
     forgotten: set = field(default_factory=set)   # simulations BRAIN answers 404 for
     listed: Optional[List[Dict[str, Any]]] = None  # what /users/self/alphas lists instead
+    ignore_setting: Optional[Tuple[str, Any]] = None  # BRAIN runs every alpha with this setting
 
     def tick(self, key: str) -> int:
         with self.lock:
@@ -364,6 +365,8 @@ def _get_alpha(fb, q, body, aid) -> Response:
         made = alpha(aid, dateCreated=now)
         made["regular"] = {"code": sim.get("regular"), "description": None, "operatorCount": 1}
         made["settings"] = {**made["settings"], **(sim.get("settings") or {})}
+        if fb.state.ignore_setting:
+            made["settings"][fb.state.ignore_setting[0]] = fb.state.ignore_setting[1]
         if fb.state.alpha_checks is not None:
             made["is"] = {**made["is"], "checks": fb.state.alpha_checks}
         return 200, {}, made

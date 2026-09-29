@@ -386,6 +386,8 @@ async def test_used_up_slot_goes_to_the_back_of_the_queue(bg_client):
 def test_no_answer_for_a_while_is_treated_as_rate_limiting(monkeypatch):
     gate = pf.CorrelationGate()
     assert gate.cooldown_seconds == 0        # conftest: slow mode only
+    assert gate.stall_seconds == 300         # BRAIN is often slow: only 5 silent minutes count
+    gate.stall_seconds = 180
     clock = [5000.0]
     monkeypatch.setattr(pf.time, "monotonic", lambda: clock[0])
     gate.touch("A1", "prod", polled=True)
@@ -559,7 +561,7 @@ async def test_nothing_is_sent_during_a_cooldown_and_the_queue_survives(bg_clien
     await client.real_sleep(0.02)
     sent = len(s.calls)
 
-    out = await client.check_correlation("B2", "prod", max_wait=30)   # answers at once, asks nothing
+    out = await client.check_correlation("B2", "prod", max_wait=0)    # answers at once, asks nothing
     entry = out["checks"]["production"]
     assert entry["cooling_down"] is True and entry["resumes_in_seconds"] >= 1 and entry["queue_position"] == 2
     assert out["queue"]["cooling_down"] and out["queue"]["computing"] == []
@@ -832,3 +834,47 @@ def test_estimated_ops_counts_like_brain(expr, count):
 def test_ts_backfill_takes_lookback_positionally():
     assert pf._lint_expression("ts_backfill(close, 10)") == []
     assert pf._lint_expression("ts_backfill(close, 10, 2)")[0].startswith("ts_backfill: argument 3")
+
+
+
+@pytest.mark.asyncio
+async def test_a_call_waits_through_a_cooldown_and_gets_the_result(bg_client):
+    client, gate = bg_client, bg_client.correlation_gate
+    install(client, {"/correlations/prod": [resp(200, {"max": 0.42})]})
+    gate.start_cooldown(0.3, reason="test")
+    t0 = pf.time.monotonic()
+    out = await client.check_correlation("A1", "prod", max_wait=5, estimate=False)
+    assert out["status"] == "DONE" and out["checks"]["production"]["max_correlation"] == 0.42
+    assert 0.25 <= pf.time.monotonic() - t0 < 4                    # waited out the cooldown, not the whole 5s
+
+
+def test_prod_histogram_is_reported():
+    data = {"schema": {"properties": [{"name": "min"}, {"name": "max"}, {"name": "alphas"}]},
+            "records": [[0.4, 0.5, 3764], [0.5, 0.6, 271], [0.6, 0.7, 8], [0.7, 0.8, 1], [0.8, 0.9, 0]],
+            "max": 0.7051}
+    out = pf._correlation_histogram(data, 0.7)
+    assert out == {"histogram_top": {"0.5..0.6": 271, "0.6..0.7": 8, "0.7..0.8": 1}, "alphas_over_threshold": 1}
+    assert pf._correlation_top_rows(data, 3) == []
+    assert pf._correlation_histogram({"schema": {"properties": [{"name": "id"}]}}, 0.7) == {}
+
+
+@pytest.mark.asyncio
+async def test_account_limits_are_kept_apart_and_duplicates_dropped(client):
+    body = {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "value": 2, "limit": 1.58},
+                              {"name": "REGULAR_SUBMISSION", "result": "FAIL", "value": 4, "limit": 4},
+                              {"name": "MATCHES_THEMES", "result": "PASS"},
+                              {"name": "MATCHES_THEMES", "result": "PASS"},
+                              {"name": "SELF_CORRELATION", "result": "PENDING"}]}}
+    install(client, {"/check": [resp(200, body)]})
+    out = await client.get_submission_check("A1", max_wait=0)
+    assert out["account_blockers"] == ["REGULAR_SUBMISSION"] and out["failed"] == []
+    assert out["is_passed"] is True and "pending_note" in out
+    assert [r["name"] for r in out["checks"]].count("MATCHES_THEMES") == 1
+
+
+def test_empty_signal_is_flagged():
+    alpha = {"id": "Z", "regular": {"code": "equal(x, 0)"},
+             "is": {"sharpe": 0, "turnover": 0, "checks": [{"name": "CONCENTRATED_WEIGHT", "result": "FAIL"}]}}
+    assert pf._compact_alpha_row(alpha)["empty_signal"] is True
+    alpha["is"].update(sharpe=1.2, turnover=0.3)
+    assert "empty_signal" not in pf._compact_alpha_row(alpha)

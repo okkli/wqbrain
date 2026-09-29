@@ -25,7 +25,7 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_CORR_QUEUE_SECONDS` | `3600` | 一个查询在后台最多存活多久，超时仍无结果就放弃 |
 | `WQMCP_CORR_ROTATE` | `0` | 默认查询不会丢位置，一直占着名额等结果。设为 `1` 时，占满 `WQMCP_CORR_MAX_SLOT_SECONDS`（默认 600）还没结果就排到队尾 |
 | `WQMCP_CHECK_MAX_ALPHAS` | `1` | 提交检查单独一条通道，同一时刻最多算几个 |
-| `WQMCP_CORR_COOLDOWN_SECONDS` / `WQMCP_CORR_COOLDOWN_MAX` | `300` / `1800` | 判定限流后完全停止请求的时长，连续无结果时逐次加倍到上限。设为 `0` 则只降速、不停 |
+| `WQMCP_CORR_COOLDOWN_SECONDS` / `WQMCP_CORR_COOLDOWN_MAX` | `120` / `1800` | 判定限流后完全停止请求的时长，连续无结果时逐次加倍到上限。设为 `0` 则只降速、不停 |
 | `WQMCP_SUBMIT_QUEUE` | `1` | 模拟名额满时，请求进入本服务的先进先出队列等待。设为 `0` 则直接返回 `RATE_LIMITED` |
 | `WQMCP_SUBMIT_QUEUE_MAX` / `WQMCP_SUBMIT_QUEUE_SECONDS` | `50` / `7200` | 发枪队列最多排几个请求、一个请求最多等多久 |
 | `WQMCP_SUBMIT_QUEUE_INTERVAL` | `15` | 名额满时每隔几秒重试队首的请求 |
@@ -37,8 +37,12 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_RESULTS_DIR` | `<wqmcp>/results` | 带 `tag` 的模拟结果写到这里的 `<tag>.jsonl` |
 | `WQMCP_WATCH_SECONDS` / `WQMCP_WATCH_INTERVAL` | `10800` / `30` | 带 `tag` 的模拟在后台最多跟踪多久、每隔几秒查一次 |
 | `WQMCP_STALE_MULTI_SECONDS` / `WQMCP_STALE_SINGLE_SECONDS` | `1200` / `600` | 模拟的进度这么久没动，就标为 `stale` |
+| `WQMCP_STATE_FILE` | `<wqmcp>/state/server_state.json` | 重启后要保留的状态：每个模拟提交了什么、tag、已写入的结果、发枪队列。设为空则只放内存 |
+| `WQMCP_PROGRESS_SECONDS` | `10` | 调用进行中每隔几秒向客户端发一次进度通知 |
+| `WQMCP_SLOW_CALL_SECONDS` | `50` | 超过这个时长的调用在日志里记为 WARNING |
+| `WQMCP_LOOP_STALL_SECONDS` | `2` | 事件循环卡住超过这个时长，就把卡住的位置和正在等待的调用写进日志 |
 | `WQMCP_AUTO_RETRY_GLITCH` | `1` | multi 的子项全部失败且没有任何原因时，自动重发一次。设为 `0` 关闭 |
-| `WQMCP_CORR_STALL_SECONDS` | `180` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
+| `WQMCP_CORR_STALL_SECONDS` | `300` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
 | `WQMCP_CORR_THROTTLED_INTERVAL` | `60` | 被限流期间每个查询的轮询间隔（秒） |
 | `WQMCP_CORR_HOLD_SECONDS` | `90` | 只在关闭后台模式时有用：返回 PENDING 之后名额为这个 alpha 保留多久 |
 | `WQMCP_CORR_CACHE_SECONDS` | `1800` | 已算出的相关性在内存里保留多久，期间重复查询直接返回（结果带 `cached: true`）。设为 `0` 关闭 |
@@ -190,11 +194,12 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
   - 填 `"all"`：全部取消。
   - 取消只是让本服务停止排队和轮询。BRAIN 已经开始的计算不会因此停止，只是结果不再被取走。
   - 正在等这个查询的调用会收到 `status: CANCELLED`。取消之后可以重新提交。
-- **识别限流并冷却**：有 alpha 在算却连续 `WQMCP_CORR_STALL_SECONDS` 秒没有任何结果，或者收到 429，就判定为被限流。限流时继续请求只会让 BRAIN 更慢，所以：
+- **识别限流并冷却**：有 alpha 在算却连续 `WQMCP_CORR_STALL_SECONDS` 秒（默认 300，平台算一条相关性常常就要几分钟）没有任何结果，或者收到 429，就判定为被限流。限流时继续请求只会让 BRAIN 更慢，所以：
   - 冷却：完全停止相关性请求 5 分钟，队列原样保留，被打断的 alpha 排在最前面。提交检查不受冷却影响（见下）。
   - 试探：冷却结束后只放 1 个 alpha，每 `WQMCP_CORR_THROTTLED_INTERVAL` 秒查一次。
   - 有结果就恢复正常速度；`WQMCP_CORR_STALL_SECONDS` 秒内还没结果就再冷却，时长加倍（5、10、20、30 分钟）。
-  - 冷却期间的相关性调用立即返回 `cooling_down` 和 `resumes_in_seconds`，不向 BRAIN 发请求，并附上 `local_estimate`（ProdMemo 的本地估计，仅供初筛）。冷却的时间不计入查询的存活时间。
+  - 冷却期间的相关性调用照样等满 `wait_seconds`：冷却在这期间结束、结果又算出来了，就直接返回结果；否则返回 `cooling_down` 和 `resumes_in_seconds`，并附上 `local_estimate`（ProdMemo 的本地估计，仅供初筛）。冷却的时间不计入查询的存活时间。
+  - 冷却从 2 分钟起步，连续无结果时加倍（2、4、8、16、30 分钟）。
   - 手动控制：`check_alpha(check="cooldown", wait_seconds=600)` 立即开始冷却，`check_alpha(check="resume")` 立即恢复。
 - **不丢位置**：查询一直占着名额等结果，不会因为等得久被挪到队尾。
 - **排队顺序**：被冷却打断的 → `priority="high"` 的 → 只查 PROD 的、或已等满 5 分钟的 → 其余；同一档内先来先算。
@@ -217,6 +222,13 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - `mode="concurrent"` 时，被接受的项是 `SUBMITTED`，没名额的项是 `QUEUED`。
 - `queue=False` 保持原来的行为。队列只在内存里，服务重启后丢失。
 
+**调用的可观测性**
+- 每次工具调用在日志里记一行：编号、工具、参数摘要、结果（ok / error / deadline / cancelled）和耗时；超过 50 秒记为 WARNING。
+- 事件循环卡住超过 2 秒时，把卡住的位置和正在等待的调用写进日志。
+- 调用进行中每 10 秒向客户端发一次进度通知（客户端要求时），避免客户端因"长时间无响应"放弃调用。
+- `brain_status` 的 `server` 给出运行的版本（`release`）、启动时间和工具列表指纹（`tools_hash`）。客户端的工具列表缺少文档里写的参数时，是客户端还拿着旧版本的工具列表，重连 MCP 即可。
+- 发布重启时，正在处理中的调用会被断开，客户端要等到自己的空闲超时才会报错。重启后的服务从状态文件恢复发枪队列、运行时长、tag 和结果记录。
+
 **结果记到服务器上的文件**
 
 `create_simulation(..., tag="G-r3", labels=[...])`：
@@ -231,6 +243,10 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - multi 的子项全部失败且都没有原因时，判为平台故障，自动重发一次；原 id 返回 `RETRIED` 和 `retried_as`，之后查原 id 跟随新的一次。
 - BRAIN 对已跑完的模拟返回 404 时，按表达式和设置从 alpha 列表里找回结果（`recovered: true`）。
 - `get_simulation(format="tsv")`：结果压成一段 TSV，是最短的答复。多个 id 共用一个等待预算；等待被截到 40 秒时答复里有 `wait_capped_to`。
+
+**表达式参数的编码**
+
+有些客户端会把"字符串或列表"类型的参数多编码一层：表达式变成带引号的 `"rank(x)"`（平台会把它当成字符串常量，所有子项报 `found None`），或者整个列表变成一个字符串。服务端会还原，并在 `warnings` 里说明。以引号开头的表达式也会被预检拦下。
 
 **多枪结果**
 - 每行带 `index`，即它是请求里的第几项。
@@ -250,15 +266,27 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 
 在本账户 765 条跑成功的 alpha 上检查，零误报。
 
+- multi：有问题就整批不发。single / concurrent：有问题的项不发，列在 `refused` 里，其余照发。`force=True` 全部照发。
+- `ops_est` 给出每一项按平台口径估算的算子数；设了 `max_ops` 时，超出的项同样不发。
+
 **精简行**
 - `fails`：数值没达到门槛的检查项，写成 `SHARPE 1.4<1.58`，不管 BRAIN 判的是 FAIL 还是 WARNING（BRAIN 在同一批里对同类未达标项判得不一致）。BRAIN 没判 FAIL 的带标记，如 `(W)` 表示它只判了 WARNING。没有数值的 FAIL 项写名字。
 - `warns`：其余的 WARNING 项（如 CLUSTER_TEST）。
 - 没有值的键不输出（如 FULL 模式下的 `robust_sharpe`）。
-- 同一批子项共同的设置只在父级 `set` 出现一次，各行只列不同的项；`nanHandling`、`pasteurization`、`maxPosition`、`unitHandling` 与默认不同时也会列出。
+- 同一批子项共同的设置只在父级 `set` 出现一次，各行只列不同的项；`nanHandling`、`pasteurization`、`maxPosition`、`unitHandling` 与默认不同时也会列出。`set` 取自平台实际使用的设置。
+- 平台实际使用的设置与提交的不同时，行里有 `settings_mismatch`。
+- 同一表达式、同一设置之前跑过 QUICK 时，FULL 的行带 `same_as_quick`（那次 QUICK 的 alpha id）。
+- 从未持仓的空信号（换手和 Sharpe 都为 0）标 `empty_signal: true`，这时 fails 没有参考价值，需要检查表达式本身（如 `equal(x, 0)` 而字段从不为 0）。
+- 查询多个 id 时，本客户端已经完整拿到过的完成结果只给一行摘要（`returned_before: true`）；`only_pending=True` 让所有已完成的都只给摘要。单独查某个 id 时总是给完整结果。
+- 同一个模拟的并发查询合并成一次。
+- FULL multi 运行中，平台只返回一个进度数，不列子项，所以没有子项完成数。
 - 被连带取消的子项压成 `cancelled: [序号]`。
 - 说明文字每次调用只出现一次，不在每行重复。
 
 **提交检查的结论**
+- 账户级的限制（如 `REGULAR_SUBMISSION`：当日提交额度用完）单独放在 `account_blockers`，不计入 `failed` 和 `is_passed`。
+- 同名同值的重复检查行只保留一行。
+- `SELF` / `PROD_CORRELATION` 是平台在提交检查内部计算的，不经过本服务的相关性队列，所以在队列里看不到它们。
 - 有检查项是 ERROR 时，`all_passed` 为 null，不给结论。
 - PROD_CORRELATION 是 ERROR 时，备用端点的值放在 `prod_fallback` 里并注明来源，不计入 `all_passed`。
 - `prod_source` 说明 `prod_correlation` 来自提交检查还是备用端点。
@@ -275,6 +303,7 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
   - 本地池里没有接近的 alpha、pool 在该区域没有预测力、或区间太宽时，`confidence` 为 `low`。
 - `get_datasets` 每页 20 条、默认只返回关键字段，`detail=True` 返回完整对象，`category` 按类目过滤。
 - `get_datafields` 默认精简（id、type、coverage、dateCoverage、userCount、alphaCount、描述前 80 字），每页最多 500 条（内部按 BRAIN 的上限 50 分页取）。
+- prod 相关性平台返回的是分布直方图（每 0.1 一档有多少条生产 alpha），不是逐条 alpha：返回 0.5 以上的非空档 `histogram_top` 和超过阈值的条数 `alphas_over_threshold`。self 相关性照旧给最相关的 3 条。
 - `get_alpha_recordset(alpha_id, "yearly-stats")` 是这条 alpha 自己的逐年数据；`get_alpha_performance` 是加入前后的组合数据。
 - `list_alphas` 和 `get_activity(kind="diversity-score")` 的日期可以只写 `2026-06-29`。BRAIN 只接受带时区的完整时间，工具会补成当天 00:00:00 或 23:59:59（UTC）。
 - `check_alpha` 查 QUICK 模式的 alpha 时，会说明 BRAIN 不支持检查这类 alpha，需要用 FULL 模式重跑。
