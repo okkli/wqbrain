@@ -82,6 +82,7 @@ class FakeState:
     forgotten: set = field(default_factory=set)   # simulations BRAIN answers 404 for
     listed: Optional[List[Dict[str, Any]]] = None  # what /users/self/alphas lists instead
     ignore_setting: Optional[Tuple[str, Any]] = None  # BRAIN runs every alpha with this setting
+    delete_finished_400: bool = False   # DELETE of a finished simulation is refused
 
     def tick(self, key: str) -> int:
         with self.lock:
@@ -299,6 +300,9 @@ def _get_sim(fb: FakeBrain, q, body, sid: str) -> Response:
 
 @route("DELETE", r"/simulations/([^/]+)")
 def _del_sim(fb, q, body, sid) -> Response:
+    sim = fb.state.sims.get(sid) or {}
+    if fb.state.delete_finished_400 and sim.get("polls", 0) >= fb.state.child_polls_needed:
+        return 400, {}, {"detail": "Simulation is already complete."}
     return 200, {}, None
 
 
@@ -369,6 +373,7 @@ def _get_alpha(fb, q, body, aid) -> Response:
             made["settings"][fb.state.ignore_setting[0]] = fb.state.ignore_setting[1]
         if fb.state.alpha_checks is not None:
             made["is"] = {**made["is"], "checks": fb.state.alpha_checks}
+
         return 200, {}, made
     return 200, {}, alpha(aid)
 
@@ -482,6 +487,7 @@ def _field(fb, q, body, fid) -> Response:
                          "data": [{"region": r, "delay": 1, "universe": f"U{i}"} for i in range(10)
                                   for r in ("USA", "EUR", "ASI", "GLB", "JPN")]}
     kind = {"subindustry": "GROUP", "industry": "GROUP", "sector": "GROUP"}.get(fid, "MATRIX")
+
     if fid.startswith("evt"):
         kind = "VECTOR"
     return 200, {}, {"id": fid, "type": kind,
@@ -512,7 +518,7 @@ def _operators(fb, q, body) -> Response:
         "Cross Sectional": "zscore scale quantile winsorize normalize",
         "Group": "group_neutralize group_rank group_mean",
         "Vector": "vec_avg vec_sum",
-        "Logical": "if_else",
+        "Logical": "if_else equal",
         # expressions the fake platform itself answers in special ways
         "Special": "fail alias dup bad f g h ex x_op",
     }.items() for n in names.split()]

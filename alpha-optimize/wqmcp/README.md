@@ -36,7 +36,8 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_CORR_ABANDON_SECONDS` | `1200` | 排队中的查询这么久没人再来问，就自动出队 |
 | `WQMCP_RESULTS_DIR` | `<wqmcp>/results` | 带 `tag` 的模拟结果写到这里的 `<tag>.jsonl` |
 | `WQMCP_WATCH_SECONDS` / `WQMCP_WATCH_INTERVAL` | `10800` / `30` | 带 `tag` 的模拟在后台最多跟踪多久、每隔几秒查一次 |
-| `WQMCP_STALE_MULTI_SECONDS` / `WQMCP_STALE_SINGLE_SECONDS` | `1200` / `600` | 模拟的进度这么久没动，就标为 `stale` |
+| `WQMCP_STALE_MULTI_SECONDS` / `WQMCP_STALE_SINGLE_SECONDS` | `1200` / `600` | FULL 模拟的进度这么久没动，就标为 `stale` |
+| `WQMCP_STALE_QUICK_MULTI_SECONDS` / `WQMCP_STALE_QUICK_SINGLE_SECONDS` | `480` / `300` | QUICK 模拟的同一阈值 |
 | `WQMCP_STATE_FILE` | `<wqmcp>/state/server_state.json` | 重启后要保留的状态：每个模拟提交了什么、tag、已写入的结果、发枪队列。设为空则只放内存 |
 | `WQMCP_PROGRESS_SECONDS` | `10` | 调用进行中每隔几秒向客户端发一次进度通知 |
 | `WQMCP_SLOW_CALL_SECONDS` | `50` | 超过这个时长的调用在日志里记为 WARNING |
@@ -238,7 +239,12 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 
 **模拟状态**
 - 运行中返回 `running_seconds`，不再返回没有意义的 `progress`（BRAIN 只给 0.1、0.15、0.35 这几档）。
-- 进度 20 分钟（multi）/ 10 分钟（single）没动时标 `stale: true` 和 `stalled_seconds`，建议取消后重发。
+- 进度长时间没动时标 `stale: true` 和 `stalled_seconds`，建议取消后重发。阈值：FULL multi 20 分钟、FULL single 10 分钟、QUICK multi 8 分钟、QUICK single 5 分钟。平台不告诉是哪个子项慢，提示里建议拆成 concurrent 重发来定位。
+- 取消一个已经结束的模拟时，返回 `already_complete: true` 和它的结果，不再报 400。
+- 完成结果里的 `diagnostics`：
+  - `no_effect`：同一表达式只差一个设置、结果却完全相同，说明这个设置没有生效，并给出可能原因（decay：信号在无数据日是 NaN 且 `nanHandling=OFF`，或 FAST 中性化）。
+  - `decay_not_applied`：decay ≥ 20 但换手仍大于 1。
+  - `concentrated_weight`：平台不给这项的数值，集中给出一次诊断建议。
 - `create_simulation(resubmit="<模拟 id>")`：把某次提交原样再发一次（设置、tag、label 都相同）。
 - multi 的子项全部失败且都没有原因时，判为平台故障，自动重发一次；原 id 返回 `RETRIED` 和 `retried_as`，之后查原 id 跟随新的一次。
 - BRAIN 对已跑完的模拟返回 404 时，按表达式和设置从 alpha 列表里找回结果（`recovered: true`）。
@@ -268,6 +274,7 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 
 - multi：有问题就整批不发。single / concurrent：有问题的项不发，列在 `refused` 里，其余照发。`force=True` 全部照发。
 - `ops_est` 给出每一项按平台口径估算的算子数；设了 `max_ops` 时，超出的项同样不发。
+- 对以 `_min/_max/_mean/_avg/_median` 结尾的字段做 `equal(x, 常数)` 或 `x == 常数` 时，在 `warnings` 里提示信号很可能是常量（IND 轮这类比较 16 枪里 15 枪是常量；`*_std` 字段 158 枪没有一枪是常量，不提示）。只提示，不拦截。
 
 **精简行**
 - `fails`：数值没达到门槛的检查项，写成 `SHARPE 1.4<1.58`，不管 BRAIN 判的是 FAIL 还是 WARNING（BRAIN 在同一批里对同类未达标项判得不一致）。BRAIN 没判 FAIL 的带标记，如 `(W)` 表示它只判了 WARNING。没有数值的 FAIL 项写名字。
