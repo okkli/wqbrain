@@ -1250,14 +1250,18 @@ class BrainApiClient:
             started = sent.get("at") or seen["first"]
             state["running_seconds"] = int(now - started)
             is_multi = state.get("type") == "MULTI" or len(sent.get("items") or []) > 1
-            limit = STALE_MULTI_SECONDS if is_multi else STALE_SINGLE_SECONDS
+            quick = all(str((i.get("settings") or {}).get("simulationMode") or "").upper() == "QUICK"
+                        for i in sent.get("items") or [{}])
+            limit = _stale_limit(is_multi, quick)
             stalled = now - seen["changed"]
             if stalled > limit:
                 state.update(stale=True, stalled_seconds=int(stalled), note=(
                     f"Looks stuck: no progress for {int(stalled // 60)} minutes (BRAIN usually finishes a "
-                    f"{'multi' if is_multi else 'single'} simulation well within {int(limit // 60)}). It holds "
-                    "an account slot: cancel_simulation it and submit again, e.g. "
-                    f"create_simulation(resubmit=\"{sim_id}\")."))
+                    f"{'QUICK' if quick else 'FULL'} {'multi' if is_multi else 'single'} simulation well within "
+                    f"{int(limit // 60)}). It holds an account slot: cancel_simulation it and submit again, e.g. "
+                    f"create_simulation(resubmit=\"{sim_id}\")."
+                    + (" BRAIN does not say which child is slow; resubmitting the items with mode=\"concurrent\" "
+                       "runs each on its own and shows which one it is." if is_multi else "")))
             return state
         self._seen.pop(sim_id, None)
         if self._is_platform_glitch(state) and sent.get("payloads") and AUTO_RETRY_GLITCH \
@@ -1270,6 +1274,9 @@ class BrainApiClient:
                         "note": ("BRAIN failed every child without giving a reason — a platform hiccup "
                                  "(the same batch usually passes when sent again). It was resubmitted once as "
                                  f"{retried['simulation_id']}; asking for {sim_id} follows the new run.")}
+        found = _diagnostics(state, sent.get("items") or [])
+        if found:
+            state["diagnostics"] = found
         if compact:
             state = _compact_state(state)
         await self._log_results(sim_id, state)
@@ -1919,9 +1926,9 @@ class BrainApiClient:
             ahead = self.submit_queue.index(entry)
             out.update(queue_position=ahead + 1, waiting_seconds=int(time.time() - entry["enqueued"]),
                        attempts=entry["attempts"], retry_after_seconds=15.0,
-                       note=("The account's simulation slots are full. This request waits in this "
-                             "server's queue (first in, first out) and is sent as soon as BRAIN accepts "
-                             f"it. Follow it with get_simulation(simulation_ids=\"{entry['queue_id']}\"); "
+                       note=("The account's simulation slots are full. Queued requests wait in this "
+                             "server's queue (first in, first out) and are sent as soon as BRAIN accepts "
+                             "them. Follow one with get_simulation(simulation_ids=<its queue_id>); "
                              "cancel_simulation takes it out."))
         else:
             out.update({k: entry[k] for k in ("simulation_id", "progress_url", "error", "waited_seconds")
@@ -2130,6 +2137,8 @@ class BrainApiClient:
             issues += _semantic_issues(expr, operators, types)
             if issues:
                 rows.append({"index": index, "expr": _cut(expr, 120), "issues": issues})
+            for text in _constant_signal_warnings(expr, types):
+                warnings.append({"index": index, "expr": _cut(expr, 120), "issue": text})
             if max_ops:
                 ops = _estimated_ops(expr)
                 if ops > max_ops:
@@ -2144,6 +2153,12 @@ class BrainApiClient:
         url = _simulation_url(ref)
         response = await self._request('delete', url)
         if response.status_code >= 400:
+            # BRAIN refuses to cancel what has already ended: say so, with the result.
+            state = await self._check_once(url)
+            if state.get("status") not in ("RUNNING", "UNKNOWN", None):
+                return {"simulation_id": url.rsplit('/', 1)[-1], "cancelled": False,
+                        "already_complete": True, "result": state,
+                        "note": "It had already ended, so there was nothing to cancel; here is its result."}
             raise Exception(_http_error_detail(response, "cancel simulation"))
         return {"simulation_id": url.rsplit('/', 1)[-1], "cancelled": True,
                 "http_status": response.status_code}
@@ -4066,6 +4081,28 @@ def _semantic_issues(expr: str, operators: Dict[str, str], field_types: Dict[str
     return list(dict.fromkeys(issues))
 
 
+# Fields that are a per-day min / max / mean of scores: equal(x, 0) on them gave a
+# constant signal in 15 of 16 runs of the 2026-09-29 IND round. Deliberately
+# narrow: *_std fields (158 runs) and max_* / mean_* prefixes were never constant.
+_CONTINUOUS_FIELD_RE = re.compile(r"_(min|max|mean|avg|median)$", re.I)
+
+
+def _constant_signal_warnings(expr: str, field_types: Dict[str, str]) -> List[str]:
+    """equal(x, c) / x == c where x is a continuous statistic: the comparison is
+    (almost) never true, the signal is a constant and the run is wasted."""
+    text = _strip_strings_and_comments(expr)
+    found = []
+    pattern = (r"\bequal\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*-?\d+(\.\d+)?\s*\)"
+               r"|\b([A-Za-z_][A-Za-z0-9_]*)\s*==\s*-?\d+(\.\d+)?")
+    for m in re.finditer(pattern, text):
+        name = m.group(1) or m.group(3)
+        if field_types.get(name) == "MATRIX" and _CONTINUOUS_FIELD_RE.search(name):
+            found.append(f"{m.group(0).strip()}: {name} is a per-day min / max / mean, which is almost never "
+                         "exactly that value (and NaN on days without data): the signal is likely a constant "
+                         "(turnover 0, sharpe 0). Such comparisons were constant in 15 of 16 earlier runs.")
+    return found
+
+
 def _balanced_call(text: str, open_at: int) -> bool:
     """True when the parenthesis at open_at closes at the very end of text."""
     depth = 0
@@ -4179,6 +4216,81 @@ def _match_key(code: Any, settings: Dict[str, Any]) -> Tuple:
         else (float(settings[k]) if isinstance(settings.get(k), (int, float))
               and not isinstance(settings.get(k), bool) else settings.get(k))
         for k in _MATCH_SETTINGS)
+
+
+# Metrics that decide whether two results are "the same run".
+_SAME_RUN_KEYS = ("sharpe", "fitness", "turnover", "margin_bps", "returns")
+_NO_EFFECT_HINTS = {
+    "decay": ("decay changes nothing when the signal is NaN on the days without data and nanHandling "
+              "is OFF (BRAIN does not decay across NaN; try nan_handling=\"ON\" or ts_backfill), or "
+              "under FAST neutralization"),
+    "nanHandling": "the expression has no NaN for nanHandling to fill",
+    "truncation": "no stock reaches the truncation limit: the weights are already spread",
+    "maxTrade": "maxTrade is ignored in QUICK mode; in FULL it only acts on illiquid names",
+}
+
+
+def _diagnostics(state: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Things a finished batch shows that no single row says: a setting that did
+    not change the result at all, decay that is not applied, and the
+    CONCENTRATED_WEIGHT wall BRAIN gives no number for."""
+    rows = state.get("alpha_results")
+    if rows is None and isinstance(state.get("alpha"), dict):
+        rows = [{"index": 0, **state["alpha"]}]
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    done = [r for r in rows if r.get("status", "COMPLETE") == "COMPLETE" and r.get("sharpe") is not None]
+
+    def sent(r: Dict[str, Any]) -> Dict[str, Any]:
+        i = r.get("index", 0)
+        return (items[i].get("settings") or {}) if i < len(items) else {}
+
+    def expr(r: Dict[str, Any]) -> Optional[str]:
+        i = r.get("index", 0)
+        return re.sub(r"\s+", "", items[i].get("expr") or "") if i < len(items) else None
+
+    def metrics(r: Dict[str, Any]) -> Tuple:
+        return tuple(r.get(k) for k in _SAME_RUN_KEYS)
+
+    # Items that differ in exactly one setting but give identical numbers.
+    seen: set = set()
+    for a_pos, a in enumerate(done):
+        for b in done[a_pos + 1:]:
+            sa, sb = sent(a), sent(b)
+            if not sa or not sb or expr(a) != expr(b):
+                continue          # only the same expression run with other settings says anything
+            diff = [k for k in set(sa) | set(sb) if sa.get(k) != sb.get(k)]
+            if len(diff) != 1 or metrics(a) != metrics(b):
+                continue
+            key = diff[0]
+            group = next((g for g in out if g.get("setting") == key and g.get("kind") == "no_effect"), None)
+            if group is None:
+                group = {"kind": "no_effect", "setting": key, "items": [], "values": [],
+                         "note": f"{key} did not change the result: these items differ only in {key} and "
+                                 "give the same numbers. " + _NO_EFFECT_HINTS.get(key, "")}
+                out.append(group)
+            for r, st in ((a, sa), (b, sb)):
+                if (key, r.get("index")) not in seen:
+                    seen.add((key, r.get("index")))
+                    group["items"].append(r.get("index"))
+                    group["values"].append(st.get(key))
+    # High turnover despite a long decay: the decay is not applied.
+    slow = [r.get("index") for r in done
+            if (r.get("turnover") or 0) > 1 and float(sent(r).get("decay") or 0) >= 20]
+    if slow:
+        out.append({"kind": "decay_not_applied", "items": slow,
+                    "note": "turnover above 1 although decay is 20 or more: the decay is most likely not "
+                            "applied (a signal that is NaN on the days without data, with nanHandling OFF)."})
+    walls = [r.get("index") for r in done
+             if any(str(f).split(" ")[0] == "CONCENTRATED_WEIGHT" for f in r.get("fails") or [])]
+    if walls:
+        out.append({"kind": "concentrated_weight", "items": walls,
+                    "note": "CONCENTRATED_WEIGHT: BRAIN gives no number for it. It fails when a few stocks "
+                            "carry most of the weight — typical of sparse / binary (event) signals that are "
+                            "zero for most stocks. Truncation only caps single names; spreading the signal "
+                            "helps more: rank / group_rank it, or combine it with a dense signal."})
+    return out
 
 
 def _compact_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -4355,6 +4467,15 @@ SUBMIT_QUEUE_MAX_INTERVAL = float(os.environ.get("WQMCP_SUBMIT_QUEUE_MAX_INTERVA
 # A simulation whose progress has not moved for this long is reported as stale.
 STALE_MULTI_SECONDS = float(os.environ.get("WQMCP_STALE_MULTI_SECONDS", "1200"))
 STALE_SINGLE_SECONDS = float(os.environ.get("WQMCP_STALE_SINGLE_SECONDS", "600"))
+# QUICK runs finish in a few minutes: they are stale much sooner.
+STALE_QUICK_MULTI_SECONDS = float(os.environ.get("WQMCP_STALE_QUICK_MULTI_SECONDS", "480"))
+STALE_QUICK_SINGLE_SECONDS = float(os.environ.get("WQMCP_STALE_QUICK_SINGLE_SECONDS", "300"))
+
+
+def _stale_limit(is_multi: bool, quick: bool) -> float:
+    if quick:
+        return STALE_QUICK_MULTI_SECONDS if is_multi else STALE_QUICK_SINGLE_SECONDS
+    return STALE_MULTI_SECONDS if is_multi else STALE_SINGLE_SECONDS
 # Resubmit (once) a multi-simulation BRAIN failed without saying why.
 AUTO_RETRY_GLITCH = os.environ.get("WQMCP_AUTO_RETRY_GLITCH", "1") != "0"
 # Results of tagged simulations: results/<tag>.jsonl, followed in the background.
@@ -4902,10 +5023,11 @@ async def create_simulation(
             key = (item.regular or "", str(item.settings.region), item.settings.delay)
             seen_items.setdefault(key, i)
         try:
-            unknown, _ = await brain_client.field_problems(
+            unknown, soft = await brain_client.field_problems(
                 [(i, key[0], {"region": key[1], "delay": key[2]}) for key, i in seen_items.items()])
         except Exception:   # the pre-check must never stop a submission by failing itself
-            unknown = []
+            unknown, soft = [], []
+        warnings += list(dict.fromkeys(f"item {w['index']}: {w['issue']}" for w in soft))
         key_of_index = {i: key for key, i in seen_items.items()}
         for row in unknown:
             key = key_of_index[row["index"]]

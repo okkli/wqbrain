@@ -1217,3 +1217,50 @@ async def test_brain_status_names_the_release(mcp_session, fake):
     server = out["server"]
     assert server["tools"] == len(TOOLS) and len(server["tools_hash"]) == 10 and server["started"].endswith("Z")
     assert server["release"]
+
+
+async def test_cancelling_a_finished_simulation_returns_it(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    fake.state.delete_finished_400 = True
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions="rank(x)")
+        await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        out = await call(s, "cancel_simulation", simulation_id=sub["simulation_id"])
+    assert out["cancelled"] is False and out["already_complete"] is True
+    assert out["result"]["status"] == "COMPLETE" and out["result"]["alpha"]["expr"] == "rank(x)"
+
+
+async def test_queued_items_share_one_note(mcp_session, fake):
+    fake.state.sim_slots_full = True
+    async with mcp_session() as s:
+        a = await call(s, "create_simulation", expressions="rank(a)", queue=True)
+        b = await call(s, "create_simulation", expressions="rank(b)", queue=True)
+        both = await call(s, "get_simulation", simulation_ids=[a["queue_id"], b["queue_id"]])
+        for q in (a, b):
+            await call(s, "cancel_simulation", simulation_id=q["queue_id"])
+    assert "|" not in both["note"] and all("note" not in x for x in both["simulations"])
+
+
+async def test_quick_multi_is_stale_sooner(mcp_session, fake, monkeypatch):
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"], simulation_mode="QUICK")
+        monkeypatch.setattr(pf, "STALE_QUICK_MULTI_SECONDS", -1.0)
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
+    assert out["stale"] is True and "QUICK multi" in out["note"] and 'mode="concurrent"' in out["note"]
+
+
+async def test_batch_diagnostics_reach_the_answer(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    # the fake gives every child the same numbers, as BRAIN does when decay is not applied
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions="rank(x)",
+                         per_alpha_settings=[{"decay": 4}, {"decay": 20}])
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+    assert out["diagnostics"][0]["kind"] == "no_effect" and out["diagnostics"][0]["values"] == [4, 20]
+
+
+async def test_constant_signal_is_warned_before_sending(mcp_session, fake):
+    async with mcp_session() as s:
+        out = await call(s, "create_simulation", expressions="rank(equal(snt_pos_mean, 0))")
+    assert out["status"] == "SUBMITTED" and any("per-day min / max / mean" in w for w in out["warnings"])

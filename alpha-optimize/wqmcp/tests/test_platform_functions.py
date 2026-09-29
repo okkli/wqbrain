@@ -878,3 +878,48 @@ def test_empty_signal_is_flagged():
     assert pf._compact_alpha_row(alpha)["empty_signal"] is True
     alpha["is"].update(sharpe=1.2, turnover=0.3)
     assert "empty_signal" not in pf._compact_alpha_row(alpha)
+
+
+# --- field report 2026-09-29 supplement ---------------------------------------------
+
+def _row(i, **m):
+    return {"index": i, "status": "COMPLETE", "sharpe": 1.2, "fitness": 0.8, "turnover": 0.3, "margin_bps": 5.0, **m}
+
+
+def test_a_setting_without_effect_is_diagnosed():
+    items = [{"expr": "rank(x)", "settings": {"decay": d, "neutralization": "FAST", "nanHandling": "OFF"}}
+             for d in (4, 20, 60)] + [{"expr": "rank(y)", "settings": {"decay": 9, "neutralization": "FAST",
+                                                                       "nanHandling": "OFF"}}]
+    state = {"alpha_results": [_row(0), _row(1), _row(2, sharpe=1.3), _row(3)]}
+    found = pf._diagnostics(state, items)       # item 3: same numbers, other expression -> left out
+    assert found == [{"kind": "no_effect", "setting": "decay", "items": [0, 1], "values": [4, 20],
+                      "note": found[0]["note"]}]
+    assert "nanHandling is OFF" in found[0]["note"] and "FAST" in found[0]["note"]
+
+
+def test_decay_not_applied_and_the_concentrated_weight_wall():
+    items = [{"settings": {"decay": 60}}, {"settings": {"decay": 4}}]
+    state = {"alpha_results": [_row(0, turnover=1.52, fails=["CONCENTRATED_WEIGHT"]), _row(1, turnover=1.4)]}
+    kinds = {d["kind"]: d for d in pf._diagnostics(state, items)}
+    assert kinds["decay_not_applied"]["items"] == [0]
+    assert kinds["concentrated_weight"]["items"] == [0] and "no number" in kinds["concentrated_weight"]["note"]
+    assert pf._diagnostics({"alpha": _row(0)}, [{"settings": {"decay": 2}}]) == []
+
+
+def test_constant_signal_warning():
+    types = {f: "MATRIX" for f in ("snt21_pos_max", "snt21_neg_mean", "snt21_pos_std", "news_article_count",
+                                    "max_lower_price_target_topic", "mean_share_repurchase_score")}
+    types["sector"] = "GROUP"
+    assert pf._constant_signal_warnings("rank(equal(snt21_pos_max, 0))", types)[0].startswith(
+        "equal(snt21_pos_max, 0): snt21_pos_max is a per-day min / max / mean")
+    assert pf._constant_signal_warnings("if_else(snt21_neg_mean == 0, 1, 0)", types)
+    # never constant in the field data: std, counts, max_ / mean_ prefixes
+    for expr in ("equal(snt21_pos_std, 0)", "equal(news_article_count, 0)",
+                 "equal(max_lower_price_target_topic, 0)", "equal(mean_share_repurchase_score, 0)",
+                 "equal(sector, 3)"):
+        assert pf._constant_signal_warnings(expr, types) == [], expr
+
+
+def test_stale_limits_depend_on_the_mode():
+    assert pf._stale_limit(True, True) == 480 and pf._stale_limit(False, True) == 300
+    assert pf._stale_limit(True, False) == 1200 and pf._stale_limit(False, False) == 600
