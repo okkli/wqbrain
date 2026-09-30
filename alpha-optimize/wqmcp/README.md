@@ -19,7 +19,9 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_READ_ONLY` | `0` | 设为 `1` 时，所有会写 BRAIN 的操作都直接返回错误：建模拟、取消模拟、改 alpha 属性、提交 |
 | `WQMCP_ALLOW_SUBMIT` | `1` | 设为 `0` 时 `submit_alpha(confirm=True)` 报错；`confirm=False` 的预检仍可用 |
 | `WQMCP_ACCEPT_VERSIONS` | `0` | 设为 `1` 时按目录发送带版本号的 Accept 头。默认关闭，因为线上验证过的是不带版本号的请求；先用 `scripts/live_regression.py --accept-versions` 实测，再决定是否打开 |
-| `WQMCP_CORR_MAX_ALPHAS` | `2` | 同一时刻最多让 BRAIN 计算几个 alpha 的相关性（prod / self / power-pool / 提交检查），其余排队 |
+| `WQMCP_CORR_MAX_ALPHAS` | `2` | prod 通道同一时刻最多算几个 alpha，其余排队（`WQMCP_CORR_PROD_MAX` 可单独覆盖） |
+| `WQMCP_CORR_SELF_MAX` | `1` | self（含 power-pool）通道同一时刻最多算几个。prod 和 self 各走各的通道，慢的 self 不占 prod 的名额 |
+| `WQMCP_CORR_SELF_SLOT_SECONDS` | `600` | 一个 self 占通道这么久还没结果，就让出名额、回队列（保留原来的排队时间）；prod 一直占到出结果 |
 | `WQMCP_CORR_MIN_INTERVAL` | `0.5` | 相关性和提交检查接口的请求之间至少间隔几秒 |
 | `WQMCP_CORR_BACKGROUND` | `1` | 查询在后台继续排队和轮询，不随那次工具调用结束。设为 `0` 时查询随调用结束 |
 | `WQMCP_CORR_QUEUE_SECONDS` | `3600` | 一个查询在后台最多存活多久，超时仍无结果就放弃 |
@@ -32,7 +34,7 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_MAX_WAIT_SECONDS` | `40` | 任何工具单次调用最多等多久。连接在静默约 45 秒后会断开，所以 `wait_seconds` 超过这个值会被截到这个值 |
 | `WQMCP_TOOL_DEADLINE_SECONDS` | `75` | 只读工具超过这个时间没有结果就放弃并返回 `timed_out`，不会一直挂着 |
 | `WQMCP_COMPACT_EXPR_CHARS` | `1500` | 精简行里表达式最多保留多少字符，`0` 表示不截断 |
-| `WQMCP_CORR_AGING_SECONDS` | `300` | 排队超过这个时间的查询，和只查 PROD 的查询同等优先 |
+| `WQMCP_CORR_AGING_SECONDS` | `300` | 从第一次提出算起，排队超过这个时间的查询排在普通查询前面（`priority="high"` 之后） |
 | `WQMCP_CORR_ABANDON_SECONDS` | `1200` | 排队中的查询这么久没人再来问，就自动出队 |
 | `WQMCP_RESULTS_DIR` | `<wqmcp>/results` | 带 `tag` 的模拟结果写到这里的 `<tag>.jsonl` |
 | `WQMCP_WATCH_SECONDS` / `WQMCP_WATCH_INTERVAL` | `10800` / `30` | 带 `tag` 的模拟在后台最多跟踪多久、每隔几秒查一次 |
@@ -42,7 +44,7 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_PROGRESS_SECONDS` | `10` | 调用进行中每隔几秒向客户端发一次进度通知 |
 | `WQMCP_SLOW_CALL_SECONDS` | `50` | 超过这个时长的调用在日志里记为 WARNING |
 | `WQMCP_LOOP_STALL_SECONDS` | `2` | 事件循环卡住超过这个时长，就把卡住的位置和正在等待的调用写进日志 |
-| `WQMCP_AUTO_RETRY_GLITCH` | `1` | multi 的子项全部失败且没有任何原因时，自动重发一次。设为 `0` 关闭 |
+| `WQMCP_AUTO_RETRY_GLITCH` | `1` | multi 的子项全部失败且没有任何原因时，把每一项单独重发一次（找出坏的那项）。设为 `0` 关闭 |
 | `WQMCP_CORR_STALL_SECONDS` | `300` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
 | `WQMCP_CORR_THROTTLED_INTERVAL` | `60` | 被限流期间每个查询的轮询间隔（秒） |
 | `WQMCP_CORR_HOLD_SECONDS` | `90` | 只在关闭后台模式时有用：返回 PENDING 之后名额为这个 alpha 保留多久 |
@@ -246,7 +248,7 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
   - `decay_not_applied`：decay ≥ 20 但换手仍大于 1。
   - `concentrated_weight`：平台不给这项的数值，集中给出一次诊断建议。
 - `create_simulation(resubmit="<模拟 id>")`：把某次提交原样再发一次（设置、tag、label 都相同）。
-- multi 的子项全部失败且都没有原因时，判为平台故障，自动重发一次；原 id 返回 `RETRIED` 和 `retried_as`，之后查原 id 跟随新的一次。
+- multi 的子项全部失败且都没有原因时，不再原样重发整批（坏字段会让它再失败一次），而是每一项单独发一次（经过发枪队列）。原 id 返回 `RETRIED` 和 `retried_as`（各项的新 id 或队列号），之后查原 id 按原顺序合并各项结果。单独也失败且没有原因的项带 `diagnosis`：列出表达式里的字段，提示用 `get_datafields` 核对该 region / universe / delay 下是否真有数据。带 `tag` 时各项仍按原序号写入日志。
 - BRAIN 对已跑完的模拟返回 404 时，按表达式和设置从 alpha 列表里找回结果（`recovered: true`）。
 - `get_simulation(format="tsv")`：结果压成一段 TSV，是最短的答复。多个 id 共用一个等待预算；等待被截到 40 秒时答复里有 `wait_capped_to`。
 
@@ -277,7 +279,10 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - 对以 `_min/_max/_mean/_avg/_median` 结尾的字段做 `equal(x, 常数)` 或 `x == 常数` 时，在 `warnings` 里提示信号很可能是常量（IND 轮这类比较 16 枪里 15 枪是常量；`*_std` 字段 158 枪没有一枪是常量，不提示）。只提示，不拦截。
 
 **精简行**
-- `fails`：数值没达到门槛的检查项，写成 `SHARPE 1.4<1.58`，不管 BRAIN 判的是 FAIL 还是 WARNING（BRAIN 在同一批里对同类未达标项判得不一致）。BRAIN 没判 FAIL 的带标记，如 `(W)` 表示它只判了 WARNING。没有数值的 FAIL 项写名字。
+- `fails`：数值没达到门槛的检查项，写成 `SHARPE 1.4<1.58`，不管 BRAIN 判的是 FAIL 还是 WARNING（BRAIN 在同一批里对同类未达标项判得不一致）。BRAIN 没判 FAIL 的带标记，如 `(W)` 表示它只判了 WARNING。没有 LOW_/HIGH_ 前缀但带数值的 FAIL 项（如 IS_LADDER_SHARPE）同样写出数值：`IS_LADDER 1.2<1.58`；BRAIN 没给数值的写 `名字 (no value)`。
+- QUICK 行没有 CLUSTER_TEST：给 `cluster_est` = 0.76 × Sharpe（186 条 FULL alpha 上 CLUSTER / Sharpe 的中位数，p10 0.65、p90 0.94），估计值可能低于门槛时给 `cluster_risk`（`likely` / `possible`），好在跑 FULL 前就发现。
+- CONCENTRATED_WEIGHT 失败的行带 `long_short`（多 / 空持仓数），作为平台不给数值时的代理指标。
+- TSV 里 `set` 的键顺序固定（universe、decay、neutralization、truncation、…），逐项覆盖不会打乱顺序。
 - `warns`：其余的 WARNING 项（如 CLUSTER_TEST）。
 - 没有值的键不输出（如 FULL 模式下的 `robust_sharpe`）。
 - 同一批子项共同的设置只在父级 `set` 出现一次，各行只列不同的项；`nanHandling`、`pasteurization`、`maxPosition`、`unitHandling` 与默认不同时也会列出。`set` 取自平台实际使用的设置。
@@ -303,11 +308,12 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 实测 QUICK 下 `max_trade="ON"` 和 `"OFF"` 的结果逐位相同，而 FULL 下差别很大（Sharpe 6.39 → 2.33）。这样的项会出现在 `create_simulation` 返回的 `warnings` 里。
 
 **其他**
-- `compare_alphas(alpha_ids=[...])`：用各自的 PnL 在本地算 2–10 条 alpha 之间的相关性，未提交的 alpha 也可以，不消耗相关性请求。
+- `compare_alphas(alpha_ids=[...])`：用各自的 PnL 在本地算 2–10 条 alpha 之间的相关性，未提交的 alpha 也可以，不消耗相关性请求。相关性 ≥ 0.999 的一对标 `identical`，之后其中一条测出的 prod / self 直接给另一条用（`reused_from`），不再排队。
 - `prodmemo_check` 的 `prod_est`：
   - 按区域拟合（该区域标定点不少于 8 个时），否则用全部区域并注明。例如 EUR 的 PROD 平均比全局公式高 0.09，而且 pool 在 EUR 几乎预测不了 PROD。
   - 带 `range`（90% 区间）和标定点数；标定点不足时不给单点值。
   - 本地池里没有接近的 alpha、pool 在该区域没有预测力、或区间太宽时，`confidence` 为 `low`。
+  - 斜率低于 0.1（`PRODMEMO_EST_MIN_SLOPE`）时不给单点值，只给区间和 `no_point_estimate` 说明：EUR 的斜率只有 0.01~0.03，所有 alpha 都会被估成约 .71，实测却在 .56~.77。
 - `get_datasets` 每页 20 条、默认只返回关键字段，`detail=True` 返回完整对象，`category` 按类目过滤。
 - `get_datafields` 默认精简（id、type、coverage、dateCoverage、userCount、alphaCount、描述前 80 字），每页最多 500 条（内部按 BRAIN 的上限 50 分页取）。
 - prod 相关性平台返回的是分布直方图（每 0.1 一档有多少条生产 alpha），不是逐条 alpha：返回 0.5 以上的非空档 `histogram_top` 和超过阈值的条数 `alphas_over_threshold`。self 相关性照旧给最相关的 3 条。
@@ -323,6 +329,19 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - `get_activity(kind="pyramid-alphas")` 去掉了没有依据的回退路径。
 - diversity-score 分页读取，不再逐个请求 alpha。
 - payments 出错时两部分各自报原因。
+
+## 2026-09-30 实战问题的修复（EUR 第四轮）
+
+- **调用按时返回**：只读工具的每次调用有自己的时限（`wait_seconds + 20` 秒，最少 30，最多 `WQMCP_TOOL_DEADLINE_SECONDS`），HTTP 超时、重试等待、限流冷却都不会超过它。查模拟时 BRAIN 慢，就返回上一次看到的状态（`last_known: true`、`seen_seconds_ago`），不再挂到 75 秒报 UNKNOWN。服务端日志显示 319 秒无响应那次服务端按时回了，是客户端连接断开（与 ECONNRESET 一致）。
+- **prod / self 分通道**：见上面的环境变量。`check_alpha(check="correlation")` 先把 self 放进队列，然后等 prod：prod 一出就返回，self 在后台继续。
+- **队列顺序**：`priority="high"` → 冷却后回来试探的那一个 → 排队超过 5 分钟的（从第一次提出算，回队列不重新计时）→ 先来先到。队列里每行带 `rank_reason`、`lane`、`client`、`estimated_wait_seconds`；`lanes` 给各通道的上限和占用。
+- **谁在占槽**：每个 MCP 会话自动得到 `c1`、`c2`… 的名字，也可以 `check_alpha(client="J")` 自己起名，队列里显示出来。
+- **端点健康度**：队列快照里的 `endpoint_health`：`ok` / `slow` / `down`，最近几次 prod 的耗时、距上次出结果多久、按 QUICK / FULL 分开的耗时中位数。`down` 时建议先用 `compare_alphas` 在本地排除同轴。
+- **提交检查**：PROD 是 ERROR 时，时间够就隔 3 秒再查一次 `/check`。prod 已在后台队列里时也取它的结果作 `prod_fallback`。回答里有单一结论 `verdict`（pass / fail / unknown）和 `verdict_basis`；有账户限制时加 `submittable_now: false`。POWER_POOL_* 检查放进 `power_pool_checks`，不影响常规 alpha 的结论。
+- **整批无原因失败**：改为逐项单独重发（见“模拟状态”）。
+- **说明截断**：客户端会截断过长的工具说明，`tag` 等参数原本在 4000 字之后。`create_simulation`、`check_alpha`、`get_simulation` 的说明压缩到约 2000 字，关键参数放在最前。没带 tag 的 multi 完成时，每个会话提示一次 `tag` 的用法。
+- **算子数**：负数字面量的符号（`subtract(-1, x)`、`if_else(c, 1, -1)`、`x = -0.5`）不计为算子，与平台 `operatorCount` 一致。
+- 修掉的隐患：轮询退避 `1.6 ** polls` 在轮询约 1500 次后溢出，后台任务会崩；取消一个 alpha 时会连带清掉它在另一通道的名额。
 
 ## 测试
 

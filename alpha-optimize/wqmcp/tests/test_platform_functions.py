@@ -177,20 +177,23 @@ async def test_gate_queues_beyond_max_alphas_and_holds_the_slot(client):
     assert first["checks"]["production"]["status"] == "PENDING"
     assert "queued" not in first["checks"]["production"]
 
-    # BRAIN is still computing A1, so B2 has to wait and sends nothing
+    # BRAIN is still computing A1's prod, so B2's prod waits and sends nothing;
+    # its self has a lane of its own and starts
     sent = len(s.calls)
     second = await client.check_correlation("B2", "both", max_wait=0)
-    for entry in second["checks"].values():
-        assert entry["status"] == "PENDING" and entry["queued"] is True
-    assert second["status"] == "PENDING" and len(s.calls) == sent
+    assert second["checks"]["production"]["status"] == "PENDING" and second["checks"]["production"]["queued"] is True
+    assert "queued" not in second["checks"]["self"]
+    assert second["status"] == "PENDING"
+    assert [c[1] for c in s.calls[sent:]] == [s.calls[sent][1]] and "/B2/correlations/self" in s.calls[sent][1]
 
-    # asking again for A1 (either correlation) continues it instead of queueing
+    # asking again for A1's prod continues it instead of queueing (its self now
+    # waits behind B2's in the self lane)
     again = await client.check_correlation("A1", "both", max_wait=0)
-    assert not any(e.get("queued") for e in again["checks"].values())
+    assert not again["checks"]["production"].get("queued") and again["checks"]["self"]["queued"] is True
 
     # once A1 is finished its slot goes to B2
     s.routes["/alphas/A1/correlations"] = [resp(200, {"max": 0.4})]
-    done = await client.check_correlation("A1", "both", max_wait=0)
+    done = await client.check_correlation("A1", "prod", max_wait=0)
     assert done["status"] == "DONE"
     third = await client.check_correlation("B2", "prod", max_wait=0)
     assert "queued" not in third["checks"]["production"]
@@ -232,7 +235,7 @@ async def test_gate_is_first_come_first_served(client):
     gate = client.correlation_gate
     gate.max_alphas = 1
     gate.touch("A1", "prod")
-    b, c = gate.enqueue("B2"), gate.enqueue("C3")
+    b, c = gate.enqueue("B2", "prod"), gate.enqueue("C3", "prod")
     assert not gate.admit(b, "prod") and not gate.admit(c, "prod")
     gate.release("A1", "prod")
     assert not gate.admit(c, "prod")      # B2 asked first
@@ -258,6 +261,7 @@ async def test_finished_correlation_is_cached_and_overlapping_polls_are_shared(c
 async def test_gate_spaces_requests(client):
     gate = client.correlation_gate
     gate.min_interval = 0.5
+    gate.self_max = 2                     # both selfs at once: only the pacing spaces them
     install(client, {"/correlations/": [resp(200, {"max": 0.2})]})
     await asyncio.gather(*[client.check_correlation(a, "both", max_wait=0) for a in ("A1", "B2")])
     paced = [w for w in client.sleeps if 0 < w <= 1.5]
@@ -428,25 +432,29 @@ async def test_cancel_one_waiting_all(bg_client):
     s = install(client, {"/correlations/": [COMPUTING()]})       # BRAIN never answers
     for alpha in ("A1", "B2", "C3", "D4"):
         await client.check_correlation(alpha, "both", max_wait=0)
-    assert [r["alpha_id"] for r in gate.snapshot()["waiting"]] == ["B2", "C3", "D4"]
+    for lane in ("prod", "self"):                                 # each lane has its own queue
+        assert [r["alpha_id"] for r in gate.snapshot()["waiting"] if r["lane"] == lane] == ["B2", "C3", "D4"]
 
     out = await pf.check_alpha(alpha_id="C3", check="cancel")     # one alpha that waits
-    assert out["cancelled"] == [{"alpha_id": "C3", "checks": ["prod", "self"], "was": "waiting"}]
-    assert [(r["position"], r["alpha_id"]) for r in out["queue"]["waiting"]] == [(1, "B2"), (2, "D4")]
+    assert [dict(c, checks=sorted(c["checks"])) for c in out["cancelled"]] == \
+        [{"alpha_id": "C3", "checks": ["prod", "self"], "was": "waiting"}]
+    assert [(r["position"], r["alpha_id"]) for r in out["queue"]["waiting"] if r["lane"] == "prod"] == \
+        [(1, "B2"), (2, "D4")]
     assert "note" not in out
 
     out = await pf.check_alpha(alpha_id="A1", check="cancel")     # the one being computed
     assert out["cancelled"][0]["was"] == "computing" and "BRAIN already started" in out["note"]
     await until(client, lambda: [r["alpha_id"] for r in gate.snapshot()["computing"]] == ["B2"])
+    assert all(v["busy"] <= v["max"] for v in gate.snapshot()["lanes"].values())
     polled_a1 = len([c for c in s.calls if "/alphas/A1/" in c[1]])
     assert gate.snapshot()["waiting"][0]["alpha_id"] == "D4"      # B2 moved up and started
 
     out = await pf.check_alpha(alpha_id="waiting", check="cancel")
-    assert [r["alpha_id"] for r in out["cancelled"]] == ["D4"]
+    assert "D4" in [r["alpha_id"] for r in out["cancelled"]]     # (and B2's self, if it still waited)
     assert [r["alpha_id"] for r in out["queue"]["computing"]] == ["B2"] and out["queue"]["waiting"] == []
 
     out = await pf.check_alpha(alpha_id="all", check="cancel")
-    assert [r["alpha_id"] for r in out["cancelled"]] == ["B2"]
+    assert [r["alpha_id"] for r in out["cancelled"]] == ["B2"] and out["cancelled"][0]["was"] == "computing"
     assert out["queue"]["computing"] == [] and out["queue"]["waiting"] == [] and not gate.inflight
     sent = len(s.calls)
     await client.real_sleep(0.05)
@@ -601,26 +609,30 @@ async def test_cooldown_by_hand_and_resume(bg_client):
 
 # --- queue order: prod first, a lane for the submission check, estimates, no lost place
 
-def test_prod_only_requests_go_first_and_the_check_has_its_own_lane(monkeypatch):
+def test_prod_self_and_check_each_have_their_own_lane(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(pf.time, "monotonic", lambda: clock[0])
     gate = pf.CorrelationGate()
-    gate.max_alphas, gate.check_max = 1, 1
-    gate.touch("RUN", "prod")                          # the only correlation slot is taken
+    gate.max_alphas, gate.check_max, gate.self_max = 1, 1, 1
+    gate.touch("RUN", "prod")                          # the only prod slot is taken
+    gate.touch("SLOW", "self")                         # ... and the only self slot
     a_self, a_prod = gate.enqueue("A1", "self"), gate.enqueue("A1", "prod")
     b_prod = gate.enqueue("B2", "prod")
     c_check = gate.enqueue("C3", "check")
-    assert [t[1:3] for t in gate._order("corr")] == [("B2", "prod"), ("A1", "self"), ("A1", "prod")]
-    assert gate.position("B2") == 1 and gate.position("A1") == 2 and gate.position("C3", "check") == 1
+    assert [t[1:3] for t in gate._order("prod")] == [("A1", "prod"), ("B2", "prod")]
+    assert [t[1:3] for t in gate._order("self")] == [("A1", "self")]
+    assert gate.position("A1") == 1 and gate.position("B2") == 2 and gate.position("C3", "check") == 1
     assert gate.admit(c_check, "check")                # not behind the correlations
-    assert not gate.admit(b_prod, "prod")
-    gate.release("RUN", "prod")
-    assert not gate.admit(a_prod, "prod") and gate.admit(b_prod, "prod")
+    assert not gate.admit(a_prod, "prod")
+    gate.release("RUN", "prod")                        # a prod slot frees: the slow self does not matter
+    assert not gate.admit(b_prod, "prod") and gate.admit(a_prod, "prod")
+    assert not gate.admit(a_self, "self")              # self still waits for its own lane
     snap = gate.snapshot()
-    assert [(r["alpha_id"], r["checks"]) for r in snap["computing"]] in (
-        [("B2", ["prod"]), ("C3", ["check"])], [("C3", ["check"]), ("B2", ["prod"])])
-    assert [(r["position"], r["alpha_id"], r["checks"]) for r in snap["waiting"]] == [(1, "A1", ["self", "prod"])]
-    assert a_self in gate._waiting
+    assert snap["lanes"]["prod"] == {"max": 1, "busy": 1} and snap["lanes"]["self"] == {"max": 1, "busy": 1}
+    assert [(r["lane"], r["position"], r["alpha_id"]) for r in snap["waiting"]] == \
+        [("prod", 1, "B2"), ("self", 1, "A1")]
+    gate.release("SLOW", "self")
+    assert gate.admit(a_self, "self")
 
 
 def test_a_request_keeps_its_slot_and_waiting_ones_get_an_estimate(monkeypatch):
@@ -670,14 +682,18 @@ def test_priority_aging_and_abandon(monkeypatch):
     monkeypatch.setattr(pf.time, "monotonic", lambda: clock[0])
     gate = pf.CorrelationGate()
     gate.aging_seconds, gate.abandon_seconds = 300.0, 1200.0
-    gate.enqueue("OLD", "prod"); gate.enqueue("OLD", "self")          # prod + self, asked first
+    gate.enqueue("OLD", "prod")                                        # asked first
     clock[0] += 10
-    gate.enqueue("NEW", "prod")                                        # prod only, later
-    assert [t[1] for t in gate._order("corr")][0] == "NEW"             # prod-only goes first ...
+    gate.enqueue("NEW", "prod")
+    assert [t[1] for t in gate._order("prod")] == ["OLD", "NEW"]       # first come, first served
+    assert gate.rank_reason("NEW", "prod") == "fifo"
+    gate.enqueue("VIP", "prod"); gate.asked("VIP", "prod", "high")
+    assert [t[1] for t in gate._order("prod")][0] == "VIP"             # priority goes first ...
     clock[0] += 300
-    assert [t[1] for t in gate._order("corr")][0] == "OLD"             # ... until the other waited 5 min
-    gate.enqueue("VIP", "self"); gate.asked("VIP", "self", "high")
-    assert [t[1] for t in gate._order("corr")][0] == "VIP"             # priority beats both
+    assert gate.rank_reason("OLD", "prod") == "aged"                   # ... aged ones next
+    gate.leave(next(t for t in gate._waiting if t[1] == "OLD"))
+    gate.enqueue("OLD", "prod")                                        # back in the queue: keeps its age
+    assert [t[1] for t in gate._order("prod")] == ["VIP", "OLD", "NEW"]
     gate.asked("OLD", "prod")
     assert not gate.abandoned("OLD", "prod")
     clock[0] += 1201
@@ -705,9 +721,8 @@ async def test_abandoned_queued_job_is_dropped(bg_client):
     await client.check_correlation("A1", "prod", max_wait=0, estimate=False)
     await client.check_correlation("B2", "prod", max_wait=0, estimate=False)
     assert [r["alpha_id"] for r in gate.snapshot()["waiting"]] == ["B2"]
-    await until(client, lambda: not gate.snapshot()["waiting"])
+    await until(client, lambda: not gate.snapshot()["waiting"] and ("B2", "prod") not in gate.inflight)
     assert not [c for c in s.calls if "/alphas/B2/" in c[1]]           # dropped without a request
-    assert ("B2", "prod") not in gate.inflight
 
 
 @pytest.mark.asyncio
@@ -824,8 +839,11 @@ def test_without_the_operator_list_names_are_not_judged():
     ("rank(close)", 1), ("rank(-returns)", 2), ("rank(close) - rank(open)", 3),
     ("ts_backfill(close, 10)", 1), ("a = rank(close); b = a * 2; -b", 3),
     ("group_neutralize(rank(close), bucket(rank(cap), range=\"0,1,0.1\"))", 4),
-    ("if_else(close > open, 1, -1)", 3), ("rank(close) * 1e-5", 2),
+    ("if_else(close > open, 1, -1)", 2), ("rank(close) * 1e-5", 2),
     ("hump(x, hump=0.01)", 1),
+    # a literal's sign is no operator (BRAIN: 3 for the first, 2026-09-30 report)
+    ("inverse(subtract(-1, days_from_last_change(F)))", 3), ("subtract(-30, rank(x))", 2),
+    ("x = -0.5; rank(x)", 1), ("-1 * rank(x)", 2), ("rank(x) - 1", 2),
 ])
 def test_estimated_ops_counts_like_brain(expr, count):
     assert pf._estimated_ops(expr) == count
@@ -923,3 +941,61 @@ def test_constant_signal_warning():
 def test_stale_limits_depend_on_the_mode():
     assert pf._stale_limit(True, True) == 480 and pf._stale_limit(False, True) == 300
     assert pf._stale_limit(True, False) == 1200 and pf._stale_limit(False, False) == 600
+
+
+# --- field report 2026-09-30 --------------------------------------------------------
+
+def test_quick_row_estimates_the_cluster_and_keeps_every_number():
+    alpha = {"id": "Q1", "settings": {"simulationMode": "QUICK"}, "regular": {"code": "rank(x)"},
+             "is": {"sharpe": 1.8, "fitness": 1.1, "turnover": 0.2, "longCount": 12, "shortCount": 30,
+                    "checks": [{"name": "LOW_SHARPE", "result": "PASS", "value": 1.8, "limit": 1.58},
+                               {"name": "IS_LADDER_SHARPE", "result": "FAIL", "value": 1.2, "limit": 1.58},
+                               {"name": "CONCENTRATED_WEIGHT", "result": "FAIL"}]}}
+    row = pf._compact_alpha_row(alpha)
+    assert row["cluster_est"] == 1.37 and row["cluster_risk"].startswith("possible")
+    assert "IS_LADDER 1.2<1.58" in row["fails"] and "CONCENTRATED_WEIGHT (no value)" in row["fails"]
+    assert row["long_short"] == "12/30"
+    weak = pf._compact_alpha_row({**alpha, "is": {**alpha["is"], "sharpe": 1.6}})
+    assert weak["cluster_risk"].startswith("likely")                    # 0.94 x 1.6 < 1.58
+    full = pf._compact_alpha_row({**alpha, "settings": {"simulationMode": "FULL"}})
+    assert "cluster_est" not in full                                    # FULL has the real test
+    diag = pf._diagnostics({"alpha_results": [{"index": 0, **row}]}, [{"expr": "rank(x)", "settings": {}}])
+    wall = next(d for d in diag if d["kind"] == "concentrated_weight")
+    assert wall["long_short"] == {0: "12/30"}
+
+
+def test_tsv_settings_keep_one_order():
+    state = {"set": {"decay": 3, "neutralization": "MARKET"},
+             "alpha_results": [{"index": 0, "id": "A", "set": {}},
+                               {"index": 1, "id": "B", "set": {"universe": "TOP1000"}}]}
+    lines = pf._tsv(state)["tsv"].splitlines()[1:]
+    sets = [line.split("\t")[pf._TSV_COLUMNS.index("set")] for line in lines]
+    assert sets == ["decay=3,neutralization=MARKET", "universe=TOP1000,decay=3,neutralization=MARKET"]
+
+
+def test_a_fail_without_a_message_names_the_fields_to_check():
+    text = pf._silent_fail_diagnosis("group_rank(vec_avg(pv87_x), densify(sta3_sector)) + -1",
+                                     {"region": "EUR", "universe": "TOP2500", "delay": 1})
+    assert "EUR/TOP2500/D1" in text and "pv87_x, sta3_sector" in text and "get_datafields" in text
+    assert pf._expression_fields("ts_mean(close, d=5); x = rank(y)") == ["close", "y"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_status_check_answers_the_last_known_state_in_time(client):
+    started = asyncio.Event()
+
+    async def slow_raw(location, compact=True):
+        started.set()
+        await asyncio.Event().wait()          # BRAIN never answers
+        return {"status": "COMPLETE"}
+
+    client._check_once_raw = slow_raw
+    client._last_state["S1"] = (pf.time.time() - 30, {"status": "RUNNING", "running_seconds": 90})
+    token = pf._CALL_DEADLINE.set(pf.time.monotonic() + 4.5)
+    try:
+        t0 = pf.time.monotonic()
+        out = await client._check_once(f"{client.base_url}/simulations/S1")
+    finally:
+        pf._CALL_DEADLINE.reset(token)
+    assert pf.time.monotonic() - t0 < 3 and started.is_set()
+    assert out["status"] == "RUNNING" and out["last_known"] is True and out["seen_seconds_ago"] >= 30

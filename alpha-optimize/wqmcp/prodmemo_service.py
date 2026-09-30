@@ -12,6 +12,7 @@ time (``prodmemo_client.fetcher = brain_client``).
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -61,6 +62,10 @@ PROD_EST_MIN_FIT = 8
 PROD_EST_MIN_POOL = 0.3
 CHECK_MANY_LIMIT = 20
 CHECK_MANY_CONCURRENCY = 2
+
+
+# Below this slope the pool says nothing about the alpha: no point estimate.
+PROD_EST_MIN_SLOPE = float(os.environ.get('PRODMEMO_EST_MIN_SLOPE', '0.1'))
 
 
 def fit_prod_estimate(pairs):
@@ -842,6 +847,12 @@ class ProdMemoService:
         if spread >= 0.25:
             reasons.append(f'the fit is loose (90% band ±{spread:.2f})')
         out['confidence'] = 'low' if reasons else 'normal'
+        if abs(b) < PROD_EST_MIN_SLOPE:
+            # Every alpha of the region would get the same number (EUR 2026-09-30: all
+            # ~.71, measured .56-.77): a point value would only mislead. The range stays.
+            out['value'] = None
+            out['no_point_estimate'] = (f'slope {b:.2f} < {PROD_EST_MIN_SLOPE} in {scope}: the local pool '
+                                        'does not tell this alpha apart, only the usual range there')
         if reasons:
             out['over_threshold'] = None if out['range'][0] <= PROD_THRESHOLD < out['range'][1] \
                 else out['over_threshold']
