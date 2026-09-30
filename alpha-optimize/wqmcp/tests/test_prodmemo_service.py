@@ -506,6 +506,17 @@ def test_prod_estimate_is_fitted_per_region_and_says_when_it_cannot_be_trusted()
     # EUR: every alpha would get ~0.72, so no point value, only the range around it
     assert eur['region'] == 'EUR' and eur['value'] is None and 'slope' in eur['no_point_estimate']
     assert eur['range'][0] < 0.72 < eur['range'][1]
+    # a slope just above the limit does not bring the point value back (no flicker) ...
+    import prodmemo_service as pms
+    service._flat_regions = {'EUR'}
+    orig = pms.fit_prod_estimate
+    try:
+        pms.fit_prod_estimate = lambda pairs: (0.6, 0.12, 10, 0.05, 'fitted')
+        assert estimate(0.5, 'EUR')['value'] is None
+        pms.fit_prod_estimate = lambda pairs: (0.6, 0.2, 10, 0.05, 'fitted')   # ... a clear one does
+        assert estimate(0.5, 'EUR')['value'] == 0.7
+    finally:
+        pms.fit_prod_estimate = orig
     assert eur['confidence'] == 'low' and 'barely moves Prod' in eur['note']
     other = estimate(0.5, 'JPN')                                # JPN has no calibration of its own
     assert other['region'] == 'ALL' and 'fitted on all regions' in other['region_fallback']

@@ -64,8 +64,11 @@ CHECK_MANY_LIMIT = 20
 CHECK_MANY_CONCURRENCY = 2
 
 
-# Below this slope the pool says nothing about the alpha: no point estimate.
+# Below this slope the pool says nothing about the alpha: no point estimate. A
+# region only gets point values back above PROD_EST_RESUME_SLOPE, so a slope
+# hovering around the limit does not switch them on and off with every new point.
 PROD_EST_MIN_SLOPE = float(os.environ.get('PRODMEMO_EST_MIN_SLOPE', '0.1'))
+PROD_EST_RESUME_SLOPE = float(os.environ.get('PRODMEMO_EST_RESUME_SLOPE', '0.15'))
 
 
 def fit_prod_estimate(pairs):
@@ -847,12 +850,20 @@ class ProdMemoService:
         if spread >= 0.25:
             reasons.append(f'the fit is loose (90% band ±{spread:.2f})')
         out['confidence'] = 'low' if reasons else 'normal'
+        flat = getattr(self, '_flat_regions', None)
+        if flat is None:
+            flat = self._flat_regions = set()
         if abs(b) < PROD_EST_MIN_SLOPE:
+            flat.add(scope)
+        elif abs(b) >= PROD_EST_RESUME_SLOPE:
+            flat.discard(scope)
+        if scope in flat:
             # Every alpha of the region would get the same number (EUR 2026-09-30: all
             # ~.71, measured .56-.77): a point value would only mislead. The range stays.
             out['value'] = None
-            out['no_point_estimate'] = (f'slope {b:.2f} < {PROD_EST_MIN_SLOPE} in {scope}: the local pool '
-                                        'does not tell this alpha apart, only the usual range there')
+            out['no_point_estimate'] = (f'slope {b:.2f} in {scope} (point values only below '
+                                        f'{PROD_EST_MIN_SLOPE} -> above {PROD_EST_RESUME_SLOPE}): the local '
+                                        'pool does not tell this alpha apart, only the usual range there')
         if reasons:
             out['over_threshold'] = None if out['range'][0] <= PROD_THRESHOLD < out['range'][1] \
                 else out['over_threshold']

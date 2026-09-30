@@ -1319,7 +1319,103 @@ async def test_the_queue_names_who_asked(mcp_session, fake):
 
 
 def test_client_labels_are_short_and_stable(monkeypatch):
-    keys = iter([101, 202, 101])
-    monkeypatch.setattr(pf, "_session_key", lambda: next(keys))
-    monkeypatch.setattr(pf, "_client_names", {})
+    import itertools
+
+    class Session:
+        pass
+    a, b = Session(), Session()
+    sessions = iter([a, b, a])
+    monkeypatch.setattr(pf, "_session", lambda: next(sessions))
+    monkeypatch.setattr(pf, "_client_numbers", itertools.count(1))
     assert [pf._client_label() for _ in range(3)] == ["c1", "c2", "c1"]
+
+
+async def test_parallel_polls_of_one_id_get_the_rows_once(mcp_session, fake):
+    fake.state.child_polls_needed = 2
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"])
+        outs = await asyncio.gather(*[call(s, "get_simulation", simulation_ids=sub["simulation_id"],
+                                           wait_seconds=10) for _ in range(3)])
+        full = [o for o in outs if "alpha_results" in o]
+        assert len(full) == 1 and all(o["returned_before"] is True for o in outs if o not in full)
+        again = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
+        assert len(again["alpha_results"]) == 2                              # asked again: in full
+
+
+# --- field report 2026-09-30b ---------------------------------------------------------
+
+async def test_labels_follow_the_request_when_the_precheck_holds_an_item_back(mcp_session, fake, tmp_path,
+                                                                             monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        out = await call(s, "create_simulation", expressions=["rank(a)", "rank(b", "rank(c)"], mode="concurrent",
+                         tag="lab", labels=["A", "B", "C"])
+        assert out["status"] == "SUBMITTED" and [r["index"] for r in out["refused"]] == [1]
+        for sid in out["simulation_ids"]:
+            await call(s, "get_simulation", simulation_ids=sid, wait_seconds=10)
+        one = await call(s, "create_simulation", expressions=["rank(d)", "rank(e)"], tag="lab", labels="probe")
+        await call(s, "get_simulation", simulation_ids=one["simulation_id"], wait_seconds=10)
+        bad = await call(s, "create_simulation", expressions=["rank(f)", "rank(g)"], tag="lab", labels=["x", "y", "z"])
+    assert "labels has 3 entries but there are 2 items" in bad["error"]
+    rows = [json.loads(line) for line in open(tmp_path / "lab.jsonl")]
+    assert sorted((r["index"], r["label"]) for r in rows if r["simulation_id"] in out["simulation_ids"]) == \
+        [(0, "A"), (2, "C")]
+    assert [r["label"] for r in rows if r["simulation_id"] == one["simulation_id"]] == ["probe", "probe"]
+
+
+async def test_an_old_alpha_is_flagged_for_singles_and_in_tsv(mcp_session, fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions="alias(x)", tag="old", validate_expressions=False)
+        row = (await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10))["alpha"]
+        assert row["reused_alpha"] is True and row["submitted_expr"] == "alias(x)"
+        multi = await call(s, "create_simulation", expressions=["rank(a)", "alias(x)", "dup()", "dup()"],
+                           validate_expressions=False)
+        tsv = await call(s, "get_simulation", simulation_ids=multi["simulation_id"], wait_seconds=10, format="tsv")
+    lines = [line.split("\t") for line in tsv["tsv"].splitlines()]
+    head = lines[0]
+    assert head[-2:] == ["reused", "submitted_expr"] and head[:14] == list(pf._TSV_COLUMNS[:14])
+    cells = {int(x[0]): dict(zip(head, x)) for x in lines[1:]}
+    assert cells[1]["reused"] == "old_alpha" and cells[1]["submitted_expr"] == "alias(x)"
+    assert cells[0]["reused"] == "" and cells[3]["reused"] == "dup_of=2"
+    logged = json.loads(open(tmp_path / "old.jsonl").readline())
+    assert logged["reused_alpha"] is True and logged["submitted_expr"] == "alias(x)"
+
+
+async def test_the_simulation_list_says_whose_and_filters(mcp_session, fake):
+    async with mcp_session() as s:
+        await call(s, "create_simulation", expressions="rank(a)", tag="nu5_M", client="M")
+        await call(s, "create_simulation", expressions="rank(b)", tag="nu5_O", client="O")
+        await call(s, "create_simulation", expressions="rank(c)")
+        everything = await call(s, "get_simulation")
+        mine = await call(s, "get_simulation", tag="nu5_O")
+        by_client = await call(s, "get_simulation", client="M")
+        none = await call(s, "get_simulation", tag="nope")
+    assert [(r.get("tag"), r.get("client")) for r in everything["recent_simulations"][:3]] == \
+        [(None, everything["recent_simulations"][0]["client"]), ("nu5_O", "O"), ("nu5_M", "M")]
+    assert everything["recent_simulations"][0]["client"].startswith("c")      # the session's own name
+    assert [r["tag"] for r in mine["recent_simulations"]] == ["nu5_O"]
+    assert [r["tag"] for r in by_client["recent_simulations"]] == ["nu5_M"]
+    assert none["recent_simulations"] == [] and "matching tag='nope'" in none["note"]
+
+
+async def test_compare_alphas_against_anchors_only(mcp_session, fake):
+    days = [f"2024-{m:02d}-{d:02d}" for m in range(1, 13) for d in range(1, 28)]
+    steps = [((i * 37) % 11) - 5 for i in range(len(days))]
+    other = [((i * 13) % 7) - 3 for i in range(len(days))]
+
+    def curve(st, scale=1.0):
+        total, out = 0.0, []
+        for day, step in zip(days, st):
+            total += scale * step
+            out.append([day, total])
+        return out
+    fake.state.pnl = {"C1": curve(steps), "S1": curve(steps, 2.0), "S2": curve(other), "S3": curve(other, -1.0)}
+    async with mcp_session() as s:
+        out = await call(s, "compare_alphas", alpha_ids=["C1"], anchors=["S1", "S2", "S3"])
+        bad = await call(s, "compare_alphas", alpha_ids=["C1"])
+    assert len(out["pairs"]) == 3 and all(p["a"] == "C1" for p in out["pairs"])      # no anchor x anchor
+    assert out["by_candidate"]["C1"] == {"anchor": "S1", "correlation": 1.0}
+    assert "2-10" in bad["error"]

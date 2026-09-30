@@ -23,7 +23,10 @@ import os
 import sys
 import math
 import io
+import difflib
+import itertools
 import threading
+import weakref
 import contextvars
 import time
 import json
@@ -1195,10 +1198,12 @@ class BrainApiClient:
         self._estimates: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._estimate_tasks: Dict[str, "asyncio.Task"] = {}
         self._modes: Dict[str, str] = {}      # alpha -> QUICK / FULL
+        self._coverage_gaps: Dict[str, Optional[Dict[str, Any]]] = {}   # alpha -> coverage dips
         # One gate for every client of this server: see CorrelationGate.
         self.correlation_gate = CorrelationGate()
         # Simulations created by this process (newest first), for get_simulation().
-        self.recent_simulations: collections.deque = collections.deque(maxlen=50)
+        # several agents share this server: enough history for each to find its own
+        self.recent_simulations: collections.deque = collections.deque(maxlen=300)
         # What was sent for each of them: a result row can then say which item of
         # the request it belongs to, and whether BRAIN answered with another alpha.
         self._submitted: "collections.OrderedDict[str, Dict[str, Any]]" = collections.OrderedDict()
@@ -1458,6 +1463,7 @@ class BrainApiClient:
                                  f"ones come back, a bad one shows itself. Asking for {sim_id} follows them.")}
         found = _diagnostics(state, sent.get("items") or [])
         if found:
+            await self._add_coverage_gaps(found, state)
             state["diagnostics"] = found
         if compact:
             state = _compact_state(state)
@@ -1474,8 +1480,9 @@ class BrainApiClient:
         for index, item in enumerate(sent.get("payloads") or []):
             data = SimulationData(type=item.get("type", "REGULAR"), settings=SimulationSettings(**item["settings"]),
                                   **{k: item[k] for k in ("regular", "combo", "selection") if item.get(k)})
-            item_meta = None if not meta else {
-                "tag": meta["tag"], "labels": [labels[index]] if index < len(labels) else [], "item": index}
+            client = next((r.get("client") for r in self.recent_simulations if r["simulation_id"] == sim_id), None)
+            item_meta = {"tag": (meta or {}).get("tag"), "item": index, "client": client,
+                         "labels": [labels[index]] if index < len(labels) else []}
             try:
                 out = await self.create_simulation(data, True, item_meta)
             except Exception as e:
@@ -1856,10 +1863,77 @@ class BrainApiClient:
             return out
         alpha = await self._request('get', f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}")
         alpha.raise_for_status()
-        if compact:
-            return {"status": "COMPLETE", "progress_url": location,
-                    "alpha": _compact_alpha_row(alpha.json()), "note": _COMPACT_NOTE}
-        return {"status": "COMPLETE", "progress_url": location, "alpha": alpha.json(), "note": _FLIP_NOTE}
+        details = alpha.json()
+        row = _compact_alpha_row(details) if compact else details
+        sent = self._submitted.get(location.rstrip("/").rsplit("/", 1)[-1]) or {}
+        if compact and len(sent.get("items") or []) == 1:
+            # a single (or one item of a concurrent batch) can be answered by an old alpha too
+            self._compare_with_sent(sent["items"][0], details, row, sent.get("at", 0))
+        return {"status": "COMPLETE", "progress_url": location, "alpha": row,
+                "note": _COMPACT_NOTE if compact else _FLIP_NOTE}
+
+    async def _add_coverage_gaps(self, found: List[Dict[str, Any]], state: Dict[str, Any],
+                                 budget: float = 8.0) -> None:
+        """CONCENTRATED_WEIGHT: the days the alpha covered (almost) no stock, from
+        BRAIN's coverage recordset (FULL runs only). On such a day the few names
+        with data carry all the weight. Best effort, at most 3 alphas, bounded."""
+        wall = next((d for d in found if d.get("kind") == "concentrated_weight"), None)
+        if wall is None:
+            return
+        rows = state.get("alpha_results")
+        if rows is None and isinstance(state.get("alpha"), dict):
+            rows = [{"index": 0, **state["alpha"]}]
+        ids = {r.get("index"): r.get("id") for r in rows or [] if r.get("id")}
+        wanted = [(i, ids[i]) for i in wall["items"] if ids.get(i)][:3]
+
+        async def gaps(alpha_id: str) -> Optional[Dict[str, Any]]:
+            if alpha_id in self._coverage_gaps:
+                return self._coverage_gaps[alpha_id]
+            r = await self._poll(f"{self.base_url}/alphas/{_seg(alpha_id, 'alpha id')}/recordsets/coverage",
+                                 budget)
+            if r.get("status") == "ERROR" and r.get("http_status") == 404:
+                found_gaps: Optional[Dict[str, Any]] = {"none": "no coverage data (QUICK runs have none)"}
+            elif r.get("status") != "DONE":
+                return None
+            else:
+                found_gaps = _coverage_gaps((r.get("data") or {}).get("records") or [])
+            self._coverage_gaps[alpha_id] = found_gaps
+            return found_gaps
+        try:
+            results = await asyncio.wait_for(asyncio.gather(*(gaps(a) for _, a in wanted),
+                                                            return_exceptions=True), budget + 2)
+        except asyncio.TimeoutError:
+            return
+        by_index = {i: g for (i, _), g in zip(wanted, results) if isinstance(g, dict)}
+        if by_index:
+            wall["coverage_gaps"] = by_index
+            if any(g.get("days") for g in by_index.values()):
+                wall["note"] = ("CONCENTRATED_WEIGHT with coverage gaps (coverage_gaps: trading days on which the "
+                                "alpha covered under half its usual number of stocks, holidays left out). On those "
+                                "days the few names with data carry all the weight. Bridging the gap, e.g. "
+                                "ts_backfill(field, 5), fixed exactly this in an earlier round; truncation / "
+                                "nanHandling / decay did not. " + wall["note"])
+
+    def _compare_with_sent(self, item: Dict[str, Any], alpha: Dict[str, Any], row: Dict[str, Any],
+                           sent_at: float) -> None:
+        """What BRAIN ran against what was sent: other settings, an alpha that
+        already existed (same or aliased expression), a FULL run of a QUICK one."""
+        mismatch = _settings_mismatch(item["settings"], alpha.get("settings") or {})
+        if mismatch:
+            row["settings_mismatch"] = mismatch
+        self._note_quick(item, alpha, row)
+        code = ((alpha.get("regular") or alpha.get("combo") or {}).get("code") or "")
+        same = _same_code(code, item["expr"])
+        created = _epoch(alpha.get("dateCreated"))
+        older = created is not None and created < sent_at - 120
+        if not same or older:
+            row["reused_alpha"] = True
+            row["submitted_expr"] = _cut(item["expr"], _COMPACT_EXPR_CHARS)
+            row["warning"] = ((row.get("warning", "") + " ") if row.get("warning") else "") + (
+                "BRAIN answered with an alpha that already existed"
+                + ("" if same else " and whose expression is not the one sent (it treats them as "
+                                   "the same, e.g. a field alias)")
+                + f": id and expr are the old alpha's (created {alpha.get('dateCreated')}).")
 
     async def _check_multi_children(self, location: str, children: List[str],
                                     compact: bool = True,
@@ -1954,22 +2028,7 @@ class BrainApiClient:
             else:
                 first_row_of[alpha_id] = index
             if item is not None:
-                mismatch = _settings_mismatch(item["settings"], alpha.get("settings") or {})
-                if mismatch:
-                    row["settings_mismatch"] = mismatch
-                self._note_quick(item, alpha, row)
-                code = ((alpha.get("regular") or alpha.get("combo") or {}).get("code") or "")
-                same = _same_code(code, item["expr"])
-                created = _epoch(alpha.get("dateCreated"))
-                older = created is not None and created < sent.get("at", 0) - 120
-                if not same or older:
-                    row["reused_alpha"] = True
-                    row["submitted_expr"] = _cut(item["expr"], _COMPACT_EXPR_CHARS)
-                    row["warning"] = ((row.get("warning", "") + " ") if row.get("warning") else "") + (
-                        "BRAIN answered with an alpha that already existed"
-                        + ("" if same else " and whose expression is not the one sent (it treats them as "
-                                           "the same, e.g. a field alias)")
-                        + f": id and expr are the old alpha's (created {alpha.get('dateCreated')}).")
+                self._compare_with_sent(item, alpha, row, sent.get("at", 0))
             full.append(row)
         full.sort(key=lambda r: r["index"])
 
@@ -2121,10 +2180,15 @@ class BrainApiClient:
     def _remember_simulation(self, simulation_id: str, kind: str, sim_type: str, count: int,
                              payloads: Optional[List[Dict[str, Any]]] = None,
                              meta: Optional[Dict[str, Any]] = None) -> None:
-        self.recent_simulations.appendleft({
-            "simulation_id": simulation_id, "kind": kind, "type": sim_type, "alphas": count,
-            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
+        row = {"simulation_id": simulation_id, "kind": kind, "type": sim_type, "alphas": count,
+               "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        # who sent it: given with the request (it may be sent later, from the queue), else this session
+        client = (meta or {}).get("client") or _client_label()
+        if (meta or {}).get("tag"):
+            row["tag"] = meta["tag"]
+        if client:
+            row["client"] = client
+        self.recent_simulations.appendleft(row)
         if payloads:
             self._submitted[simulation_id] = {
                 "at": time.time(), "kind": kind, "payloads": payloads,
@@ -2196,6 +2260,7 @@ class BrainApiClient:
         return [{"queue_position": i + 1, "queue_id": e["queue_id"], "kind": e["kind"],
                  "alphas": e["alphas"], "waiting_seconds": int(time.time() - e["enqueued"]),
                  "attempts": e["attempts"],
+                 **{k: (e.get("meta") or {})[k] for k in ("tag", "client") if (e.get("meta") or {}).get(k)},
                  "expr": _cut((e["payloads"][0].get("regular") or e["payloads"][0].get("combo") or ""), 80)}
                 for i, e in enumerate(self.submit_queue)]
 
@@ -2367,11 +2432,16 @@ class BrainApiClient:
 
         async def load_operators() -> None:
             operators.update(await self.operator_categories())
+        # Lookups that miss the budget go on in the background (field_info caches them):
+        # cut off, they used to be skipped silently and the next submit found the next problem.
+        async def look_up_all() -> None:
+            await asyncio.gather(load_operators(), *(look_up(n) for n in names), return_exceptions=True)
+        lookups = _background_task(look_up_all())
         try:
-            await asyncio.wait_for(asyncio.gather(load_operators(), *(look_up(n) for n in names)),
-                                   timeout=budget)
+            await asyncio.wait_for(asyncio.shield(lookups), timeout=budget)
         except asyncio.TimeoutError:
             pass
+        known = dict(known)          # what is in by now; later answers only fill the cache
         types = {n: info["type"] for n, info in known.items() if info and info.get("type")}
         rows, warnings = [], []
         for index, expr, settings in items:
@@ -2394,6 +2464,11 @@ class BrainApiClient:
             issues += _semantic_issues(expr, operators, types)
             if issues:
                 rows.append({"index": index, "expr": _cut(expr, 120), "issues": issues})
+            unchecked = [n for n in _field_candidates(expr) if n not in known]
+            if unchecked:
+                warnings.append({"index": index, "expr": _cut(expr, 120), "issue": (
+                    f"not checked, BRAIN did not answer in time: {', '.join(unchecked[:6])} (their lookup "
+                    "goes on, so the next pre-check has them)")})
             for text in _constant_signal_warnings(expr, types):
                 warnings.append({"index": index, "expr": _cut(expr, 120), "issue": text})
             if max_ops:
@@ -4239,6 +4314,12 @@ _GROUP_ARGS = {
     "group_mean": (2,), "group_extra": (2,), "group_vector_proj": (2,),
     "group_cartesian_product": (0, 1), "densify": (0,),
 }
+# Operators some accounts lack, and the same value from ones they have:
+# name -> (operator needed, how to write it).
+_OPERATOR_REWRITES = {
+    "ts_min": ("ts_min_diff", "subtract(x, ts_min_diff(x, d))  (ts_min_diff(x, d) = x - ts_min(x, d))"),
+    "ts_max": ("ts_max_diff", "subtract(x, ts_max_diff(x, d))  (ts_max_diff(x, d) = x - ts_max(x, d))"),
+}
 # Operators whose result is a group.
 _GROUP_MAKERS = {"bucket", "densify", "group_cartesian_product"}
 # Operator categories whose result is a number, never a group.
@@ -4328,7 +4409,14 @@ def _semantic_issues(expr: str, operators: Dict[str, str], field_types: Dict[str
     if operators:
         for name in dict.fromkeys(c["name"] for c in calls):
             if name not in operators:
-                close = [o for o in operators if o.startswith(name.split("_")[0] + "_")][:4]
+                rewrite = _OPERATOR_REWRITES.get(name)
+                if rewrite and rewrite[0] in operators:
+                    issues.append(f"unknown operator {name}(): this account does not have it; "
+                                  f"the same value is {rewrite[1]}")
+                    continue
+                prefix = [o for o in operators if o.startswith(name.split("_")[0] + "_")]
+                close = list(dict.fromkeys(difflib.get_close_matches(name, prefix or list(operators), n=4,
+                                                                     cutoff=0.5)))[:4]
                 issues.append(f"unknown operator {name}()" + (f" (did you mean {', '.join(close)}?)" if close else ""))
 
     def kind_of(arg: str, depth: int = 0) -> Optional[str]:
@@ -4563,6 +4651,48 @@ _NO_EFFECT_HINTS = {
 }
 
 
+def _easter(year: int) -> Tuple[int, int]:
+    """(month, day) of Easter Sunday (Gregorian)."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    g = (8 * b + 13) // 25
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 19 * l) // 433
+    return (h + l - 7 * m + 90) // 25, (h + l - 7 * m + 33 * ((h + l - 7 * m + 90) // 25) + 19) % 32
+
+
+def _market_holiday(day: str) -> bool:
+    """Days most European markets are closed: New Year, Good Friday, Easter Monday,
+    1 May, Christmas Eve to Boxing Day, New Year's Eve."""
+    try:
+        d = datetime.strptime(day[:10], "%Y-%m-%d")
+    except ValueError:
+        return False
+    if (d.month, d.day) in ((1, 1), (5, 1), (12, 24), (12, 25), (12, 26), (12, 31)):
+        return True
+    month, dom = _easter(d.year)
+    easter = datetime(d.year, month, dom)
+    return (d - easter).days in (-2, 1)
+
+
+def _coverage_gaps(records: List[Any]) -> Dict[str, Any]:
+    """Trading days on which an alpha covered under half its median number of
+    stocks (from the coverage recordset: [date, instrumentsCovered])."""
+    values = [(str(r[0]), r[1]) for r in records if isinstance(r, list) and len(r) >= 2
+              and isinstance(r[1], (int, float))]
+    counts = sorted(v for _, v in values if v > 0)
+    if not counts:
+        return {"none": "no coverage data"}
+    median = counts[len(counts) // 2]
+    days = [(day, int(v)) for day, v in values if v < 0.5 * median and not _market_holiday(day)]
+    out: Dict[str, Any] = {"median": int(median), "count": len(days)}
+    if days:
+        out["days"] = [f"{day}={v}" for day, v in days[:10]]
+    return out
+
+
 def _diagnostics(state: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Things a finished batch shows that no single row says: a setting that did
     not change the result at all, decay that is not applied, and the
@@ -4663,7 +4793,7 @@ def _compact_state(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _TSV_COLUMNS = ("index", "id", "ops", "sharpe", "fitness", "turnover", "margin_bps", "sub_sharpe",
-                "y2_sharpe", "cluster", "fails", "warns", "set", "expr")
+                "y2_sharpe", "cluster", "fails", "warns", "set", "expr", "reused", "submitted_expr")
 
 
 def _tsv(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -4683,6 +4813,10 @@ def _tsv(state: Dict[str, Any]) -> Dict[str, Any]:
             order = list(_COMPACT_SETTING_KEYS) + list(_COMPACT_EXTRA_SETTINGS)
             keys = sorted(value, key=lambda k: (order.index(k) if k in order else len(order), k))
             return ",".join(f"{k}={value[k]}" for k in keys)
+        if key == "reused":      # BRAIN answered with an existing alpha: id / expr are that one's
+            if row.get("duplicate_of_index") is not None:
+                return f"dup_of={row['duplicate_of_index']}"
+            return "old_alpha" if row.get("reused_alpha") else ""
         if key == "id" and value is None:
             return f"{row.get('status', '')}: {row.get('message') or row.get('error') or ''}".strip()
         if isinstance(value, list):
@@ -4867,7 +5001,42 @@ def _server_info() -> Dict[str, Any]:
     return {"release": _RELEASE, "started": _STARTED_AT, "tools": count, "tools_hash": digest}
 
 
-_hinted_tag: set = set()        # MCP sessions already told about tag=
+# Per MCP session, forgotten with it (an id() of a closed session can come back for a new one).
+_hinted_tag: "weakref.WeakSet[Any]" = weakref.WeakSet()           # already told about tag=
+_full_rows_at: "weakref.WeakKeyDictionary[Any, Dict[str, float]]" = weakref.WeakKeyDictionary()
+_client_names: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
+_client_numbers = itertools.count(1)
+
+
+def _session() -> Any:
+    """The MCP session of this call (None outside one)."""
+    try:
+        return mcp.get_context().session
+    except Exception:
+        return None
+
+
+def _once_per_burst(out: Dict[str, Any], ref: Any, started: float) -> Dict[str, Any]:
+    """Parallel polls of one id from one session all finish together (they share
+    one check): the first gets the rows, the others one line. A call that started
+    after the rows went out (asking again) gets them again."""
+    rows = out.get("alpha_results")
+    if out.get("status") not in ("COMPLETE", "FINISHED_WITH_ERRORS") or not (rows or out.get("alpha")):
+        return out
+    sid = str(out.get("simulation_id") or ref).rstrip("/").rsplit("/", 1)[-1]
+    session, now = _session(), time.monotonic()
+    if session is None:
+        return out
+    sent = _full_rows_at.setdefault(session, {})
+    last = sent.get(sid)
+    if last is None or last < started:
+        sent[sid] = now
+        while len(sent) > 500:
+            sent.pop(next(iter(sent)))
+        return out
+    return {"simulation_id": sid, "status": out["status"], "rows": len(rows) if isinstance(rows, list) else 1,
+            "returned_before": True, "note": ("A call of yours running at the same time got these rows; "
+                                              "ask again to get them here.")}
 
 
 def _tag_hint(out: Dict[str, Any], ref: Any) -> Dict[str, Any]:
@@ -4879,16 +5048,15 @@ def _tag_hint(out: Dict[str, Any], ref: Any) -> Dict[str, Any]:
     except ValueError:
         return out
     if out.get("type") != "MULTI" or out.get("status") not in ("COMPLETE", "FINISHED_WITH_ERRORS") \
-            or brain_client._tags.get(sim_id) or _session_key() in _hinted_tag:
+            or brain_client._tags.get(sim_id) or _session() is None or _session() in _hinted_tag:
         return out
-    _hinted_tag.add(_session_key())
+    _hinted_tag.add(_session())
     out["hint"] = ('create_simulation(tag="name") appends every finished row to results/<name>.jsonl on '
                    'this server; fetch with curl -s http://<mcp host>:<port>/results/<name>.jsonl '
                    'instead of copying rows out of answers.')
     return out
 
 
-_client_names: Dict[int, str] = {}
 _client_override: "contextvars.ContextVar[str]" = contextvars.ContextVar("wqmcp_client", default="")
 
 
@@ -4898,12 +5066,12 @@ def _client_label() -> str:
     given = _client_override.get()
     if given:
         return given
-    key = _session_key()
-    if not key:
+    session = _session()
+    if session is None:
         return ""
-    if key not in _client_names:
-        _client_names[key] = f"c{len(_client_names) + 1}"
-    return _client_names[key]
+    if session not in _client_names:
+        _client_names[session] = f"c{next(_client_numbers)}"
+    return _client_names[session]
 
 
 def _session_key() -> int:
@@ -5199,9 +5367,10 @@ async def create_simulation(
     queue: Optional[bool] = None,
     max_ops: Optional[int] = None,
     tag: Optional[str] = None,
-    labels: Optional[List[str]] = None,
+    labels: Union[str, List[str], None] = None,
     resubmit: Optional[str] = None,
     force: bool = False,
+    client: str = "",
 ) -> Dict[str, Any]:
     """
     🚀 Submit simulations (backtests); returns at once, then poll get_simulation.
@@ -5215,9 +5384,12 @@ async def create_simulation(
         repeated, so a sweep is one call: expressions=["rank(x)"],
         per_alpha_settings=[{"decay": 3}, {"decay": 5}, {"neutralization": "MARKET"}].
       resubmit="<simulation id>": send the same items again (settings, tag, labels).
-      max_ops=N: hold back items with more operators than N (BRAIN's operatorCount;
-        every row carries "ops_est").
+      max_ops=N: hold back items with more operators than N (BRAIN's operatorCount: every
+        occurrence counts, a repeated subexpression too; each item carries "ops_est").
       force=True: send items the lint refused.
+      client="J": who sends it, shown by get_simulation() and the queues (default c1, c2 per session).
+      Batches: prefer mode multi. It takes one account slot for up to 10 alphas;
+        concurrent takes one slot per item.
       queue (default on): full slots -> status QUEUED with a queue_id ("Q7") that
         get_simulation / cancel_simulation accept; queue=False -> RATE_LIMITED.
 
@@ -5250,12 +5422,14 @@ async def create_simulation(
         if ids:
             result["next"] = f"get_simulation(simulation_ids={ids!r}, wait_seconds=30)"
         return {**result, "resubmitted": str(resubmit).strip()}
-    meta = None
     if tag is not None:
         _results_path(tag)                  # validates the tag before anything is sent
-        meta = {"tag": tag, "labels": [str(x) if x is not None else "" for x in (labels or [])]}
     elif labels:
         raise ValueError("labels are stored with a tag: pass tag as well")
+    if isinstance(labels, str):
+        labels = [labels]
+    meta = {"tag": tag, "labels": [str(x) if x is not None else "" for x in (labels or [])],
+            "client": str(client)[:24] if client else _client_label()}
     sim_type = SIMULATION_TYPES.get(str(type or "").strip().upper())
     if not sim_type:
         raise ValueError(f"type must be one of {sorted(SIMULATION_TYPES)}, got {type!r}")
@@ -5330,6 +5504,13 @@ async def create_simulation(
                 selectionHandling=selection_handling, selectionLimit=selection_limit,
                 componentActivation=component_activation)
 
+    if meta and meta["labels"]:
+        # labels follow the items of the request; the pre-check may hold some back later
+        if len(meta["labels"]) == 1 and len(codes) > 1:
+            meta["labels"] = meta["labels"] * len(codes)      # one label for the whole batch
+        elif len(meta["labels"]) != len(codes):
+            raise ValueError(f"labels has {len(meta['labels'])} entries but there are {len(codes)} "
+                             "items: give one per item, or a single one for all of them")
     items: List[SimulationData] = []
     children: List[Dict[str, Any]] = []
     for i, code in enumerate(codes):
@@ -5371,8 +5552,10 @@ async def create_simulation(
         try:
             unknown, soft = await brain_client.field_problems(
                 [(i, key[0], {"region": key[1], "delay": key[2]}) for key, i in seen_items.items()])
-        except Exception:   # the pre-check must never stop a submission by failing itself
+        except Exception as e:   # the pre-check must never stop a submission by failing itself
             unknown, soft = [], []
+            warnings.append(f"catalogue pre-check skipped ({type(e).__name__}: {_cut(str(e), 120)}): "
+                            "fields and operators were not checked against BRAIN's lists")
         warnings += list(dict.fromkeys(f"item {w['index']}: {w['issue']}" for w in soft))
         key_of_index = {i: key for key, i in seen_items.items()}
         for row in unknown:
@@ -5411,8 +5594,6 @@ async def create_simulation(
         children = [children[i] for i in keep]
 
     try:
-        if meta and meta["labels"] and len(meta["labels"]) != len(items):
-            raise ValueError(f"labels has {len(meta['labels'])} entries but there are {len(items)} simulations")
         if mode == "single":
             result = await brain_client.create_simulation(items[0], use_queue, meta)
         elif mode == "multi":
@@ -5463,7 +5644,8 @@ async def _submit_concurrently(items: List[SimulationData], children: List[Dict[
             return None
         labels = meta.get("labels") or []
         item = children[i].get("index", i)        # the item's place in the original request
-        return {"tag": meta["tag"], "labels": [labels[item]] if item < len(labels) else [], "item": item}
+        return {"tag": meta.get("tag"), "labels": [labels[item]] if item < len(labels) else [], "item": item,
+                "client": meta.get("client")}
 
     async def submit(i: int, item: SimulationData) -> Dict[str, Any]:
         try:
@@ -5523,12 +5705,15 @@ async def _submit_concurrently(items: List[SimulationData], children: List[Dict[
 
 @_tool(READ)
 async def get_simulation(simulation_ids: Union[str, List[str], None] = None, wait_seconds: float = 0,
-                         compact: bool = True, format: str = "rows", only_pending: bool = False) -> Dict[str, Any]:
+                         compact: bool = True, format: str = "rows", only_pending: bool = False,
+                         tag: str = "", client: str = "") -> Dict[str, Any]:
     """
     ⏳ Progress / result of simulations: single, multi, RAA, or several at once.
 
     simulation_ids: ids, queue ids ("Q7") or progress_urls from create_simulation;
-      omit it to list this server's recent simulations and its submit queue.
+      omit it to list this server's recent simulations and its submit queue (each row
+      has tag and client). tag="x" / client="J" narrow that list, e.g. to find your
+      own after a reconnect; client="J" also names you in the queues.
     wait_seconds: poll up to this long (at most 40, one budget for all ids).
     format="tsv": the rows as one TSV text, which is the shortest answer. compact=False: full alpha objects.
     only_pending: with several ids, finished ones come back as one line.
@@ -5550,12 +5735,18 @@ async def get_simulation(simulation_ids: Union[str, List[str], None] = None, wai
     plus one row per region. Several ids: {"status", "simulations": [...]}.
     """
     refs = _as_list(simulation_ids, "simulation_ids")
+    if client:
+        _client_override.set(str(client)[:24])
     if not refs:
-        recent = list(brain_client.recent_simulations)
-        waiting = brain_client.submit_queue_snapshot()
+        def mine(row: Dict[str, Any]) -> bool:
+            return (not tag or row.get("tag") == tag) and (not client or row.get("client") == client)
+        recent = [r for r in brain_client.recent_simulations if mine(r)]
+        waiting = [r for r in brain_client.submit_queue_snapshot() if mine(r)]
+        narrowed = " matching " + ", ".join(f"{k}={v!r}" for k, v in (("tag", tag), ("client", client)) if v)
         out = {"recent_simulations": recent,
                "note": ("Pass simulation_ids (or queue ids) to check them." if recent or waiting
-                        else "No simulations were created by this server since it started.")}
+                        else ("No simulations" + (narrowed if tag or client else "")
+                              + " were created by this server since it started."))}
         if waiting:
             out["submit_queue"] = waiting
         return out
@@ -5611,7 +5802,7 @@ async def get_simulation(simulation_ids: Union[str, List[str], None] = None, wai
 
     if len(refs) == 1:
         try:
-            return _tag_hint(finish(await state_of(refs[0])), refs[0])
+            return _tag_hint(_once_per_burst(finish(await state_of(refs[0])), refs[0], started), refs[0])
         except ValueError as e:
             return {"error": f"{e}. Pass the simulation_id (or progress_url) returned by create_simulation"}
 
@@ -5827,7 +6018,8 @@ async def get_alpha_recordset(alpha_id: str, recordset: Optional[str] = None,
 
 
 @_tool(READ)
-async def compare_alphas(alpha_ids: List[str], wait_seconds: float = 30, years: int = 4) -> Dict[str, Any]:
+async def compare_alphas(alpha_ids: List[str], wait_seconds: float = 30, years: int = 4,
+                         anchors: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     🔀 Correlation between alphas of your own, computed here from their PnL — also
     for alphas that are not submitted, which BRAIN's self correlation leaves out.
@@ -5837,18 +6029,27 @@ async def compare_alphas(alpha_ids: List[str], wait_seconds: float = 30, years: 
     `years` years, Pearson, on the days both alphas have.
 
     Args:
-        alpha_ids: 2-10 alpha ids
+        alpha_ids: 2-10 alpha ids (every pair); with anchors 1-10 candidates
+        anchors: up to 20 alpha ids (e.g. submitted ones) to compare each candidate
+            with: only candidate x anchor pairs are computed, not anchor x anchor
         wait_seconds: How long to wait for BRAIN to produce a PnL it does not have
             yet (an unsubmitted alpha's PnL is made on first request; at most 40)
         years: Length of the window, counted back from the last common day
 
     Returns:
         pairs (highest correlation first): a, b, correlation, overlap_days;
-        max = the highest pair; alphas = per alpha the days of PnL found, or
+        max = the highest pair; with anchors, by_candidate = each candidate's
+        highest pair; alphas = per alpha the days of PnL found, or
         status PENDING (call again) / ERROR.
     """
     ids = list(dict.fromkeys(str(a).strip() for a in _as_list(alpha_ids, "alpha_ids") if str(a).strip()))
-    if not 2 <= len(ids) <= 10:
+    anchor_ids = [a for a in dict.fromkeys(str(x).strip() for x in _as_list(anchors, "anchors") if str(x).strip())
+                  if a not in ids]
+    if anchors:
+        if not 1 <= len(ids) <= 10 or not 1 <= len(anchor_ids) <= 20:
+            raise ValueError(f"with anchors: 1-10 candidates in alpha_ids and 1-20 other alphas in anchors, "
+                             f"got {len(ids)} and {len(anchor_ids)}")
+    elif not 2 <= len(ids) <= 10:
         raise ValueError(f"alpha_ids takes 2-10 different alphas, got {len(ids)}")
     years = max(1, min(int(years or 4), 20))
     wait = _wait(wait_seconds)
@@ -5867,28 +6068,30 @@ async def compare_alphas(alpha_ids: List[str], wait_seconds: float = 30, years: 
                                  else {"error": f"only {len(records)} days of PnL"})}
         return alpha_id, records
 
-    curves = dict(await asyncio.gather(*(pnl_of(a) for a in ids)))
+    curves = dict(await asyncio.gather(*(pnl_of(a) for a in ids + anchor_ids)))
     alphas = [c if isinstance(c, dict) else
               {"id": a, "status": "OK", "days": len(c), "first_day": c[0][0], "last_day": c[-1][0]}
               for a, c in curves.items()]
     ready = [a for a in ids if isinstance(curves[a], list)]
+    ready_anchors = [a for a in anchor_ids if isinstance(curves[a], list)]
+    todo = ([(a, b) for a in ready for b in ready_anchors] if anchor_ids
+            else [(a, b) for i, a in enumerate(ready) for b in ready[i + 1:]])
     pairs = []
-    for i, a in enumerate(ready):
-        for b in ready[i + 1:]:
-            ca, cb = curves[a], curves[b]
-            end = min(ca[-1][0], cb[-1][0])
-            shorter = [r for r in (ca if ca[-1][0] <= cb[-1][0] else cb) if r[0] <= end]
-            start = rolling_window_start(shorter, years)
-            dates = sorted({d for d, _ in ca} | {d for d, _ in cb})
-            r = pearson_correlation(calculate_forward_filled_returns(ca, dates, start, end),
-                                    calculate_forward_filled_returns(cb, dates, start, end))
-            row: Dict[str, Any] = {"a": a, "b": b}
-            if r is None:
-                row.update(correlation=None, note="no common days, or a flat PnL")
-            else:
-                row.update(correlation=round(r["value"], 4), overlap_days=r["overlapCount"],
-                           window=f"{start}..{end}")
-            pairs.append(row)
+    for a, b in todo:
+        ca, cb = curves[a], curves[b]
+        end = min(ca[-1][0], cb[-1][0])
+        shorter = [r for r in (ca if ca[-1][0] <= cb[-1][0] else cb) if r[0] <= end]
+        start = rolling_window_start(shorter, years)
+        dates = sorted({d for d, _ in ca} | {d for d, _ in cb})
+        r = pearson_correlation(calculate_forward_filled_returns(ca, dates, start, end),
+                                calculate_forward_filled_returns(cb, dates, start, end))
+        row: Dict[str, Any] = {"a": a, "b": b}
+        if r is None:
+            row.update(correlation=None, note="no common days, or a flat PnL")
+        else:
+            row.update(correlation=round(r["value"], 4), overlap_days=r["overlapCount"],
+                       window=f"{start}..{end}")
+        pairs.append(row)
     pairs.sort(key=lambda p: 2.0 if p["correlation"] is None else -p["correlation"])
     gate = brain_client.correlation_gate
     for p in pairs:
@@ -5900,6 +6103,9 @@ async def compare_alphas(alpha_ids: List[str], wait_seconds: float = 30, years: 
     measured = [p for p in pairs if p["correlation"] is not None]
     if measured:
         out["max"] = {k: measured[0][k] for k in ("a", "b", "correlation")}
+    if anchor_ids:
+        out["by_candidate"] = {a: next(({"anchor": p["b"], "correlation": p["correlation"]}
+                                        for p in measured if p["a"] == a), None) for a in ids}
     waiting = [a["id"] for a in alphas if a.get("status") == "PENDING"]
     if waiting:
         out["status"] = "PENDING"
