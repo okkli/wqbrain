@@ -357,6 +357,28 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - `ops_est` 对重复出现的子表达式按出现次数计，与平台一致（在有重复的真实 alpha 上核对过）。
 - 上一轮报告里 QUICK 行的 IS_LADDER 不带数值：落盘记录显示都是 06:02Z 切换之前旧版本的行，新版本之后都带数值。没有数值的 IS_LADDER 是 PENDING（平台还没算），不计入 fails。
 
+## 2026-09-30c 实战问题的修复（EUR 推进 + 第六轮）
+
+- **verdict 计入 WARNING**：提交检查新增 `blocking_warnings`，列出非豁免的 WARNING 及数值（如 `CLUSTER_TEST 1.4<1.58`）。BRAIN 判通过但有这类 WARNING 时，`verdict` 为 `pass_with_warnings`。豁免名单默认 `MATCHES_COMPETITION,MATCHES_THEMES,POWER_POOL_*`，用 `WQMCP_WARNING_EXEMPT` 修改（结尾 `*` 表示前缀）。`all_passed` 保持 BRAIN 自己的判定。
+- **319 秒无响应**：服务端日志显示这几次调用服务端都按时回了（例如 `check_alpha(N1V0ng5g)` 11.7 秒、`get_simulation(Q93)` 26.6 秒），是回包在断掉的连接上丢了。日志里有 51 次 `GET /mcp 409`（客户端重开流时服务端以为旧流还在，即半开连接）。之前服务端不发 SSE 事件 id，连接一断客户端无从续传，只能等到自己的超时（约 300 秒）。现在服务端记住最近的事件（内存，最多 5000 条、15 分钟），客户端断线后带 `Last-Event-ID` 重连就能取回错过的回包（`WQMCP_RESUMABLE=0` 关闭）。有端到端测试：调用中途断开连接，重连后仍拿到结果。
+- **限流**：本账号对 BRAIN 的所有请求共用一个令牌桶（`WQMCP_BRAIN_RPS`，默认每秒 8 个），几路同时开工的突发请求在这里排一下，而不是一起撞 429。429 来不及重试时，任何工具都返回 `status: RATE_LIMITED` 和 `retry_after_seconds`，不再只有一句错误文字。
+- **整批报错但其实算完了**：multi 的子项全部失败、只有 BRAIN 的通用信息（“There was an error while running the simulation”）或没有信息时，先按表达式和设置去 alpha 列表里找，已经生成的直接取回（`recovered: true`，也写进 tag 日志），剩下的才逐条重发。全部找到时一枪都不重发。
+- **预检**：
+  - 单枪无原因失败、且表达式里只有一个数据字段时，记下这个字段在该 region/delay 下“目录里有但不可用”，下次预检直接拦下（`force=True` 可放行）。这份记录和字段查询缓存都会跨重启保留。
+  - multi 的字段查询时间从 20 秒放宽到 40 秒，减少没查完的字段。
+  - 按 BRAIN 自己的设置选项校验 region / delay / universe / neutralization（如 EUR 没有 TOP1600，只有 TOPCS1600），不合法的项在本地拦下，不再整批 400。在 1062 条真实 alpha 的设置上零误报。
+  - QUICK + `max_trade="ON"` 的项在本地拦下（结果必定与 OFF 相同），`force=True` 可放行。
+- **结果行**：
+  - `warns` 里的 WARNING 也带数值（如 FULL 行的 `IS_LADDER 2.07>=2.02`）。
+  - TSV 末尾新增 `cluster_est` 和 `queue_id` 两列（R 路只看 TSV，所以没看到 `cluster_est`）；tag 日志和 `get_simulation()` 列表里也有 `queue_id`。
+  - `dup_of` 的行说明两条表达式差在哪些名字上（如 `fnd17_6_2rhsfcfq` vs `fnd17_2rhsfcfq`，BRAIN 视为同一数据）。
+  - 只差一个设置、所有指标都在 2% 以内时，诊断给出 `little_effect`（如稀疏事件字段上 decay 4→40）；完全相同的仍是 `no_effect`。
+  - 多 id 查询里只给一行的已完成模拟带 `rows_available: true`，并提示怎么取回完整结果。
+  - 客户端对单个表达式多包的一层 JSON 引号照旧去掉，但不再在 warnings 里提示。
+- **队列**：还在等 BRAIN 的提交检查不占通道，以前在队列里看不到。现在队列快照的 `submission_checks_open` 列出它们（alpha、未完成的检查、已等多久、client）。
+- **IS_LADDER 与 2Y**：在 1100 条真实 alpha 上，每条只会有 LOW_2Y_SHARPE 或 IS_LADDER_SHARPE 中的一个，与 region、QUICK/FULL、时间都无关（两种在同一分钟里交替出现），BRAIN 按什么选哪一个看不出来。门槛也是 BRAIN 给的：QUICK 行常见 1.58，FULL 提交检查见过 2.02，以 FULL 的提交检查为准。
+- 报告里另外几项在部署前的版本上出现、当前版本已经修好：labels 广播、`compare_alphas(anchors=...)`、FULL 行 IS_LADDER 不带数值（06:03Z 之后的 54 条 FULL、311 条 QUICK 全都带数值）。
+
 ## 测试
 
 ```bash

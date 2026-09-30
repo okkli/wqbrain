@@ -24,6 +24,7 @@ import sys
 import math
 import io
 import difflib
+import inspect
 import itertools
 import threading
 import weakref
@@ -44,6 +45,10 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from mcp.server.fastmcp import FastMCP
+try:  # resumable SSE streams (mcp >= 1.8)
+    from mcp.server.streamable_http import EventMessage, EventStore
+except ImportError:  # pragma: no cover
+    EventMessage, EventStore = None, object
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
@@ -82,6 +87,23 @@ def _retry_after_seconds(response: requests.Response) -> float:
 
 # Transient statuses a GET may retry (BRAIN's rate limit and gateway hiccups).
 _RETRYABLE_STATUS = (429, 502, 503, 504)
+# What BRAIN says when a simulation failed on its side, without a reason.
+_GENERIC_SIM_ERROR = re.compile(r"(?i)there was an error while running the simulation\.?")
+
+
+class BrainBusy(requests.Timeout):
+    """BRAIN asked this account to slow down and the call has no time left to wait
+    for it: reported as RATE_LIMITED with retry_after_seconds, not as an error."""
+
+    def __init__(self, message: str, retry_after: float = 15.0) -> None:
+        super().__init__(message)
+        self.retry_after = max(1.0, float(retry_after))
+
+
+# Requests per second this account sends BRAIN (all tools, all clients together),
+# so a burst (three agents asking for 4 alphas each) queues for a moment here
+# instead of drawing 429s.
+BRAIN_RPS = max(0.5, float(os.environ.get("WQMCP_BRAIN_RPS", "8")))
 
 # --- Deployment switches (see README.md) -------------------------------------
 BRAIN_BASE_URL = os.environ.get("WQMCP_BASE_URL", "https://api.worldquantbrain.com").rstrip("/")
@@ -261,6 +283,8 @@ class CorrelationGate:
         self._client_of: Dict[Tuple[str, str], str] = {}       # (alpha, kind) -> who asked
         self._timing: Dict[Tuple[str, str], collections.deque] = {}   # (kind, mode) -> seconds
         self._twins: Dict[str, str] = {}                       # alpha -> alpha with identical PnL
+        # submission checks BRAIN still works on: they hold no lane, so the queue would not show them
+        self._checks_open: "collections.OrderedDict[str, Dict[str, Any]]" = collections.OrderedDict()
         self.aging_seconds = max(0.0, float(env("WQMCP_CORR_AGING_SECONDS", "300")))
         self.abandon_seconds = max(1.0, float(env("WQMCP_CORR_ABANDON_SECONDS", "1200")))
         self._asked: Dict[Tuple[str, str], float] = {}    # (alpha, kind) -> last time a caller asked
@@ -397,6 +421,24 @@ class CorrelationGate:
         probe = min((t for t in tickets if t[0] < 0), key=lambda t: t[0], default=None)
         return sorted(tickets, key=lambda t: (self._tier(t, probe)[0],
                                               self._first_asked.get((t[1], t[2]), t[3]), abs(t[0])))
+
+    def check_state(self, alpha_id: str, pending: List[str], client: str = "") -> None:
+        """Note (or clear) a submission check that BRAIN has not finished."""
+        if pending:
+            row = self._checks_open.get(alpha_id) or {"alpha_id": alpha_id, "first": time.monotonic()}
+            row.update(pending=list(pending), seen=time.monotonic(), **({"client": client} if client else {}))
+            self._checks_open[alpha_id] = row
+            while len(self._checks_open) > 100:
+                self._checks_open.popitem(last=False)
+        else:
+            self._checks_open.pop(alpha_id, None)
+
+    def open_checks(self) -> List[Dict[str, Any]]:
+        """Submission checks still pending on BRAIN's side, asked for in the last 30 minutes."""
+        now = time.monotonic()
+        return [{"alpha_id": r["alpha_id"], "pending": r["pending"], "waiting_seconds": int(now - r["first"]),
+                 **({"client": r["client"]} if r.get("client") else {})}
+                for r in self._checks_open.values() if now - r["seen"] < 1800]
 
     def rank_reason(self, alpha_id: str, kind: str) -> Optional[str]:
         tickets = [t for t in self._waiting if self.lane(t[2]) == self.lane(kind)]
@@ -661,6 +703,7 @@ class CorrelationGate:
             "computing": sorted(computing.values(), key=lambda r: -r["for_seconds"]),
             "waiting": waiting,
             "endpoint_health": self.health(),
+            **({"submission_checks_open": self.open_checks()} if self.open_checks() else {}),
         }
         if self._last_result is not None:
             out["last_result_seconds_ago"] = int(now - self._last_result)
@@ -836,7 +879,12 @@ def _check_lists(checks: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
             else:
                 fails.append(_short_check(name) + ("" if value is not None else " (no value)"))
         elif result == "WARNING" and "MATCHES_" not in name:
-            warns.append(_short_check(name))
+            value, limit = c.get("value"), c.get("limit")
+            if isinstance(value, (int, float)) and isinstance(limit, (int, float)) \
+                    and not isinstance(value, bool) and not isinstance(limit, bool):
+                warns.append(f"{_short_check(name)} {value:g}{'<' if value < limit else '>='}{limit:g}")
+            else:
+                warns.append(_short_check(name))
     return fails, warns
 
 
@@ -940,7 +988,9 @@ def _correlation_stats(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _verdict(report: Dict[str, Any]) -> Dict[str, Any]:
-    """One field to read: verdict pass / fail / unknown, and what it rests on."""
+    """One field to read: verdict pass / pass_with_warnings / fail / unknown, and
+    what it rests on. pass_with_warnings: BRAIN passed it, but a WARNING that is
+    not exempt (blocking_warnings) stands in the way of a regular submission."""
     failed = report.get("failed") or []
     if failed:
         verdict, basis = "fail", "BRAIN failed: " + ", ".join(failed)
@@ -954,10 +1004,40 @@ def _verdict(report: Dict[str, Any]) -> Dict[str, Any]:
     else:
         open_ = (report.get("pending") or []) + (report.get("errored") or [])
         verdict, basis = "unknown", "still open: " + (", ".join(open_) or "no checks returned")
+    warned = report.get("blocking_warnings") or []
+    if verdict == "pass" and warned:
+        # BRAIN passes it, but a WARNING that is not exempt blocks a regular submission
+        verdict = "pass_with_warnings"
+        basis += "; but it warns: " + ", ".join(warned)
     out = {"verdict": verdict, "verdict_basis": basis}
     if report.get("account_blockers"):
         out["submittable_now"] = False
     return out
+
+
+# WARNINGs that do not block a regular submission (a trailing * is a prefix).
+_WARNING_EXEMPT = [x.strip().upper() for x in os.environ.get(
+    "WQMCP_WARNING_EXEMPT", "MATCHES_COMPETITION,MATCHES_THEMES,POWER_POOL_*").split(",") if x.strip()]
+
+
+def _warning_exempt(name: str) -> bool:
+    name = str(name or "").upper()
+    return any(name.startswith(x[:-1]) if x.endswith("*") else name == x for x in _WARNING_EXEMPT)
+
+
+def _blocking_warnings(checks: List[Dict[str, Any]]) -> List[str]:
+    """The WARNING checks that are not exempt, with their numbers when there are any."""
+    out = []
+    for c in checks:
+        name = c.get("name") or ""
+        if c.get("result") != "WARNING" or _warning_exempt(name) or name in _ACCOUNT_CHECKS:
+            continue
+        value, limit = c.get("value"), c.get("limit")
+        if isinstance(value, (int, float)) and isinstance(limit, (int, float)):
+            out.append(f"{name} {value:g}{'<' if value < limit else '>'}{limit:g}")
+        else:
+            out.append(name)
+    return list(dict.fromkeys(out))
 
 
 def _prod_errored(data: Any) -> bool:
@@ -1182,6 +1262,7 @@ class BrainApiClient:
         # (connect, read) timeout applied to every request unless overridden.
         # NOTE: requests.Session has no working `.timeout` attribute — it must
         # be passed per request (see _request).
+        self._tokens, self._tokens_at = BRAIN_RPS, time.perf_counter()   # own clock for the bucket
         self.request_timeout = (
             float(os.environ.get("WQMCP_CONNECT_TIMEOUT", "10")),
             float(os.environ.get("WQMCP_READ_TIMEOUT", "60")),
@@ -1217,6 +1298,7 @@ class BrainApiClient:
         self._logged: set = set()                     # simulations whose results are in the log
         self._seen: Dict[str, Dict[str, Any]] = {}    # simulation id -> first seen / progress / changed
         self._retried: Dict[str, List[str]] = {}      # simulation id -> ids (or queue ids) of its items sent alone
+        self._recovered_rows: Dict[str, Dict[int, Dict[str, Any]]] = {}   # ... and rows found in the alpha list
         self._watchers: Dict[str, "asyncio.Task"] = {}
         self._checking: Dict[Tuple[str, bool], "asyncio.Task"] = {}
         self._last_state: Dict[str, Tuple[float, Dict[str, Any]]] = {}   # simulation -> last answer
@@ -1226,6 +1308,9 @@ class BrainApiClient:
         self._quick_alphas: "collections.OrderedDict[Tuple, str]" = collections.OrderedDict()
         # data field id -> (checked at, combinations it exists for) / None = no such field
         self._field_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+        # "EUR/D1" -> fields a single simulation failed on without a reason (the only
+        # field of its expression): listed by BRAIN, but not served there.
+        self._silent_fields: Dict[str, Dict[str, str]] = {}
         self._operators: Optional[Tuple[float, Dict[str, str]]] = None
     
     def log(self, message: str, level: str = "INFO"):
@@ -1292,6 +1377,7 @@ class BrainApiClient:
         accept = _accept_header(method, url)
         if accept:
             kwargs['headers'] = {"Accept": accept, **(kwargs.get('headers') or {})}
+        await self._pace_account(deadline)
         loop = asyncio.get_running_loop()
         func = getattr(session, method)
         is_get = method.lower() == 'get'
@@ -1301,7 +1387,7 @@ class BrainApiClient:
             cooldown = self._cooldown_until - time.monotonic()
             if is_get and cooldown > 0:
                 if deadline is not None and time.monotonic() + cooldown > deadline - 3:
-                    raise requests.Timeout("BRAIN asked to slow down; no time left in this call")
+                    raise BrainBusy("BRAIN asked to slow down; no time left in this call", cooldown + 2)
                 await asyncio.sleep(min(cooldown, 30.0))  # cooldown itself is capped at 30s
             try:
                 resp = await loop.run_in_executor(self._executor, lambda: func(url, **kwargs))
@@ -1318,9 +1404,24 @@ class BrainApiClient:
                 return resp          # no time to retry within this call: report what BRAIN said
             if resp.status_code == 429:
                 self._cooldown_until = max(self._cooldown_until, time.monotonic() + min(wait, 30.0))
+                self._tokens = min(self._tokens, 0.0)      # nobody sends until the bucket refills
             self.log(f"GET {url} -> {resp.status_code}, retrying in {min(wait, 15.0):.0f}s", "WARNING")
             await asyncio.sleep(min(wait, 15.0))
         return resp
+
+    async def _pace_account(self, deadline: Optional[float]) -> None:
+        """Token bucket for every request of this account (BRAIN_RPS per second)."""
+        while True:
+            now = time.perf_counter()
+            self._tokens = min(BRAIN_RPS, self._tokens + (now - self._tokens_at) * BRAIN_RPS)
+            self._tokens_at = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+            wait = (1.0 - self._tokens) / BRAIN_RPS
+            if deadline is not None and time.monotonic() + wait > deadline - 3:
+                raise BrainBusy("this account's requests are queued; no time left in this call", wait + 5)
+            await asyncio.sleep(wait)
 
     async def cookie_list(self) -> List[Dict[str, Any]]:
         """Current BRAIN session cookies (for the forum's headless browser)."""
@@ -1449,9 +1550,20 @@ class BrainApiClient:
                        "runs each on its own and shows which one it is." if is_multi else "")))
             return state
         self._seen.pop(sim_id, None)
+        self._learn_silent_field(state, sent)
         if self._is_platform_glitch(state) and sent.get("payloads") and AUTO_RETRY_GLITCH \
                 and sim_id not in self._retried.values():
-            ids = await self._split_resubmit(sim_id)
+            # BRAIN sometimes created the alphas although it reports the batch failed
+            # (2026-09-30c: a resend came back "reused" for every item): look first.
+            recovered = await self._recover_results(sim_id, compact)
+            done = {r["index"]: r for r in (recovered or {}).get("alpha_results") or []
+                    if r.get("status") == "COMPLETE"}
+            self._recovered_rows[sim_id] = done
+            if done and len(done) == len(sent.get("items") or []):
+                # every alpha exists: nothing to send, this id now answers from the alpha list
+                self._retried[sim_id] = [f"alpha:{done[i].get('id')}" for i in sorted(done)]
+                return await self._split_state(sim_id, compact)
+            ids = await self._split_resubmit(sim_id, skip=set(done))
             if ids:
                 self._retried[sim_id] = ids
                 return {"status": "RETRIED", "retried_as": ids, "simulation_id": sim_id,
@@ -1459,8 +1571,10 @@ class BrainApiClient:
                         "note": ("BRAIN failed every child without giving a reason. That is either a platform "
                                  "hiccup or one item BRAIN cannot run (typically a field that is in the "
                                  "catalogue but not served for these settings), which takes the whole batch "
-                                 f"down. Each item was sent again on its own ({', '.join(ids)}): the good "
-                                 f"ones come back, a bad one shows itself. Asking for {sim_id} follows them.")}
+                                 "down. Items BRAIN had made anyway were taken from your alpha list "
+                                 "(alpha:<id>); the others were sent again one by one "
+                                 f"({', '.join(i for i in ids if not i.startswith('alpha:')) or '-'}): the good ones "
+                                 f"come back, a bad one shows itself. Asking for {sim_id} follows them.")}
         found = _diagnostics(state, sent.get("items") or [])
         if found:
             await self._add_coverage_gaps(found, state)
@@ -1470,14 +1584,39 @@ class BrainApiClient:
         await self._log_results(sim_id, state)
         return state
 
-    async def _split_resubmit(self, sim_id: str) -> List[str]:
+    def _learn_silent_field(self, state: Dict[str, Any], sent: Dict[str, Any]) -> None:
+        """A single that failed without a reason and uses exactly one data field: that
+        field is most likely listed but not served for the region / delay (EUR pv87_*
+        fields, 2026-09-30). The next pre-check holds it back."""
+        items = sent.get("items") or []
+        if len(items) != 1 or state.get("status") not in ("FAIL", "ERROR") or isinstance(state.get("alpha"), dict):
+            return
+        text = str(state.get("message") or "").strip()
+        if text and not _GENERIC_SIM_ERROR.fullmatch(text):
+            return
+        fields = [f for f in _field_candidates(items[0]["expr"]) if self._field_cache.get(f, (0, None))[1]]
+        if len(fields) != 1:
+            return
+        st = items[0]["settings"]
+        where = f"{str(st.get('region') or '').upper()}/D{st.get('delay')}"
+        known = self._silent_fields.setdefault(where, {})
+        if fields[0] not in known:
+            known[fields[0]] = time.strftime("%Y-%m-%d", time.gmtime())
+            self.log(f"field {fields[0]} failed silently in {where}: held back from now on", "WARNING")
+            self.save_state()
+
+    async def _split_resubmit(self, sim_id: str, skip: Optional[set] = None) -> List[str]:
         """Send each item of a failed multi on its own (through the submit queue, so
-        full slots only delay it). The tag goes along, with the item's own index."""
+        full slots only delay it). The tag goes along, with the item's own index.
+        Items in skip already have an alpha (found in the alpha list): "alpha:<id>"."""
         sent = self._submitted.get(sim_id) or {}
         meta = self._tags.get(sim_id)
         labels = (meta or {}).get("labels") or []
         ids: List[str] = []
         for index, item in enumerate(sent.get("payloads") or []):
+            if skip and index in skip:
+                ids.append(f"alpha:{(self._recovered_rows.get(sim_id) or {}).get(index, {}).get('id')}")
+                continue
             data = SimulationData(type=item.get("type", "REGULAR"), settings=SimulationSettings(**item["settings"]),
                                   **{k: item[k] for k in ("regular", "combo", "selection") if item.get(k)})
             client = next((r.get("client") for r in self.recent_simulations if r["simulation_id"] == sim_id), None)
@@ -1499,6 +1638,10 @@ class BrainApiClient:
         ids = self._retried[sim_id]
 
         async def one(index: int, ref: str) -> Dict[str, Any]:
+            if ref.startswith("alpha:"):          # BRAIN had made this one: found in the alpha list
+                row = (self._recovered_rows.get(sim_id) or {}).get(index) or {}
+                return {"simulation_id": sim_id, "alpha": {k: v for k, v in row.items() if k != "index"},
+                        "recovered": True}
             if not ref:
                 return {"status": "ERROR", "error": "could not be sent again"}
             if re.fullmatch(r"Q\d+", ref):
@@ -1518,7 +1661,8 @@ class BrainApiClient:
         for index, st in enumerate(states):
             expr = items[index]["expr"] if index < len(items) else ""
             if isinstance(st.get("alpha"), dict):
-                rows.append({"index": index, "status": "COMPLETE", **st["alpha"], "simulation_id": st["simulation_id"]})
+                rows.append({"index": index, "status": "COMPLETE", **st["alpha"], "simulation_id": st["simulation_id"],
+                             **({"recovered": True} if st.get("recovered") else {})})
                 continue
             row = {"index": index, "simulation_id": st.get("simulation_id"), "status": st.get("status")}
             for k in ("message", "error", "queue_position", "retry_after_seconds"):
@@ -1532,12 +1676,18 @@ class BrainApiClient:
             rows.append(row)
         running = [r for r in rows if r["status"] in ("RUNNING", "QUEUED", "UNKNOWN", "PENDING")]
         failed = [r for r in rows if r not in running and r["status"] != "COMPLETE"]
+        found = [r for r in rows if r.get("recovered")]
+        if found:     # never simulated again, so logged here (once) for a tagged batch
+            await self._log_results(sim_id, {"status": "COMPLETE", "alpha_results": found})
         out: Dict[str, Any] = {
             "status": "RUNNING" if running else ("FINISHED_WITH_ERRORS" if failed else "COMPLETE"),
             "type": "MULTI", "simulation_id": sim_id, "retried_as": ids,
             "total_children": len(rows), "failed_children": len(failed), "alpha_results": rows,
-            "note": (f"BRAIN failed all of {sim_id} without a reason; its items were sent again one by one "
-                     "and are shown here in the original order."
+            "note": (f"BRAIN failed all of {sim_id} without a reason. "
+                     + ("It had made every alpha anyway: the rows come from your alpha list, nothing was sent "
+                        "again." if all(i.startswith("alpha:") for i in ids) else
+                        "Items it had made anyway come from your alpha list (recovered), the others were sent "
+                        "again one by one; all are shown here in the original order.")
                      + (f" Item(s) {[r['index'] for r in failed]} fail on their own too: see diagnosis."
                         if failed else "")
                      + (" Still running: ask again later." if running else "")),
@@ -1548,12 +1698,16 @@ class BrainApiClient:
 
     @staticmethod
     def _is_platform_glitch(state: Dict[str, Any]) -> bool:
-        """A multi where every child failed and not one says why."""
+        """A multi where every child failed and not one says why (no message, or only
+        BRAIN's generic "There was an error while running the simulation")."""
         rows = state.get("alpha_results") or []
+
+        def silent(r: Dict[str, Any]) -> bool:
+            text = str(r.get("message") or r.get("error") or "")
+            return not text or bool(_GENERIC_SIM_ERROR.fullmatch(text.strip()))
         return (state.get("type") == "MULTI" and len(rows) > 1
-                and all(r.get("status") not in ("COMPLETE", None) and not r.get("message") and not r.get("error")
-                        for r in rows)
-                and not state.get("errors"))
+                and all(r.get("status") not in ("COMPLETE", None) and silent(r) for r in rows)
+                and all(silent(e) for e in state.get("errors") or []))
 
     # --- state that survives a restart -------------------------------------------------
     def save_state(self) -> None:
@@ -1570,6 +1724,10 @@ class BrainApiClient:
             "queue": [{k: v for k, v in e.items()} for e in self.submit_queue],
             "queue_numbers": self._queue_numbers,
             "recent": list(self.recent_simulations),
+            "silent_fields": self._silent_fields,
+            # field lookups survive a restart (their age in wall-clock time)
+            "fields": {k: [time.time() - (time.monotonic() - v[0]), v[1]]
+                       for k, v in list(self._field_cache.items())[-3000:]},
         }
 
         def write() -> None:
@@ -1612,6 +1770,11 @@ class BrainApiClient:
         self.submit_queue = [e for e in state.get("queue") or [] if e.get("status") == "QUEUED"]
         for row in reversed(state.get("recent") or []):
             self.recent_simulations.appendleft(row)
+        self._silent_fields.update(state.get("silent_fields") or {})
+        for name, (at, info) in (state.get("fields") or {}).items():
+            age = time.time() - float(at)
+            if 0 <= age < 6 * 3600:
+                self._field_cache[name] = (time.monotonic() - age, info)
         self._resume_pending = True
 
     def resume_after_restart(self) -> None:
@@ -1747,6 +1910,8 @@ class BrainApiClient:
             index = row.get("index", 0)
             record = {"ts": stamp, "tag": meta["tag"], "simulation_id": sim_id,
                       "index": meta.get("item", index)}    # the item of the original request
+            if meta.get("queue_id"):
+                record["queue_id"] = meta["queue_id"]      # it waited in the submit queue under this id
             if index < len(labels) and labels[index]:
                 record["label"] = labels[index]
             record.update({k: v for k, v in row.items() if k not in ("index", "location")})
@@ -2022,9 +2187,15 @@ class BrainApiClient:
                    else {"index": index, **s})
             alpha_id = str(alpha.get("id") or s.get("alpha_id"))
             if alpha_id in first_row_of:
-                row["duplicate_of_index"] = first_row_of[alpha_id]
+                first = first_row_of[alpha_id]
+                row["duplicate_of_index"] = first
                 row["warning"] = ("BRAIN returned the same alpha for this item as for item "
-                                  f"{first_row_of[alpha_id]}: to BRAIN the two are identical.")
+                                  f"{first}: to BRAIN the two are identical.")
+                other = items[first]["expr"] if first < len(items) else ""
+                mine, theirs = _name_difference((item or {}).get("expr") or "", other)
+                if mine and theirs:
+                    row["warning"] += (f" They differ only in {', '.join(mine)} vs {', '.join(theirs)}, which "
+                                       "BRAIN therefore treats as the same data (e.g. aliases of one field).")
             else:
                 first_row_of[alpha_id] = index
             if item is not None:
@@ -2186,6 +2357,8 @@ class BrainApiClient:
         client = (meta or {}).get("client") or _client_label()
         if (meta or {}).get("tag"):
             row["tag"] = meta["tag"]
+        if (meta or {}).get("queue_id"):
+            row["queue_id"] = meta["queue_id"]
         if client:
             row["client"] = client
         self.recent_simulations.appendleft(row)
@@ -2307,7 +2480,7 @@ class BrainApiClient:
                 continue
             simulation_id, location = posted
             self._remember_simulation(simulation_id, entry["kind"], entry["type"], entry["alphas"],
-                                      entry["payloads"], entry.get("meta"))
+                                      entry["payloads"], {**(entry.get("meta") or {}), "queue_id": entry["queue_id"]})
             self._queue_finished(entry, "SUBMITTED", simulation_id=simulation_id, progress_url=location)
 
     async def _submit(self, kind: str, body: Any, what: str, sim_type: str,
@@ -2448,7 +2621,13 @@ class BrainApiClient:
             issues = []
             region = str(settings.get("region") or "").upper()
             delay = settings.get("delay")
+            silent = self._silent_fields.get(f"{region}/D{delay}") or {}
             for name in _field_candidates(expr):
+                if name in silent:
+                    issues.append(f"data field {name!r} made a simulation in {region} delay {delay} fail without "
+                                  f"a reason before ({silent[name]}, it was the only field there): BRAIN lists it "
+                                  "but does not seem to serve it here. force=True sends it anyway")
+                    continue
                 if name not in known:
                     continue
                 combos = None if known[name] is None else known[name]["combos"]
@@ -3690,6 +3869,9 @@ class BrainApiClient:
             "failed": failed, "pending": pending, "errored": errored,
             "checks": rows,
         }
+        warned = _blocking_warnings(checks)
+        if warned:
+            out["blocking_warnings"] = warned
         if pp_rows:
             out["power_pool_checks"] = pp_rows
             out["power_pool_note"] = "Only for a power-pool submission; they do not block a regular one."
@@ -3752,6 +3934,7 @@ class BrainApiClient:
                            "is unknown (null). prod_fallback is a prod value from elsewhere (see its source); "
                            "all_passed_with_fallback counts it in. Check again before submitting.")
         out.update(_verdict(out))
+        self.correlation_gate.check_state(str(alpha_id), out.get("pending") or [], _client_label())
         return out
 
     async def set_alpha_properties(
@@ -4007,6 +4190,40 @@ class BrainApiClient:
             self.log(f"Failed to get instrument options: {str(e)}", "ERROR")
             raise
             
+    async def setting_problems(self, items: List[Tuple[int, Dict[str, Any]]],
+                               budget: float = 10.0) -> List[Tuple[int, str]]:
+        """Settings BRAIN would refuse the whole request for (a multi comes back 400):
+        a region / delay / universe / neutralization that is not among its options
+        for the instrument type and region. Best effort: no options, no verdict."""
+        hit = getattr(self, "_options_cache", None)
+        if not hit or time.monotonic() - hit[0] > 6 * 3600:
+            try:
+                options = await asyncio.wait_for(self.get_platform_setting_options(), budget)
+            except Exception:
+                return []
+            table = {(o["InstrumentType"], o["Region"], o["Delay"]): o for o in options.get("instrument_options") or []}
+            hit = self._options_cache = (time.monotonic(), table)
+        table = hit[1]
+        if not table:
+            return []
+        out = []
+        for index, st in items:
+            kind, region, delay = st.get("instrumentType") or "EQUITY", st.get("region"), st.get("delay")
+            if region in (None, "ALL") or delay is None:
+                continue
+            row = table.get((kind, region, delay))
+            if row is None:
+                there = sorted({f"{r}/D{d}" for (k, r, d) in table if k == kind and r == region})
+                out.append((index, f"{region} delay {delay} is not a {kind} setting BRAIN offers"
+                                   + (f" (it has {', '.join(there)})" if there else "")))
+                continue
+            for key, field in (("universe", "Universe"), ("neutralization", "Neutralization")):
+                value = st.get(key)
+                if value is not None and row.get(field) and value not in row[field]:
+                    out.append((index, f"{key} {value!r} does not exist for {region} D{delay}; "
+                                       f"BRAIN has {', '.join(map(str, row[field]))}"))
+        return out
+
     async def performance_comparison(self, alpha_id: str, team_id: Optional[str] = None,
                                      competition: Optional[str] = None,
                                      max_wait: float = 30) -> Dict[str, Any]:
@@ -4148,7 +4365,9 @@ def _decoded_codes(value: Any, name: str) -> Tuple[List[str], List[str]]:
                     break
                 if not isinstance(inner, str):
                     break
-                notes.append(f"{where}: removed a layer of JSON quotes around the expression")
+                # Routine for some clients' encoding of a "string or list" argument:
+                # undone quietly (it only showed up as noise in the answers).
+                logger.debug("%s: removed a layer of JSON quotes around the expression", where)
                 text = inner
                 continue
             break
@@ -4505,6 +4724,14 @@ def _constant_signal_warnings(expr: str, field_types: Dict[str, str]) -> List[st
 _NOT_FIELDS = {"true", "false", "nan", "inf", "on", "off", "and", "or", "not", "if", "else"}
 
 
+def _name_difference(a: str, b: str) -> Tuple[List[str], List[str]]:
+    """Names (fields, operators) found in only one of two expressions."""
+    names_a = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", _strip_strings_and_comments(a or ""))
+    names_b = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", _strip_strings_and_comments(b or ""))
+    return ([n for n in dict.fromkeys(names_a) if n not in names_b],
+            [n for n in dict.fromkeys(names_b) if n not in names_a])
+
+
 def _expression_fields(expr: str) -> List[str]:
     """Names in an expression that are not operators (not followed by "(") and
     not keyword arguments (not followed by "="): the data fields, roughly."""
@@ -4693,6 +4920,21 @@ def _coverage_gaps(records: List[Any]) -> Dict[str, Any]:
     return out
 
 
+def _nearly_same(a: Tuple, b: Tuple) -> bool:
+    """Every metric of two runs within 2% (or 0.01) of each other, and at least one given."""
+    pairs = [(x, y) for x, y in zip(a, b) if x is not None or y is not None]
+    if not pairs:
+        return False
+    for x, y in pairs:
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            if x != y:
+                return False
+            continue
+        if abs(x - y) > max(0.01, 0.02 * max(abs(x), abs(y))):
+            return False
+    return True
+
+
 def _diagnostics(state: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Things a finished batch shows that no single row says: a setting that did
     not change the result at all, decay that is not applied, and the
@@ -4724,14 +4966,22 @@ def _diagnostics(state: Dict[str, Any], items: List[Dict[str, Any]]) -> List[Dic
             if not sa or not sb or expr(a) != expr(b):
                 continue          # only the same expression run with other settings says anything
             diff = [k for k in set(sa) | set(sb) if sa.get(k) != sb.get(k)]
-            if len(diff) != 1 or metrics(a) != metrics(b):
+            if len(diff) != 1:
+                continue
+            if metrics(a) == metrics(b):
+                kind = "no_effect"
+            elif _nearly_same(metrics(a), metrics(b)):
+                kind = "little_effect"      # e.g. decay 4 -> 40 on a sparse event field
+            else:
                 continue
             key = diff[0]
-            group = next((g for g in out if g.get("setting") == key and g.get("kind") == "no_effect"), None)
+            group = next((g for g in out if g.get("setting") == key and g.get("kind") == kind), None)
             if group is None:
-                group = {"kind": "no_effect", "setting": key, "items": [], "values": [],
-                         "note": f"{key} did not change the result: these items differ only in {key} and "
-                                 "give the same numbers. " + _NO_EFFECT_HINTS.get(key, "")}
+                group = {"kind": kind, "setting": key, "items": [], "values": [],
+                         "note": (f"{key} did not change the result: these items differ only in {key} and "
+                                  "give the same numbers. " if kind == "no_effect" else
+                                  f"{key} barely changed the result: these items differ only in {key} and every "
+                                  "number is within 2%. ") + _NO_EFFECT_HINTS.get(key, "")}
                 out.append(group)
             for r, st in ((a, sa), (b, sb)):
                 if (key, r.get("index")) not in seen:
@@ -4793,7 +5043,8 @@ def _compact_state(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _TSV_COLUMNS = ("index", "id", "ops", "sharpe", "fitness", "turnover", "margin_bps", "sub_sharpe",
-                "y2_sharpe", "cluster", "fails", "warns", "set", "expr", "reused", "submitted_expr")
+                "y2_sharpe", "cluster", "fails", "warns", "set", "expr", "reused", "submitted_expr",
+                "cluster_est", "queue_id")
 
 
 def _tsv(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -4899,6 +5150,49 @@ def _transport_security():
 WQMCP_HOST = os.environ.get("WQMCP_HOST", "127.0.0.1")
 WQMCP_PORT = int(os.environ.get("WQMCP_PORT", "8761"))
 
+class _MemoryEventStore(EventStore):
+    """Keeps the last SSE events so a client whose stream dropped can reconnect with
+    Last-Event-ID and get what it missed. Without it the server sends no event ids:
+    an answer sent into a dead connection was lost and the client waited ~300s for
+    it (2026-09-30: calls the server answered in 12-27s, never received)."""
+
+    def __init__(self, max_events: int = 5000, max_age: float = 900.0) -> None:
+        self._events: "collections.OrderedDict[str, Tuple[str, Any, float]]" = collections.OrderedDict()
+        self._numbers = itertools.count(1)
+        self.max_events, self.max_age = max_events, max_age
+
+    async def store_event(self, stream_id: str, message: Any) -> str:
+        event_id = str(next(self._numbers))
+        now = time.monotonic()
+        self._events[event_id] = (stream_id, message, now)
+        while self._events and (len(self._events) > self.max_events
+                                or now - next(iter(self._events.values()))[2] > self.max_age):
+            self._events.popitem(last=False)
+        return event_id
+
+    async def replay_events_after(self, last_event_id: str, send_callback: Any) -> Optional[str]:
+        if last_event_id not in self._events:
+            return None
+        stream_id = self._events[last_event_id][0]
+        after = False
+        for event_id, (sid, message, _) in list(self._events.items()):
+            if after and sid == stream_id and message is not None:
+                await send_callback(EventMessage(message, event_id))
+            after = after or event_id == last_event_id
+        return stream_id
+
+
+def _resumable() -> Dict[str, Any]:
+    """FastMCP arguments for resumable streams (older mcp versions lack them)."""
+    params = inspect.signature(FastMCP.__init__).parameters
+    out: Dict[str, Any] = {}
+    if "event_store" in params and os.environ.get("WQMCP_RESUMABLE", "1") != "0":
+        out["event_store"] = _MemoryEventStore()
+        if "retry_interval" in params:
+            out["retry_interval"] = 1000      # ms before a client reconnects a dropped stream
+    return out
+
+
 mcp = FastMCP(
     "brain-platform-mcp",
     instructions=(
@@ -4913,6 +5207,7 @@ mcp = FastMCP(
     host=WQMCP_HOST,
     port=WQMCP_PORT,
     transport_security=_transport_security(),
+    **_resumable(),
 )
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
@@ -5156,6 +5451,20 @@ async def _heartbeat(name: str, started: float) -> None:
             return
 
 
+def _rate_limited_answer(e: BaseException) -> Optional[Dict[str, Any]]:
+    """A BRAIN 429 (or a wait for one that did not fit into the call) as a structured
+    answer: RATE_LIMITED with how long to wait, instead of a bare error text."""
+    if isinstance(e, BrainBusy):
+        wait = e.retry_after
+    elif isinstance(e, requests.HTTPError) and getattr(e.response, "status_code", None) == 429:
+        wait = _retry_after_seconds(e.response) or 15.0
+    else:
+        return None
+    return {"status": "RATE_LIMITED", "retry_after_seconds": round(wait, 1),
+            "error": f"BRAIN is rate limiting this account ({e}). Nothing is wrong with the request: "
+                     "call again after retry_after_seconds (several agents share one account)."}
+
+
 def _tool(annotations: ToolAnnotations):
     """Register an MCP tool whose failures come back as {"error": ...}: callers such
     as scripts/prodmemo_daily_sync.py read that shape rather than MCP's isError.
@@ -5191,6 +5500,10 @@ def _tool(annotations: ToolAnnotations):
                 outcome = "cancelled"          # the client went away
                 raise
             except Exception as e:
+                busy = _rate_limited_answer(e)
+                if busy is not None:
+                    outcome = "rate_limited"
+                    return busy
                 outcome = "error"
                 return {"error": str(e) or repr(e)}
             finally:
@@ -5526,11 +5839,10 @@ async def create_simulation(
         items.append(SimulationData(type=sim_type, settings=SimulationSettings(**settings), **code))
         children.append({"index": i, "overrides": override} if override else {"index": i})
 
-    warnings = [f"item {i}: QUICK mode ignores maxTrade=ON — the result equals maxTrade=OFF. "
-                "Run this item with simulation_mode=\"FULL\" to see what maxTrade does."
-                for i, item in enumerate(items)
-                if str(item.settings.simulationMode or "").upper() == "QUICK"
-                and str(item.settings.maxTrade or "").upper() == "ON"]
+    warnings: List[str] = []
+    quick_max_trade = [i for i, item in enumerate(items)
+                       if str(item.settings.simulationMode or "").upper() == "QUICK"
+                       and str(item.settings.maxTrade or "").upper() == "ON"]
     # Pre-check. Every problem is found per distinct expression (or expression +
     # region + delay for the data checks) and then applies to each item using it.
     issues_of: Dict[int, List[str]] = {}
@@ -5539,6 +5851,11 @@ async def create_simulation(
         for i in indexes:
             bucket = issues_of.setdefault(i, [])
             bucket += [x for x in issues if x not in bucket]
+
+    # A slot spent on a copy of the maxTrade=OFF result (a warning alone was overlooked).
+    add(quick_max_trade, ["QUICK mode ignores maxTrade=ON: the result would equal maxTrade=OFF (a duplicate "
+                          "alpha). Run it with simulation_mode=\"FULL\" to see what maxTrade does, or "
+                          "force=True to send it anyway"])
 
     if validate_expressions and not is_python:
         for row in _lint_problems(codes):
@@ -5551,7 +5868,8 @@ async def create_simulation(
             seen_items.setdefault(key, i)
         try:
             unknown, soft = await brain_client.field_problems(
-                [(i, key[0], {"region": key[1], "delay": key[2]}) for key, i in seen_items.items()])
+                [(i, key[0], {"region": key[1], "delay": key[2]}) for key, i in seen_items.items()],
+                budget=40.0 if mode == "multi" else 20.0)   # an unchecked field can sink a whole multi
         except Exception as e:   # the pre-check must never stop a submission by failing itself
             unknown, soft = [], []
             warnings.append(f"catalogue pre-check skipped ({type(e).__name__}: {_cut(str(e), 120)}): "
@@ -5562,6 +5880,13 @@ async def create_simulation(
             key = key_of_index[row["index"]]
             add([i for i, item in enumerate(items)
                  if (item.regular or "", str(item.settings.region), item.settings.delay) == key], row["issues"])
+    if validate_expressions and sim_type != "REGION_AGNOSTIC":
+        try:
+            for i, issue in await brain_client.setting_problems(
+                    [(i, brain_client.simulation_payload(item)["settings"]) for i, item in enumerate(items)]):
+                add([i], [issue])
+        except Exception as e:   # like the catalogue check: never stops a submission itself
+            warnings.append(f"settings pre-check skipped ({type(e).__name__}: {_cut(str(e), 120)})")
     # Operators by BRAIN's operatorCount (calls, infix and unary operators, ts_backfill).
     ops_est = [_estimated_ops(item.regular) if item.regular and not is_python else None for item in items]
     for child, ops in zip(children, ops_est):
@@ -5825,7 +6150,7 @@ async def get_simulation(simulation_ids: Union[str, List[str], None] = None, wai
         if only_pending or sid in delivered:
             rows = st.get("alpha_results")
             states[k] = {"simulation_id": sid, "status": st["status"],
-                         "rows": len(rows) if isinstance(rows, list) else 1,
+                         "rows": len(rows) if isinstance(rows, list) else 1, "rows_available": True,
                          **({"returned_before": True} if sid in delivered else {})}
         else:
             delivered.add(sid)
@@ -5837,6 +6162,12 @@ async def get_simulation(simulation_ids: Union[str, List[str], None] = None, wai
     else:
         status = "FINISHED_WITH_ERRORS"
     notes = list(dict.fromkeys(s.pop("note") for s in states if s.get("note")))
+    short = [s["simulation_id"] for s in states if s.get("rows_available")]
+    if short:
+        notes.append(f"{len(short)} finished simulation(s) are shown as one line (rows_available: their rows "
+                     "were given before or only_pending is on); ask for one alone, e.g. "
+                     f"get_simulation(simulation_ids=\"{short[0]}\"), or curl the tag's results file, "
+                     "to see its rows.")
     out: Dict[str, Any] = {"status": status, "counts": dict(counts), "simulations": states}
     if notes:
         out["note"] = " | ".join(notes)   # said once, not on every simulation
@@ -6128,8 +6459,9 @@ async def check_alpha(alpha_id: str = "", check: str = "submission", wait_second
     ✅ BRAIN's checks for an alpha: submission checks and / or correlations.
 
     check (key argument):
-      "submission" (default): the Submit button's checks. Read "verdict" (pass / fail /
-        unknown) and verdict_basis; is_passed = the checks that need no correlation.
+      "submission" (default): the Submit button's checks. Read "verdict" (pass /
+        pass_with_warnings = a WARNING such as CLUSTER_TEST that is not exempt, listed in
+        blocking_warnings / fail / unknown) and verdict_basis; is_passed = the checks that need no correlation.
         PROD_CORRELATION ERROR / PENDING: prod_fallback + all_passed_with_fallback.
       "prod" / "self" / "power-pool" / "correlation" (prod+self) / "all" (with submission).
       "queue": show the correlation queue (asks BRAIN nothing).

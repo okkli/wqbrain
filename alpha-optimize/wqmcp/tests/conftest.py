@@ -27,6 +27,7 @@ os.environ["WQMCP_CORR_BACKGROUND"] = "0"
 os.environ["WQMCP_CORR_COOLDOWN_SECONDS"] = "0"   # likewise: the cooldown tests switch it on
 os.environ["WQMCP_SUBMIT_QUEUE"] = "0"            # RATE_LIMITED as such; the queue tests ask for it
 os.environ["WQMCP_STATE_FILE"] = ""               # no state file; the state tests set one
+os.environ["WQMCP_BRAIN_RPS"] = "100000"          # the fake BRAIN has no rate limit; the pacing test sets one
 os.environ["WQMCP_SUBMIT_QUEUE_INTERVAL"] = "0.2"
 os.environ["WQMCP_SUBMIT_QUEUE_MAX_INTERVAL"] = "0.2"
 
