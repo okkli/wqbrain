@@ -999,3 +999,10 @@ async def test_a_slow_status_check_answers_the_last_known_state_in_time(client):
         pf._CALL_DEADLINE.reset(token)
     assert pf.time.monotonic() - t0 < 3 and started.is_set()
     assert out["status"] == "RUNNING" and out["last_known"] is True and out["seen_seconds_ago"] >= 30
+
+
+def test_only_a_stated_wait_tightens_the_call_budget(monkeypatch):
+    monkeypatch.setattr(pf, "TOOL_DEADLINE", 75.0)
+    assert pf._call_budget({"wait_seconds": 40}) == 60 and pf._call_budget({"wait_seconds": 0}) == 30
+    assert pf._call_budget({}) == 75                  # paged reads (diversity-score) keep the old limit
+    assert pf._call_budget({"wait_seconds": 300}) == 60   # waits are capped at 40
