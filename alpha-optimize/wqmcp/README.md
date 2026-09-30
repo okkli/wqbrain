@@ -343,6 +343,20 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - **算子数**：负数字面量的符号（`subtract(-1, x)`、`if_else(c, 1, -1)`、`x = -0.5`）不计为算子，与平台 `operatorCount` 一致。
 - 修掉的隐患：轮询退避 `1.6 ** polls` 在轮询约 1500 次后溢出，后台任务会崩；取消一个 alpha 时会连带清掉它在另一通道的名额。
 
+## 2026-09-30b 实战问题的修复（EUR 第五轮）
+
+- **labels 与预检**：`labels` 按请求的条数校验（在预检拦下某项之前），被拦下的项不再让整批一条都不发；各项仍按原序号取自己的 label。只给一个 label 时用于整批。
+- **旧 alpha / 去重落盘**：single（包括 concurrent 的每一项）也检查 BRAIN 是否用已有 alpha 作答，和 multi 一样给出 `reused_alpha`、`submitted_expr`、`warning`，jsonl 里都有。TSV 末尾新增两列 `reused`（`old_alpha` 或 `dup_of=<序号>`）和 `submitted_expr`；原有列的位置不变，按位置解析的脚本不用改。
+- **谁的模拟**：`create_simulation` / `get_simulation` 都有 `client` 参数，默认是会话自动分到的名字（`c1`、`c2`…）。`get_simulation()` 列表每行带 `tag` 和 `client`，可以用 `tag=` / `client=` 过滤，保留最近 300 条。排队中的提交也显示 tag 和 client。
+- **并行轮询**：同一会话同时查同一个 id，结果只给第一个完整行，其余返回 `returned_before`；之后再问一次照样给完整结果。
+- **预检一次报全**：BRAIN 查字段慢时，没查完的字段以前被静默跳过，下一次提交才暴露。现在在 `warnings` 里写明哪些字段没来得及查，查询在后台继续，下一次预检就有结果。预检本身出错时也会提示“已跳过”。
+- **不可用的算子**：本账号没有 `ts_min` / `ts_max` / `ts_median`。前两个直接给出等价写法（`subtract(x, ts_min_diff(x, d))`），其余按名字相似度给出候选。
+- **CONCENTRATED_WEIGHT**：FULL 结果会取该 alpha 的 `coverage` 记录集（QUICK 没有），列出覆盖股票数不到中位数一半的交易日（`coverage_gaps`，节假日不算）。M 路实测的根因就是这种缺口日，`ts_backfill` 可以补上。
+- **compare_alphas(anchors=[...])**：只算“候选 × anchors”，不再算 anchors 之间；`by_candidate` 给出每个候选最高的一对。
+- **ProdMemo 点估计**：斜率低于 0.10 时停止给点估计，要回到 0.15 以上才恢复（`PRODMEMO_EST_RESUME_SLOPE`），不会在 0.10 附近来回跳。
+- `ops_est` 对重复出现的子表达式按出现次数计，与平台一致（在有重复的真实 alpha 上核对过）。
+- 上一轮报告里 QUICK 行的 IS_LADDER 不带数值：落盘记录显示都是 06:02Z 切换之前旧版本的行，新版本之后都带数值。没有数值的 IS_LADDER 是 PENDING（平台还没算），不计入 fails。
+
 ## 测试
 
 ```bash

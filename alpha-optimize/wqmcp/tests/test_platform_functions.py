@@ -799,7 +799,7 @@ TYPES = {"close": "MATRIX", "volume": "MATRIX", "cap": "MATRIX", "subindustry": 
 
 
 @pytest.mark.parametrize("expr, expected", [
-    ("vec_median(evt)", "unknown operator vec_median() (did you mean vec_avg, vec_min?)"),
+    ("vec_median(evt)", "unknown operator vec_median() (did you mean vec_min, vec_avg?)"),
     ("days_from_last_change(evt)", "VECTOR field 'evt' is used in days_from_last_change()"),
     ("a = evt; ts_rank(a, 20)", "VECTOR field 'evt' (via a) is used in ts_rank()"),
     ("densify(rank(close))", "densify: argument 1 'rank(close)' must be a group"),
@@ -1006,3 +1006,34 @@ def test_only_a_stated_wait_tightens_the_call_budget(monkeypatch):
     assert pf._call_budget({"wait_seconds": 40}) == 60 and pf._call_budget({"wait_seconds": 0}) == 30
     assert pf._call_budget({}) == 75                  # paged reads (diversity-score) keep the old limit
     assert pf._call_budget({"wait_seconds": 300}) == 60   # waits are capped at 40
+
+
+def test_coverage_gaps_leave_holidays_out():
+    records = [[f"2019-08-{d:02d}", 1400.0] for d in range(1, 8)] + [["2019-08-08", 0.0], ["2019-08-09", 1390.0],
+                                                                    ["2019-12-25", 0.0], ["2019-04-19", 0.0],
+                                                                    ["2019-09-05", 300.0]]
+    gaps = pf._coverage_gaps(records)
+    assert gaps["median"] == 1400 and gaps["days"] == ["2019-08-08=0", "2019-09-05=300"]   # Christmas, Good Friday out
+    assert pf._market_holiday("2026-04-06") and not pf._market_holiday("2026-04-07")        # Easter Monday 2026
+    assert pf._coverage_gaps([]) == {"none": "no coverage data"}
+
+
+def test_missing_operators_get_a_rewrite_or_the_closest_names():
+    ops = {"ts_min_diff": "Time Series", "ts_mean": "Time Series", "ts_median_x": "Time Series",
+           "vec_avg": "Vector"}
+    assert "subtract(x, ts_min_diff(x, d))" in pf._semantic_issues("ts_min(x, 5)", ops, {})[0]
+    assert "ts_max(): " not in pf._semantic_issues("ts_max(x, 5)", ops, {})[0]          # no ts_max_diff here
+    assert "did you mean ts_median_x" in pf._semantic_issues("ts_median(x, 5)", ops, {})[0]
+
+
+@pytest.mark.asyncio
+async def test_fields_brain_is_slow_to_look_up_are_named_not_skipped(client, monkeypatch):
+    async def slow(name):
+        await asyncio.Event().wait()
+
+    async def ops():
+        return {"rank": "Cross Sectional"}
+    monkeypatch.setattr(client, "field_info", slow)
+    monkeypatch.setattr(client, "operator_categories", ops)
+    rows, warnings = await client.field_problems([(0, "rank(pv87_x)", {"region": "EUR", "delay": 1})], budget=0.05)
+    assert rows == [] and "not checked" in warnings[0]["issue"] and "pv87_x" in warnings[0]["issue"]

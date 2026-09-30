@@ -252,7 +252,8 @@ def _create_sim(fb: FakeBrain, q, body) -> Response:
     elif body.get("type") == "REGION_AGNOSTIC":
         st.sims[sid] = {"polls": 0, "raa": True, "alpha": f"RAP{sid}", "type": "REGION_AGNOSTIC"}
     else:
-        st.sims[sid] = {"polls": 0, "alpha": f"A-{sid}", "regular": body.get("regular"),
+        reused = {"alias(x)": "OLD1"}.get(body.get("regular"))     # BRAIN answers with an old alpha
+        st.sims[sid] = {"polls": 0, "alpha": reused or f"A-{sid}", "regular": body.get("regular"),
                         "type": body.get("type"), "settings": body.get("settings") or {},
                         "glitch": "unserved_field" in str(body.get("regular"))}
     return 201, {"Location": f"{fb.url}/simulations/{sid}"}, None
