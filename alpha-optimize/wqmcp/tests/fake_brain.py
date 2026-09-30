@@ -79,6 +79,7 @@ class FakeState:
     pnl: Dict[str, List[List[Any]]] = field(default_factory=dict)   # alpha id -> pnl records
     cancel_others: bool = False   # a failing multi child makes BRAIN cancel the others
     glitch_batches: int = 0       # this many next multis fail every child without a message
+    glitch_message: Optional[str] = None   # ... or with BRAIN's generic one
     forgotten: set = field(default_factory=set)   # simulations BRAIN answers 404 for
     listed: Optional[List[Dict[str, Any]]] = None  # what /users/self/alphas lists instead
     ignore_setting: Optional[Tuple[str, Any]] = None  # BRAIN runs every alpha with this setting
@@ -291,7 +292,8 @@ def _get_sim(fb: FakeBrain, q, body, sid: str) -> Response:
     if sim["polls"] < st.child_polls_needed:
         return 200, {"Retry-After": "1"}, {"progress": 0.5}
     if sim.get("glitch"):
-        return 200, {}, {"id": sid, "status": "FAIL", "message": None, "alpha": None}
+        return 200, {}, {"id": sid, "status": "ERROR" if st.glitch_message else "FAIL",
+                         "message": st.glitch_message, "alpha": None}
     if st.cancel_others and sim.get("regular") != "fail()" and "C" in sid:
         parent = sid.split("C")[0]
         if any(st.sims.get(c, {}).get("regular") == "fail()" for c in st.sims.get(parent, {}).get("children", [])):
@@ -312,16 +314,22 @@ def _del_sim(fb, q, body, sid) -> Response:
 
 @route("OPTIONS", r"/simulations")
 def _sim_options(fb, q, body) -> Response:
+    universes = {"USA": ["TOP3000", "TOP1000", "TOP500", "TOP200"], "CHN": ["TOP2000U"],
+                 "EUR": ["TOP2500", "TOP1200", "TOP800", "TOP400", "TOPCS1600"],
+                 "IND": ["TOP500"], "MEA": ["TOP400"]}
+    delays = {"USA": [1, 0], "CHN": [1], "EUR": [1, 0], "IND": [1], "MEA": [1]}
+    neutral = ["NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY", "SLOW_AND_FAST", "FAST", "SLOW"]
+    per_region = lambda values: {r: [{"value": v} for v in values(r)] for r in universes}
     choices = {
         "instrumentType": {"type": "choice", "label": "Instrument type", "choices": [{"value": "EQUITY", "label": "Equity"}]},
         "region": {"type": "choice", "label": "Region",
-                   "choices": {"instrumentType": {"EQUITY": [{"value": "USA"}, {"value": "CHN"}]}}},
-        "delay": {"type": "choice", "label": "Delay", "choices": {"instrumentType": {"EQUITY": {"region": {
-            "USA": [{"value": 1}, {"value": 0}], "CHN": [{"value": 1}]}}}}},
-        "universe": {"type": "choice", "label": "Universe", "choices": {"instrumentType": {"EQUITY": {"region": {
-            "USA": [{"value": "TOP3000"}, {"value": "TOP500"}], "CHN": [{"value": "TOP2000U"}]}}}}},
-        "neutralization": {"type": "choice", "label": "Neutralization", "choices": {"instrumentType": {"EQUITY": {"region": {
-            "USA": [{"value": "NONE"}, {"value": "SUBINDUSTRY"}], "CHN": [{"value": "MARKET"}]}}}}},
+                   "choices": {"instrumentType": {"EQUITY": [{"value": r} for r in universes]}}},
+        "delay": {"type": "choice", "label": "Delay", "choices": {"instrumentType": {"EQUITY": {"region":
+                  per_region(lambda r: delays[r])}}}},
+        "universe": {"type": "choice", "label": "Universe", "choices": {"instrumentType": {"EQUITY": {"region":
+                     per_region(lambda r: universes[r])}}}},
+        "neutralization": {"type": "choice", "label": "Neutralization", "choices": {"instrumentType": {"EQUITY": {
+            "region": per_region(lambda r: neutral)}}}},
     }
     return 200, {}, {"actions": {"POST": {"settings": {"type": "nested object", "children": choices}}}}
 
@@ -403,6 +411,8 @@ def _check(fb: FakeBrain, q, body, aid) -> Response:
         return 200, {}, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
                                            {"name": "SELF_CORRELATION", "result": "PASS", "limit": 0.7, "value": 0.3},
                                            {"name": "PROD_CORRELATION", "result": "ERROR"}]}}
+    if fb.state.alpha_checks is not None:
+        return 200, {}, {"is": {"checks": fb.state.alpha_checks}}
     if aid == "PRODOK":
         return 200, {}, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
                                            {"name": "PROD_CORRELATION", "result": "PASS", "limit": 0.7,

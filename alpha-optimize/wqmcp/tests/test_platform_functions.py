@@ -1037,3 +1037,45 @@ async def test_fields_brain_is_slow_to_look_up_are_named_not_skipped(client, mon
     monkeypatch.setattr(client, "operator_categories", ops)
     rows, warnings = await client.field_problems([(0, "rank(pv87_x)", {"region": "EUR", "delay": 1})], budget=0.05)
     assert rows == [] and "not checked" in warnings[0]["issue"] and "pv87_x" in warnings[0]["issue"]
+
+
+@pytest.mark.asyncio
+async def test_the_account_is_paced_and_a_429_comes_back_as_rate_limited(client, monkeypatch):
+    monkeypatch.setattr(pf, "BRAIN_RPS", 2.0)
+    client._tokens, client._tokens_at = 2.0, pf.time.perf_counter()
+    waits = []
+
+    async def sleep(seconds):
+        waits.append(seconds)
+        client._tokens_at -= seconds          # time "passes" for the bucket
+    monkeypatch.setattr(pf.asyncio, "sleep", sleep)
+    for _ in range(4):
+        await client._pace_account(None)
+    assert len(waits) == 2 and all(0.4 <= w <= 0.6 for w in waits)      # 2 at once, then one per 0.5s
+    token = pf._CALL_DEADLINE.set(pf.time.monotonic() + 2.0)
+    try:
+        with pytest.raises(pf.BrainBusy) as busy:
+            client._tokens = -10.0
+            await client._pace_account(pf._CALL_DEADLINE.get())
+    finally:
+        pf._CALL_DEADLINE.reset(token)
+    answer = pf._rate_limited_answer(busy.value)
+    assert answer["status"] == "RATE_LIMITED" and answer["retry_after_seconds"] > 5
+    r = resp(429, {"detail": "slow down"}, {"Retry-After": "7"})
+    assert pf._rate_limited_answer(requests.HTTPError(response=r))["retry_after_seconds"] == 7
+    assert pf._rate_limited_answer(ValueError("x")) is None
+
+
+def test_duplicates_name_what_differs_and_near_identical_runs_are_flagged():
+    assert pf._name_difference("rank(fnd17_6_2rhsfcfq)", "rank(fnd17_2rhsfcfq)") == (["fnd17_6_2rhsfcfq"],
+                                                                                    ["fnd17_2rhsfcfq"])
+    items = [{"expr": "rank(ev)", "settings": {"decay": 4}}, {"expr": "rank(ev)", "settings": {"decay": 40}},
+             {"expr": "rank(ev)", "settings": {"decay": 4, "truncation": 0.1}}]
+    rows = [{"index": 0, "sharpe": 1.50, "fitness": 1.0, "turnover": 0.100},
+            {"index": 1, "sharpe": 1.51, "fitness": 1.0, "turnover": 0.101},
+            {"index": 2, "sharpe": 1.20, "fitness": 0.7, "turnover": 0.3}]
+    found = pf._diagnostics({"alpha_results": rows}, items)
+    little = next(d for d in found if d["kind"] == "little_effect")
+    assert little["setting"] == "decay" and little["items"] == [0, 1] and "within 2%" in little["note"]
+    assert not any(d["kind"] == "no_effect" for d in found)
+    assert not pf._nearly_same((1.5, 0.1), (1.2, 0.1))
