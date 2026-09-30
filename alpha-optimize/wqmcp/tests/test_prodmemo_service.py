@@ -503,7 +503,9 @@ def test_prod_estimate_is_fitted_per_region_and_says_when_it_cannot_be_trusted()
     calibrated(dao, 'EUR', slope=0.0, base=0.72)                # EUR: prod ~ 0.72 whatever the pool
     usa, eur = estimate(0.5), estimate(0.5, 'EUR')
     assert usa['region'] == 'USA' and abs(usa['value'] - 0.55) < 0.02 and usa['confidence'] == 'normal'
-    assert eur['region'] == 'EUR' and abs(eur['value'] - 0.72) < 0.02
+    # EUR: every alpha would get ~0.72, so no point value, only the range around it
+    assert eur['region'] == 'EUR' and eur['value'] is None and 'slope' in eur['no_point_estimate']
+    assert eur['range'][0] < 0.72 < eur['range'][1]
     assert eur['confidence'] == 'low' and 'barely moves Prod' in eur['note']
     other = estimate(0.5, 'JPN')                                # JPN has no calibration of its own
     assert other['region'] == 'ALL' and 'fitted on all regions' in other['region_fallback']

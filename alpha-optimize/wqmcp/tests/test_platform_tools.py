@@ -907,7 +907,15 @@ async def test_compare_alphas_locally(mcp_session, fake):
         assert out["alphas"][0] == {"id": "A1", "status": "OK", "days": len(days),
                                     "first_day": days[0], "last_day": days[-1]}
         assert "alpha_ids takes 2-10" in (await call(s, "compare_alphas", alpha_ids=["A1", "A1"]))["error"]
+        assert out["pairs"][0]["identical"] is True and "identical" not in out["pairs"][-1]
     assert not fake.state.calls("GET", "/alphas/[^/]+/correlations/.*")     # no correlation request spent
+
+    # the same PnL: once A1's prod is measured, B2 reuses it instead of queueing for BRAIN
+    async with mcp_session() as s:
+        await call(s, "check_alpha", alpha_id="A1", check="prod", wait_seconds=10)
+        twin = await call(s, "check_alpha", alpha_id="B2", check="prod", wait_seconds=10)
+    assert twin["checks"]["production"]["reused_from"] == "A1"
+    assert not fake.state.calls("GET", "/alphas/B2/correlations/prod")
 
 
 def test_brain_markup_is_removed_from_messages():
@@ -985,17 +993,36 @@ async def test_running_time_replaces_progress_and_stuck_runs_are_flagged(mcp_ses
             f'resubmit="{sub["simulation_id"]}"' in stuck["note"]
 
 
-async def test_a_batch_failed_without_reason_is_resubmitted_once(mcp_session, fake):
+async def test_a_batch_failed_without_reason_is_split_into_singles(mcp_session, fake):
     fake.state.child_polls_needed = 1
     fake.state.glitch_batches = 1                 # the next multi fails every child, no message
     async with mcp_session() as s:
         sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"])
         first = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
-        assert first["status"] == "RETRIED" and first["retried_as"] != sub["simulation_id"]
+        assert first["status"] == "RETRIED" and len(first["retried_as"]) == 2
+        assert sub["simulation_id"] not in first["retried_as"]
         again = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
         assert again["status"] == "COMPLETE" and again["retried_as"] == first["retried_as"]
         assert [r["expr"] for r in again["alpha_results"]] == ["rank(a)", "rank(b)"]
-    assert len(posted(fake)) == 2
+    assert len(posted(fake)) == 3                 # the batch, then each item alone
+
+
+async def test_the_item_that_sinks_a_batch_is_found_and_tagged_rows_keep_their_index(mcp_session, fake, tmp_path,
+                                                                                    monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(unserved_field)"], tag="split")
+        first = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        assert first["status"] == "RETRIED"
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+    assert out["status"] == "FINISHED_WITH_ERRORS" and out["failed_children"] == 1
+    good, bad = out["alpha_results"]
+    assert good["status"] == "COMPLETE" and good["expr"] == "rank(a)"
+    assert bad["status"] == "FAIL" and "unserved_field" in bad["diagnosis"] and "get_datafields" in bad["diagnosis"]
+    assert "fail on their own" in out["note"]
+    rows = [json.loads(line) for line in open(tmp_path / "split.jsonl")]
+    assert sorted(r["index"] for r in rows) == [0, 1]
 
 
 async def test_a_simulation_brain_forgot_is_recovered_from_the_alpha_list(mcp_session, fake):
@@ -1264,3 +1291,35 @@ async def test_constant_signal_is_warned_before_sending(mcp_session, fake):
     async with mcp_session() as s:
         out = await call(s, "create_simulation", expressions="rank(equal(snt_pos_mean, 0))")
     assert out["status"] == "SUBMITTED" and any("per-day min / max / mean" in w for w in out["warnings"])
+
+
+async def test_an_untagged_multi_mentions_tag_once_per_session(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        first = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"])
+        out = await call(s, "get_simulation", simulation_ids=first["simulation_id"], wait_seconds=10)
+        assert out["status"] == "COMPLETE" and 'tag="name"' in out["hint"]
+        second = await call(s, "create_simulation", expressions=["rank(c)", "rank(d)"])
+        again = await call(s, "get_simulation", simulation_ids=second["simulation_id"], wait_seconds=10)
+        assert again["status"] == "COMPLETE" and "hint" not in again               # once is enough
+        tagged = await call(s, "create_simulation", expressions=["rank(e)", "rank(f)"], tag="t1")
+        assert "hint" not in await call(s, "get_simulation", simulation_ids=tagged["simulation_id"],
+                                        wait_seconds=10)
+
+
+async def test_the_queue_names_who_asked(mcp_session, fake):
+    gate = pf.brain_client.correlation_gate
+    gate.max_alphas = 1
+    gate.asked("Z9", "prod", client="J")
+    gate.touch("Z9", "prod")
+    async with mcp_session() as s:
+        queue = await call(s, "check_alpha", check="queue")
+    row = next(r for r in queue["computing"] if r["alpha_id"] == "Z9")
+    assert row["client"] == "J" and queue["lanes"]["prod"]["busy"] == 1
+
+
+def test_client_labels_are_short_and_stable(monkeypatch):
+    keys = iter([101, 202, 101])
+    monkeypatch.setattr(pf, "_session_key", lambda: next(keys))
+    monkeypatch.setattr(pf, "_client_names", {})
+    assert [pf._client_label() for _ in range(3)] == ["c1", "c2", "c1"]

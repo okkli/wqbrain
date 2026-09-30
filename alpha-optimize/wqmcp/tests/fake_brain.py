@@ -239,6 +239,8 @@ def _create_sim(fb: FakeBrain, q, body) -> Response:
         glitch = st.glitch_batches > 0
         if glitch:
             st.glitch_batches -= 1
+        # a field BRAIN lists but does not serve fails the whole batch, without a message
+        glitch = glitch or any("unserved_field" in str(it.get("regular")) for it in body)
         children = []
         for i, it in enumerate(body):
             cid = f"{sid}C{i}"
@@ -251,7 +253,8 @@ def _create_sim(fb: FakeBrain, q, body) -> Response:
         st.sims[sid] = {"polls": 0, "raa": True, "alpha": f"RAP{sid}", "type": "REGION_AGNOSTIC"}
     else:
         st.sims[sid] = {"polls": 0, "alpha": f"A-{sid}", "regular": body.get("regular"),
-                        "type": body.get("type"), "settings": body.get("settings") or {}}
+                        "type": body.get("type"), "settings": body.get("settings") or {},
+                        "glitch": "unserved_field" in str(body.get("regular"))}
     return 201, {"Location": f"{fb.url}/simulations/{sid}"}, None
 
 
