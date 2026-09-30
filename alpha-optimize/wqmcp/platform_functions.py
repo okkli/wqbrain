@@ -4942,9 +4942,12 @@ def _background_task(coro) -> "asyncio.Task":
 
 
 def _call_budget(kwargs: Dict[str, Any]) -> float:
-    """How long a read-only call may take: its wait plus room for the answer,
-    never more than TOOL_DEADLINE. A call that waits 40s answers within 60s."""
-    return min(TOOL_DEADLINE, max(30.0, _wait(kwargs.get("wait_seconds", 0)) + 20.0))
+    """How long a read-only call may take. A caller that says how long to wait
+    gets that plus room for the answer (wait_seconds=40 answers within 60s);
+    other calls (paged reads such as diversity-score) keep TOOL_DEADLINE."""
+    if kwargs.get("wait_seconds") is None:
+        return TOOL_DEADLINE
+    return min(TOOL_DEADLINE, max(30.0, _wait(kwargs["wait_seconds"]) + 20.0))
 
 
 # While a call runs, a progress notification goes out this often: a client that
