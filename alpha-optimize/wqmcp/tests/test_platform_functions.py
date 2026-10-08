@@ -1079,3 +1079,39 @@ def test_duplicates_name_what_differs_and_near_identical_runs_are_flagged():
     assert little["setting"] == "decay" and little["items"] == [0, 1] and "within 2%" in little["note"]
     assert not any(d["kind"] == "no_effect" for d in found)
     assert not pf._nearly_same((1.5, 0.1), (1.2, 0.1))
+
+
+# ------------------------------------------------------------- 2026-10-08 field report
+
+@pytest.mark.parametrize("name, definition, need", [
+    ("group_mean", "group_mean(x, weight, group)", 3),
+    ("ts_decay_linear", "ts_decay_linear(x, d, dense = false)", 2),
+    ("rank", "rank(x)", 1),
+    ("max", "max(x, y, ..)", None),
+    ("bucket", 'bucket(x, range="0, 1, 0.1" or buckets = "2,5,6,7,10")', None),
+    ("ts_rank", "", None),
+])
+def test_required_args_from_brain_definitions(name, definition, need):
+    assert pf._required_args(name, definition) == need
+
+
+def test_too_few_arguments_is_an_issue_more_is_not():
+    arity = {"group_mean": 3, "rank": 1}
+    assert pf._semantic_issues("group_mean(close, industry)", OPS, TYPES, arity)[0].startswith(
+        "group_mean: needs at least 3 arguments, got 2")
+    assert pf._semantic_issues("group_mean(close, volume, industry)", OPS, TYPES, arity) == []
+    assert pf._semantic_issues("rank(close, filter=true)", OPS, TYPES, arity) == []
+
+
+def test_edge_checks_and_warnings_on_the_limit():
+    checks = [{"name": "LOW_SHARPE", "result": "PASS", "value": 1.6, "limit": 1.58},
+              {"name": "IS_LADDER_SHARPE", "result": "WARNING", "value": 1.58, "limit": 1.58},
+              {"name": "CLUSTER_TEST", "result": "WARNING", "value": 1.4, "limit": 1.58},
+              {"name": "LOW_TURNOVER", "result": "PASS", "value": 0.3, "limit": 0.01},
+              {"name": "REGULAR_SUBMISSION", "result": "PASS", "value": 4, "limit": 4}]
+    assert pf._edge_checks(checks) == ["SHARPE 1.6~1.58"]          # the WARNING is in warns
+    assert pf._check_lists(checks)[1] == ["IS_LADDER 1.58=1.58 (edge)", "CLUSTER_TEST 1.4<1.58"]
+    assert pf._quota_full_pending({"is": {"checks": checks + [{"name": "PROD_CORRELATION", "result": "PENDING"}]}}) is False
+    assert pf._quota_full_pending({"is": {"checks": [{"name": "REGULAR_SUBMISSION", "result": "FAIL"},
+                                                    {"name": "SELF_CORRELATION", "result": "PENDING"}]}}) is True
+    assert pf._endpoint_family("https://api.worldquantbrain.com/alphas/X1/check") == "alphas"

@@ -1029,7 +1029,11 @@ async def test_the_item_that_sinks_a_batch_is_found_and_tagged_rows_keep_their_i
     assert bad["status"] == "FAIL" and "unserved_field" in bad["diagnosis"] and "get_datafields" in bad["diagnosis"]
     assert "fail on their own" in out["note"]
     rows = [json.loads(line) for line in open(tmp_path / "split.jsonl")]
-    assert sorted(r["index"] for r in rows) == [0, 1]
+    resent = [r for r in rows if r["status"] == "RESENT"]       # said at once, with what was sent
+    assert sorted(r["index"] for r in resent) == [0, 1] and {r["resent_from"] for r in resent} == {sub["simulation_id"]}
+    assert all("submitted_expr" in r for r in resent)
+    results = [r for r in rows if r["status"] != "RESENT"]
+    assert sorted(r["index"] for r in results) == [0, 1] and {r["resent_from"] for r in results} == {sub["simulation_id"]}
 
 
 async def test_a_simulation_brain_forgot_is_recovered_from_the_alpha_list(mcp_session, fake):
@@ -1387,7 +1391,7 @@ async def test_an_old_alpha_is_flagged_for_singles_and_in_tsv(mcp_session, fake,
         tsv = await call(s, "get_simulation", simulation_ids=multi["simulation_id"], wait_seconds=10, format="tsv")
     lines = [line.split("\t") for line in tsv["tsv"].splitlines()]
     head = lines[0]
-    assert head[14:] == ["reused", "submitted_expr", "cluster_est", "queue_id"]
+    assert head[14:18] == ["reused", "submitted_expr", "cluster_est", "queue_id"]
     assert head[:14] == list(pf._TSV_COLUMNS[:14])       # the old columns keep their places
     cells = {int(x[0]): dict(zip(head, x)) for x in lines[1:]}
     assert cells[1]["reused"] == "old_alpha" and cells[1]["submitted_expr"] == "alias(x)"
@@ -1500,3 +1504,124 @@ async def test_one_label_goes_with_every_per_item_setting(mcp_session, fake):
                          per_alpha_settings=[{"decay": 2}, {"decay": 4}, {"decay": 8}])
     assert out["status"] == "SUBMITTED"
     assert pf.brain_client._tags[out["simulation_id"]]["labels"] == ["probe"] * 3
+
+
+# ------------------------------------------------------------- 2026-10-08 field report (IND Q4)
+
+async def test_quota_full_takes_self_and_prod_from_the_lanes(mcp_session, fake):
+    fake.state.check_quota_full = True
+    async with mcp_session() as s:
+        out = await call(s, "check_alpha", alpha_id="A1", wait_seconds=10)
+    assert out["deferred"] == "quota_full" and out["account_blockers"] == ["REGULAR_SUBMISSION"]
+    assert out["status"] == "DONE" and out["pending"] == []
+    assert out["prod_fallback"]["max_correlation"] == 0.65 and out["self_fallback"]["max_correlation"] == 0.65
+    assert out["all_passed_with_fallback"] is True and out["verdict"] == "pass" and out["submittable_now"] is False
+    assert "quota" in out["pending_note"].lower() and "REGULAR_SUBMISSION" not in out["failed"]
+    assert len(fake.state.calls("GET", "/alphas/A1/check")) <= 3          # not polled for 45 minutes
+
+
+async def test_a_warning_on_the_limit_is_an_edge_and_all_clear_says_so(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    fake.state.alpha_checks = [
+        {"name": "LOW_SHARPE", "result": "PASS", "value": 1.6, "limit": 1.58},
+        {"name": "IS_LADDER_SHARPE", "result": "WARNING", "value": 1.58, "limit": 1.58},
+        {"name": "LOW_2Y_SHARPE", "result": "PENDING"}]
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions="rank(x)")
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        tsv = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], format="tsv")
+        q = await call(s, "create_simulation", expressions="rank(y)", simulation_mode="QUICK")
+        quick = await call(s, "get_simulation", simulation_ids=q["simulation_id"], wait_seconds=10)
+    row = out["alpha"]
+    assert row["warns"] == ["IS_LADDER 1.58=1.58 (edge)"] and row["all_clear"] is False
+    assert row["ladder"] == 1.58 and row["edge"] == ["SHARPE 1.6~1.58"] and "IS_LADDER" in row["y2_note"]
+    head, line = [x.split("\t") for x in tsv["tsv"].splitlines()]
+    assert head[-5:] == ["robust", "ladder", "all_clear", "edge", "maxtrade"]      # appended at the end
+    assert line[head.index("all_clear")] == "false" and line[head.index("ladder")] == "1.58"
+    assert quick["alpha"]["maxtrade_applied"] is False and "maxTrade" in quick["quick_note"]
+
+
+async def test_concurrent_rows_and_cancels_reach_the_tag_log_with_a_status(mcp_session, fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        conc = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"], mode="concurrent", tag="cc")
+        for sid in conc["simulation_ids"]:
+            await call(s, "get_simulation", simulation_ids=sid, wait_seconds=10)
+        fake.state.child_polls_needed = 1000
+        one = await call(s, "create_simulation", expressions="rank(slow)", tag="cc")
+        gone = await call(s, "cancel_simulation", simulation_id=one["simulation_id"])
+        assert gone["cancelled"] is True
+    rows = [json.loads(line) for line in (tmp_path / "cc.jsonl").read_text().splitlines()]
+    assert [r["status"] for r in rows[:2]] == ["COMPLETE", "COMPLETE"] and sorted(r["index"] for r in rows[:2]) == [0, 1]
+    assert rows[2]["status"] == "CANCELLED" and rows[2]["submitted_expr"] == "rank(slow)" \
+        and rows[2]["simulation_id"] == one["simulation_id"] and rows[2]["cancelled_by"] == "cancel_simulation"
+
+
+async def test_a_hanging_operator_is_warned_about(mcp_session, fake):
+    async with mcp_session() as s:
+        out = await call(s, "create_simulation", expressions="ts_theilsen(close, ts_step(1), 20)")
+    assert out["status"] == "SUBMITTED"
+    assert any("ts_theilsen" in w and "hang" in w and "concurrent" in w for w in out["warnings"])
+
+
+def test_a_hanging_expression_does_not_blacklist_its_field(client):
+    client._field_cache["fld"] = (pf.time.monotonic(), {"type": "MATRIX", "combos": []})
+    state = {"status": "FAIL", "message": None}
+    settings = {"region": "IND", "delay": 1}
+    client._learn_silent_field(state, {"items": [{"expr": "ts_theilsen(fld, ts_step(1), 20)", "settings": settings}]})
+    assert client._silent_fields == {} and list(client._silent_exprs["IND/D1"]) == ["ts_theilsen(fld,ts_step(1),20)"]
+    client._learn_silent_field(state, {"items": [{"expr": "ts_mean(ts_rank(fld, 5), 3)", "settings": settings}]})
+    assert client._silent_fields == {"IND/D1": {"fld": pf.time.strftime("%Y-%m-%d", pf.time.gmtime())}}  # twice
+
+
+async def test_the_exact_expression_that_failed_is_held_back(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        one = await call(s, "create_simulation", expressions="ts_mean(ts_rank(unserved_field, 5), 3)")
+        out = await call(s, "get_simulation", simulation_ids=one["simulation_id"], wait_seconds=10)
+        assert out["status"] == "FAIL"
+        again = await call(s, "create_simulation", expressions=["ts_mean(ts_rank(unserved_field, 5), 3)", "rank(close)"])
+        other = await call(s, "create_simulation", expressions="rank(unserved_field)")
+    assert "this exact expression failed" in again["problems"][0]["issues"][0] and again["problems"][0]["index"] == 0
+    assert other["status"] == "SUBMITTED" and pf.brain_client._silent_fields == {}    # the field is not blamed
+
+
+async def test_a_long_429_blocks_the_endpoint_family_and_names_alternatives(mcp_session, fake):
+    fake.state.rate_limit_long_alphas = True
+    async with mcp_session() as s:
+        first = await call(s, "get_alpha", alpha_id="A1")
+        second = await call(s, "get_alpha", alpha_id="A2")
+        status = await call(s, "brain_status")
+        fake.state.rate_limit_long_alphas = False
+        third = await call(s, "get_alpha", alpha_id="A3")
+    assert first["status"] == "RATE_LIMITED" and 2500 < first["retry_after_seconds"] <= 2604
+    assert first["blocked_endpoint"] == "/alphas" and "compare_alphas" in first["alternatives"]
+    assert second["status"] == "RATE_LIMITED" and second["blocked_endpoint"] == "/alphas"
+    assert not fake.state.calls("GET", "/alphas/A2")              # nobody runs into the wall again
+    assert len(fake.state.calls("GET", "/alphas/A1")) == 1       # and a 43-minute Retry-After is not retried
+    assert status["rate_limited"]["alphas"]["retry_after_seconds"] > 2500
+    assert third["status"] == "RATE_LIMITED"                      # still blocked: BRAIN said 2604s
+
+
+async def test_a_read_timeout_while_polling_is_unknown_not_an_error(mcp_session, fake):
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions="rank(a)")
+        pf.brain_client.request_timeout = (2.0, 0.3)
+        fake.state.sim_get_delay = 0.8
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
+    assert out["status"] == "UNKNOWN" and "timed out" in out["transient_error"].lower()
+    assert out["retry_after_seconds"] == 15.0 and out["last_known"] is False
+
+
+async def test_a_missing_recordset_lists_what_exists(mcp_session, fake):
+    async with mcp_session() as s:
+        out = await call(s, "get_alpha_recordset", alpha_id="A1", recordset="missing")
+    assert "error" in out and out["available"] == ["pnl", "yearly-stats"]
+
+
+async def test_too_few_arguments_are_caught_before_sending(mcp_session, fake):
+    async with mcp_session() as s:
+        out = await call(s, "create_simulation", expressions=["group_mean(close, industry)", "rank(close)"])
+    assert out["problems"][0]["index"] == 0 and "group_mean: needs at least 3 arguments, got 2" in out["problems"][0]["issues"][0]
+    assert not [b for b in posted(fake) if isinstance(b, list)]

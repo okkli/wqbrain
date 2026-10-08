@@ -84,6 +84,9 @@ class FakeState:
     listed: Optional[List[Dict[str, Any]]] = None  # what /users/self/alphas lists instead
     ignore_setting: Optional[Tuple[str, Any]] = None  # BRAIN runs every alpha with this setting
     delete_finished_400: bool = False   # DELETE of a finished simulation is refused
+    check_quota_full: bool = False      # /check: REGULAR_SUBMISSION FAIL, SELF / PROD PENDING for ever
+    rate_limit_long_alphas: bool = False   # GET /alphas/<id>: 429 with a 2604s Retry-After
+    sim_get_delay: float = 0.0          # GET /simulations/<id> takes this long (read timeouts)
 
     def tick(self, key: str) -> int:
         with self.lock:
@@ -268,6 +271,8 @@ def _super_sel(fb, q, body) -> Response:
 @route("GET", r"/simulations/([^/]+)")
 def _get_sim(fb: FakeBrain, q, body, sid: str) -> Response:
     st = fb.state
+    if st.sim_get_delay:
+        time.sleep(st.sim_get_delay)
     sim = st.sims.get(sid)
     if sim is None or sid in st.forgotten:
         return 404, {}, {"detail": "Not found."}
@@ -359,6 +364,8 @@ def _list_alphas(fb: FakeBrain, q, body) -> Response:
 
 @route("GET", r"/alphas/([^/]+)")
 def _get_alpha(fb, q, body, aid) -> Response:
+    if fb.state.rate_limit_long_alphas:
+        return 429, {"Retry-After": "2604"}, {"detail": "Request was throttled. Expected available in 2604 seconds."}
     if aid == "MISSING":
         return 404, {}, {"detail": "Not found."}
     child = re.fullmatch(r"RAP.+C(USA|EUR|ASI|GLB)", aid)
@@ -407,6 +414,12 @@ def _check(fb: FakeBrain, q, body, aid) -> Response:
         return 200, {"Retry-After": "0"}, None  # present-but-zero still means "running"
     if n < 2:
         return 200, {"Retry-After": "1"}, None
+    if fb.state.check_quota_full:
+        return 200, {"Retry-After": "1"}, {"is": {"checks": [
+            {"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
+            {"name": "REGULAR_SUBMISSION", "result": "FAIL", "limit": 4, "value": 4},
+            {"name": "SELF_CORRELATION", "result": "PENDING"},
+            {"name": "PROD_CORRELATION", "result": "PENDING"}]}}
     if fb.state.check_prod_error:
         return 200, {}, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.4},
                                            {"name": "SELF_CORRELATION", "result": "PASS", "limit": 0.7, "value": 0.3},
@@ -461,6 +474,8 @@ def _recordsets(fb, q, body, aid) -> Response:
 
 @route("GET", r"/alphas/([^/]+)/recordsets/([^/]+)")
 def _recordset(fb: FakeBrain, q, body, aid, name) -> Response:
+    if name == "missing":
+        return 404, {}, {"detail": "Not found."}
     if name == "pnl" and aid in fb.state.pnl:
         return 200, {}, {"schema": {"name": "pnl", "properties": [{"name": "date"}, {"name": "pnl"}]},
                          "records": fb.state.pnl[aid]}
@@ -526,7 +541,8 @@ def _fields(fb, q, body) -> Response:
 @route("GET", r"/operators")
 def _operators(fb, q, body) -> Response:
     extra = [(n, c) for c, names in {
-        "Time Series": "ts_mean ts_delta ts_backfill ts_zscore ts_sum ts_delay ts_decay_linear ts_std_dev",
+        "Time Series": "ts_mean ts_delta ts_backfill ts_zscore ts_sum ts_delay ts_decay_linear ts_std_dev "
+                       "ts_theilsen ts_step ts_entropy",
         "Arithmetic": "add subtract multiply divide abs densify",
         "Transformational": "bucket hump tail",
         "Cross Sectional": "zscore scale quantile winsorize normalize",
@@ -540,8 +556,14 @@ def _operators(fb, q, body) -> Response:
                       "description": "Rank over time"},
                      {"name": "rank", "category": "Cross Sectional", "scope": ["REGULAR", "COMBO"],
                       "definition": "rank(x)", "description": "Cross-sectional rank"}] + [
-        {"name": n, "category": c, "scope": ["REGULAR"], "definition": f"{n}(x)", "description": n}
+        {"name": n, "category": c, "scope": ["REGULAR"],
+         # the special names take any number of arguments (fail(), dup(), bad(...)
+         "definition": f"{n}(x, ..)" if c == "Special" else _DEFINITIONS.get(n, f"{n}(x)"), "description": n}
         for n, c in extra]
+
+
+_DEFINITIONS = {"group_mean": "group_mean(x, weight, group)", "ts_mean": "ts_mean(x, d)",
+                "ts_decay_linear": "ts_decay_linear(x, d, dense = false)", "add": "add(x, y, filter = false)"}
 
 
 @route("GET", r"/users/self/activities")
