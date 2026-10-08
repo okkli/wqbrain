@@ -45,6 +45,7 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_SLOW_CALL_SECONDS` | `50` | 超过这个时长的调用在日志里记为 WARNING |
 | `WQMCP_LOOP_STALL_SECONDS` | `2` | 事件循环卡住超过这个时长，就把卡住的位置和正在等待的调用写进日志 |
 | `WQMCP_AUTO_RETRY_GLITCH` | `1` | multi 的子项全部失败且没有任何原因时，把每一项单独重发一次（找出坏的那项）。设为 `0` 关闭 |
+| `WQMCP_SLOW_OPERATORS` | `ts_theilsen,ts_entropy` | 预检对含这些算子的项给出“曾让模拟卡死”的提示（只提示，不拦） |
 | `WQMCP_CORR_STALL_SECONDS` | `300` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
 | `WQMCP_CORR_THROTTLED_INTERVAL` | `60` | 被限流期间每个查询的轮询间隔（秒） |
 | `WQMCP_CORR_HOLD_SECONDS` | `90` | 只在关闭后台模式时有用：返回 PENDING 之后名额为这个 alpha 保留多久 |
@@ -378,6 +379,18 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - **队列**：还在等 BRAIN 的提交检查不占通道，以前在队列里看不到。现在队列快照的 `submission_checks_open` 列出它们（alpha、未完成的检查、已等多久、client）。
 - **IS_LADDER 与 2Y**：在 1100 条真实 alpha 上，每条只会有 LOW_2Y_SHARPE 或 IS_LADDER_SHARPE 中的一个，与 region、QUICK/FULL、时间都无关（两种在同一分钟里交替出现），BRAIN 按什么选哪一个看不出来。门槛也是 BRAIN 给的：QUICK 行常见 1.58，FULL 提交检查见过 2.02，以 FULL 的提交检查为准。
 - 报告里另外几项在部署前的版本上出现、当前版本已经修好：labels 广播、`compare_alphas(anchors=...)`、FULL 行 IS_LADDER 不带数值（06:03Z 之后的 54 条 FULL、311 条 QUICK 全都带数值）。
+
+## 2026-10-08 实战问题的修复
+
+- **当日额度满时的提交检查**：`REGULAR_SUBMISSION` 已 FAIL 而 SELF / PROD 还是 PENDING 时，BRAIN 当天不会再算完它们。现在检查立刻返回 `deferred: quota_full`，不再轮询占着通道；SELF / PROD 改从相关性通道取（`prod_fallback` / `self_fallback`，计入 `all_passed_with_fallback` 和 `verdict`），账户限制单独放在 `account_blockers`。
+- **结果行**：新增 `all_clear`（没有 FAIL 也没有 WARNING 才为 true）、`edge`（通过但离门槛不到 3% 的项）、`ladder`（IS_LADDER 值）；WARNING 正好等于门槛写成 `1.58=1.58 (edge)`，不再像通过。2Y 没有值而 IS_LADDER 有值时带 `y2_note`。TSV 末尾新增 `robust`、`ladder`、`all_clear`、`edge`、`maxtrade` 五列，原有列位置不变。
+- **QUICK 与 maxTrade**：QUICK 行带 `maxtrade_applied: false`，批次带 `quick_note`（FULL + maxTrade=ON 的 Sharpe 可能低 15~35%）；同一表达式先 QUICK 后 FULL 时，FULL 行给出 `vs_quick`（Sharpe 差值）。
+- **tag 日志**：single / concurrent 的行也带 `status`；`cancel_simulation`（含排队中的）给每一项写 `CANCELLED` 行，带表达式；整批无原因失败后逐条重发时立刻写 `RESENT` 行，结果行带 `resent_from`。
+- **预检**：无原因失败按整条表达式记（下次同一表达式拦下），只有表达式接近裸字段、或同一字段第二次拖垮表达式时才拉黑字段，算子卡死不再株连同批字段；含 `ts_theilsen` / `ts_entropy`（`WQMCP_SLOW_OPERATORS`）的项给出卡死提示；按 BRAIN 的算子定义校验参数个数（少传即拦）；多批次里 IND 设 `maxPosition=ON` 时提示。
+- **429**：Retry-After 超过 60 秒的 429 不再重试，并把该端点族（如 `/alphas`）按 BRAIN 给的时长整体挂起：后续调用直接返回 `RATE_LIMITED`、剩余秒数、`blocked_endpoint` 和可用的替代工具；`brain_status` 的 `rate_limited` 列出挂起中的端点。
+- **轮询超时**：`get_simulation` 遇到读超时 / 连接断开返回 `UNKNOWN` 和最近一次看到的状态，不再报错中断脚本。`get_alpha_recordset` 取不到某个记录集时列出该 alpha 实际有的记录集（PYTHON alpha 没有 `pnl`）。
+- **ProdMemo**：`local_estimate` 带 `typical_error`（该区域拟合的残差标准差）；`prod_lower_bound` 带置信度和说明（它是同口径假设下的下限，不说明变体之间 Prod 的方向）。
+- 备查：算子计数里一元负号和 `ts_backfill` 都算 1 个；本账号没有 `ts_max` / `ts_min`（预检会建议 `ts_max_diff` / `ts_min_diff`）；`vec_median`、`regression_neut` 不存在；`ts_count_nans` 吃 VECTOR 字段要先套 `vec_*`。
 
 ## 测试
 
