@@ -1439,6 +1439,8 @@ class BrainApiClient:
         # an unsubmitted alpha with a submitted twin fails SELF against it
         self._alpha_index: "collections.OrderedDict[str, List[str]]" = collections.OrderedDict()
         self._submitted_alphas: Dict[str, str] = {}
+        self._state_lock = threading.Lock()    # one state file write at a time, newest snapshot last
+        self._state_seq = self._state_written = 0
     
     def log(self, message: str, level: str = "INFO"):
         """Log messages to stderr to avoid MCP protocol interference."""
@@ -1915,12 +1917,22 @@ class BrainApiClient:
                        for k, v in list(self._field_cache.items())[-3000:]},
         }
 
+        self._state_seq += 1
+        seq = self._state_seq
+
         def write() -> None:
+            # Saves come from several places at once and run in threads: each writes its
+            # own temporary file, under a lock, and an older snapshot never replaces a
+            # newer one (a shared .tmp used to be truncated mid-write by the next save).
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-            tmp = STATE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(state, fh, ensure_ascii=False)
-            os.replace(tmp, STATE_FILE)
+            with self._state_lock:
+                if seq < self._state_written:
+                    return
+                tmp = f"{STATE_FILE}.{os.getpid()}.{seq}.tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(state, fh, ensure_ascii=False)
+                os.replace(tmp, STATE_FILE)
+                self._state_written = seq
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
