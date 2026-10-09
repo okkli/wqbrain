@@ -212,7 +212,7 @@ async def test_gate_frees_a_slot_nobody_polls_anymore(client):
 @pytest.mark.asyncio
 async def test_gate_gives_up_a_slot_brain_never_finishes(client, monkeypatch):
     gate = client.correlation_gate
-    gate.max_alphas, gate.max_slot_seconds, gate.rotate = 1, 600.0, True
+    gate.max_alphas, gate.max_slot_seconds, gate.rotate, gate.prod_slot_seconds = 1, 600.0, True, 0
     install(client, {"/correlations/prod": [COMPUTING()]})
     clock = [1000.0]
     monkeypatch.setattr(pf.time, "monotonic", lambda: clock[0])
@@ -377,6 +377,7 @@ async def test_queue_is_visible_and_worked_through_in_order(bg_client):
 async def test_used_up_slot_goes_to_the_back_of_the_queue(bg_client):
     client, gate = bg_client, bg_client.correlation_gate
     gate.max_alphas, gate.max_slot_seconds, gate.queue_seconds, gate.rotate = 1, 0.05, 0.6, True
+    gate.prod_slot_seconds = 0
     s = install(client, {"/correlations/prod": [COMPUTING()]})   # BRAIN never answers
     await client.check_correlation("A1", "prod", max_wait=0)
     await client.check_correlation("B2", "prod", max_wait=0)
@@ -639,7 +640,7 @@ def test_a_request_keeps_its_slot_and_waiting_ones_get_an_estimate(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(pf.time, "monotonic", lambda: clock[0])
     gate = pf.CorrelationGate()
-    gate.max_alphas, gate.max_slot_seconds, gate.hold_seconds = 1, 600.0, 1e9
+    gate.max_alphas, gate.max_slot_seconds, gate.hold_seconds, gate.prod_slot_seconds = 1, 600.0, 1e9, 0
     assert gate.rotate is False and gate.typical_seconds() is None
     gate.touch("OLD", "prod")
     clock[0] += 60
@@ -657,6 +658,33 @@ def test_a_request_keeps_its_slot_and_waiting_ones_get_an_estimate(monkeypatch):
     assert gate.computing() == {"A1"} and not gate.admit(b, "prod")   # A1 did not lose its slot
     gate.rotate = True
     assert gate.computing() == set() and gate.admit(b, "prod") and c in gate._waiting
+
+
+def test_a_stalled_prod_shows_in_endpoint_health_and_yields_its_slot(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(pf.time, "monotonic", lambda: clock[0])
+    gate = pf.CorrelationGate()
+    gate.max_alphas, gate.hold_seconds = 1, 1e9
+    assert gate.slot_limit("prod") == 300 and gate.slot_limit("self") == 600   # the defaults
+    gate.touch("A1", "prod")
+    b = gate.enqueue("B2", "prod")
+    clock[0] += 290
+    assert gate.health()["state"] == "ok" and not gate.admit(b, "prod")       # A1 still holds the lane
+    gate.answered()                        # another job came back: BRAIN answers, only A1 is silent
+    clock[0] += 20                                                           # 310s without an answer
+    health = gate.health()
+    assert health["state"] == "slow" and "stalled" in health["advice"]
+    assert health["stalled"] == [{"alpha_id": "A1", "lane": "prod", "for_seconds": 310, "holds_slot": False}]
+    assert gate.admit(b, "prod")                                             # B2 gets the slot
+    # A1 comes back as a yielded job: behind everybody waiting, however long it was first asked
+    c = gate.enqueue("C3", "prod")
+    a = gate.enqueue("A1", "prod", yielded=True)
+    assert [t[1] for t in gate._order("prod")] == ["C3", "A1"] and gate.rank_reason("A1", "prod") == "yielded"
+    gate.leave(a)
+    assert gate.rank_reason("A1", "prod") is None and gate._yielded == set()
+    monkeypatch.setenv("WQMCP_CORR_PROD_SLOT_SECONDS", "0")
+    gate.reset()
+    assert gate.slot_limit("prod") is None                                   # 0 = keep it until done
 
 
 @pytest.mark.asyncio

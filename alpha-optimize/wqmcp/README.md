@@ -21,7 +21,7 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_ACCEPT_VERSIONS` | `0` | 设为 `1` 时按目录发送带版本号的 Accept 头。默认关闭，因为线上验证过的是不带版本号的请求；先用 `scripts/live_regression.py --accept-versions` 实测，再决定是否打开 |
 | `WQMCP_CORR_MAX_ALPHAS` | `2` | prod 通道同一时刻最多算几个 alpha，其余排队（`WQMCP_CORR_PROD_MAX` 可单独覆盖） |
 | `WQMCP_CORR_SELF_MAX` | `1` | self（含 power-pool）通道同一时刻最多算几个。prod 和 self 各走各的通道，慢的 self 不占 prod 的名额 |
-| `WQMCP_CORR_SELF_SLOT_SECONDS` | `600` | 一个 self 占通道这么久还没结果，就让出名额、回队列（保留原来的排队时间）；prod 一直占到出结果 |
+| `WQMCP_CORR_SELF_SLOT_SECONDS` / `WQMCP_CORR_PROD_SLOT_SECONDS` | `600` / `300` | 一个 self / prod 占通道这么久还没结果，就让出名额、排到当前等待者之后（`rank_reason: yielded`），轮到时继续取结果；prod 设为 `0` 则一直占到出结果 |
 | `WQMCP_CORR_MIN_INTERVAL` | `0.5` | 相关性和提交检查接口的请求之间至少间隔几秒 |
 | `WQMCP_CORR_BACKGROUND` | `1` | 查询在后台继续排队和轮询，不随那次工具调用结束。设为 `0` 时查询随调用结束 |
 | `WQMCP_CORR_QUEUE_SECONDS` | `3600` | 一个查询在后台最多存活多久，超时仍无结果就放弃 |
@@ -337,7 +337,7 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - **prod / self 分通道**：见上面的环境变量。`check_alpha(check="correlation")` 先把 self 放进队列，然后等 prod：prod 一出就返回，self 在后台继续。
 - **队列顺序**：`priority="high"` → 冷却后回来试探的那一个 → 排队超过 5 分钟的（从第一次提出算，回队列不重新计时）→ 先来先到。队列里每行带 `rank_reason`、`lane`、`client`、`estimated_wait_seconds`；`lanes` 给各通道的上限和占用。
 - **谁在占槽**：每个 MCP 会话自动得到 `c1`、`c2`… 的名字，也可以 `check_alpha(client="J")` 自己起名，队列里显示出来。
-- **端点健康度**：队列快照里的 `endpoint_health`：`ok` / `slow` / `down`，最近几次 prod 的耗时、距上次出结果多久、按 QUICK / FULL 分开的耗时中位数。`down` 时建议先用 `compare_alphas` 在本地排除同轴。
+- **端点健康度**：队列快照里的 `endpoint_health`：`ok` / `slow` / `down`，最近几次 prod 的耗时、距上次出结果多久、按 QUICK / FULL 分开的耗时中位数；某个任务超过 `WQMCP_CORR_STALL_SECONDS` 没结果时降为 `slow`，`stalled` 列出该 alpha、通道、已等秒数和是否还占着名额。`down` 时建议先用 `compare_alphas` 在本地排除同轴。
 - **提交检查**：PROD 是 ERROR 时，时间够就隔 3 秒再查一次 `/check`。prod 已在后台队列里时也取它的结果作 `prod_fallback`。回答里有单一结论 `verdict`（pass / fail / unknown）和 `verdict_basis`；有账户限制时加 `submittable_now: false`。POWER_POOL_* 检查放进 `power_pool_checks`，不影响常规 alpha 的结论。
 - **整批无原因失败**：改为逐项单独重发（见“模拟状态”）。
 - **说明截断**：客户端会截断过长的工具说明，`tag` 等参数原本在 4000 字之后。`create_simulation`、`check_alpha`、`get_simulation` 的说明压缩到约 2000 字，关键参数放在最前。没带 tag 的 multi 完成时，每个会话提示一次 `tag` 的用法。
@@ -391,6 +391,14 @@ ProdMemo 仍然直接使用客户端方法（`get_user_alphas`、`get_alpha_pnl`
 - **轮询超时**：`get_simulation` 遇到读超时 / 连接断开返回 `UNKNOWN` 和最近一次看到的状态，不再报错中断脚本。`get_alpha_recordset` 取不到某个记录集时列出该 alpha 实际有的记录集（PYTHON alpha 没有 `pnl`）。
 - **ProdMemo**：`local_estimate` 带 `typical_error`（该区域拟合的残差标准差）；`prod_lower_bound` 带置信度和说明（它是同口径假设下的下限，不说明变体之间 Prod 的方向）。
 - 备查：算子计数里一元负号和 `ts_backfill` 都算 1 个；本账号没有 `ts_max` / `ts_min`（预检会建议 `ts_max_diff` / `ts_min_diff`）；`vec_median`、`regression_neut` 不存在；`ts_count_nans` 吃 VECTOR 字段要先套 `vec_*`。
+
+## 2026-10-09 余项的修复
+
+- **通道占槽**：prod 占通道 `WQMCP_CORR_PROD_SLOT_SECONDS`（默认 300 秒）没结果就让出名额，排到当前等待者之后（之前 self 让出后因"排队已久"又排回最前，等于没让）；任务超过 `stall_seconds` 没结果时 `endpoint_health` 降为 `slow` 并在 `stalled` 里列出。
+- **SELF 失败说明对手**：提交检查 SELF_CORRELATION FAIL 时带 `self_against`（相关性达到门槛的自家 alpha，含 id 和相关值，取 BRAIN 的 self 相关性结果）；`check_alpha(check="self")` 不通过时带 `against`。
+- **同代码已提交**：`get_alpha` 对未提交的 alpha，若本服务见过同代码同设置且已提交的另一个 id，给出 `submitted_twin` 和说明（提交记录和 BRAIN 返回的 `dateSubmitted` 都算，重启后保留）。
+- **取消撞上完成**：`cancel_simulation` 先看一眼状态，已结束就保留结果（写入缓存和 tag 日志）不再 DELETE；DELETE 之后再看一眼，恰好在这一瞬完成的也保留结果，返回 `already_complete` 而不是 `cancelled`。
+- **预检**：`vector_proj(1, y)` / `vector_proj(-1, y)` 这类只包一层、不改变子表达式的写法给出提示（不拦）。
 
 ## 测试
 

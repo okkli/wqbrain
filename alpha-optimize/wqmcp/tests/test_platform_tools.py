@@ -331,8 +331,24 @@ async def test_get_simulation_many_and_cancel(mcp_session, fake):
         assert states[a["simulation_id"]]["status"] == "COMPLETE"
         assert states[a["simulation_id"]]["alpha"]["id"].startswith("A-")
         cancelled = await call(s, "cancel_simulation", simulation_id=a["progress_url"])
-        assert cancelled == {"simulation_id": a["simulation_id"], "cancelled": True, "http_status": 200}
-    assert fake.state.calls("DELETE", f"/simulations/{a['simulation_id']}")
+        # it had finished: the result stays, nothing is sent to BRAIN
+        assert cancelled["cancelled"] is False and cancelled["already_complete"] is True
+        assert cancelled["result"]["status"] == "COMPLETE" and cancelled["result"]["alpha"]["id"].startswith("A-")
+    assert not fake.state.calls("DELETE", f"/simulations/{a['simulation_id']}")
+
+
+async def test_a_cancel_that_meets_the_finish_keeps_the_result(mcp_session, fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 2      # the look before the DELETE sees RUNNING, the one after COMPLETE
+    async with mcp_session() as s:
+        one = await call(s, "create_simulation", expressions="rank(a)", tag="race")
+        out = await call(s, "cancel_simulation", simulation_id=one["simulation_id"])
+        again = await call(s, "get_simulation", simulation_ids=one["simulation_id"])
+    assert out["cancelled"] is False and out["already_complete"] is True and "kept" in out["note"]
+    assert out["result"]["alpha"]["id"].startswith("A-") and again["status"] == "COMPLETE"
+    assert len(fake.state.calls("DELETE", f"/simulations/{one['simulation_id']}")) == 1
+    rows = [json.loads(line) for line in (tmp_path / "race.jsonl").read_text().splitlines()]
+    assert [r["status"] for r in rows] == ["COMPLETE"]      # no CANCELLED line: the result was not lost
 
 
 async def test_preview_super_selection(mcp_session, fake):
@@ -1556,6 +1572,49 @@ async def test_concurrent_rows_and_cancels_reach_the_tag_log_with_a_status(mcp_s
     assert [r["status"] for r in rows[:2]] == ["COMPLETE", "COMPLETE"] and sorted(r["index"] for r in rows[:2]) == [0, 1]
     assert rows[2]["status"] == "CANCELLED" and rows[2]["submitted_expr"] == "rank(slow)" \
         and rows[2]["simulation_id"] == one["simulation_id"] and rows[2]["cancelled_by"] == "cancel_simulation"
+
+
+async def test_a_self_fail_names_the_alphas_it_is_against(mcp_session, fake):
+    fake.state.alpha_checks = [{"name": "LOW_SHARPE", "result": "PASS", "value": 2.0, "limit": 1.25},
+                               {"name": "SELF_CORRELATION", "result": "FAIL", "value": 0.798, "limit": 0.7},
+                               {"name": "PROD_CORRELATION", "result": "PASS", "value": 0.5, "limit": 0.7}]
+    fake.state.corr_records = [["X2", 0.65], ["TWIN", 0.798], ["X1", 0.2], ["OLD", 0.71]]
+    async with mcp_session() as s:
+        out = await call(s, "check_alpha", alpha_id="A1", wait_seconds=10)
+        lane = await call(s, "check_alpha", alpha_id="A1", check="self", wait_seconds=10)
+    assert out["failed"] == ["SELF_CORRELATION"] and out["verdict"] == "fail"
+    assert out["self_against"] == [{"id": "TWIN", "correlation": 0.798}, {"id": "OLD", "correlation": 0.71}]
+    assert "submitted_twin" in out["self_note"]
+    assert lane["checks"]["self"]["passes_check"] is False and lane["checks"]["self"]["against"] == out["self_against"]
+
+
+async def test_get_alpha_names_a_submitted_twin_of_the_same_code(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        first = await call(s, "create_simulation", expressions="rank(a)")
+        second = await call(s, "create_simulation", expressions="rank(a)")
+        other = await call(s, "create_simulation", expressions="rank(b)")
+        ids = {}
+        for sub in (first, second, other):
+            done = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+            ids[sub["simulation_id"]] = done["alpha"]["id"]
+        a1, a2, b = ids[first["simulation_id"]], ids[second["simulation_id"]], ids[other["simulation_id"]]
+        before = await call(s, "get_alpha", alpha_id=a2)
+        sent = await call(s, "submit_alpha", alpha_id=a1, confirm=True, wait_seconds=10)
+        after = await call(s, "get_alpha", alpha_id=a2)
+        unrelated = await call(s, "get_alpha", alpha_id=b)
+    assert sent["success"] is True and "submitted_twin" not in before
+    assert after["submitted_twin"] == a1 and "SELF_CORRELATION" in after["submitted_twin_note"]
+    assert "submitted_twin" not in unrelated
+
+
+async def test_a_constant_vector_proj_is_only_a_wrapper(mcp_session, fake):
+    async with mcp_session() as s:
+        out = await call(s, "create_simulation", expressions=["vector_proj(-1, rank(close))", "vector_proj(x, y)"])
+    assert out["status"] == "SUBMITTED"
+    assert [w for w in out["warnings"] if "vector_proj" in w] == [
+        "item 0: vector_proj(-1, y) is -y itself (the projection onto a constant): the operator only wraps the "
+        "sub-expression ('rank(close)') and adds nothing to it"]
 
 
 async def test_a_hanging_operator_is_warned_about(mcp_session, fake):

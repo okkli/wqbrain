@@ -84,6 +84,7 @@ class FakeState:
     listed: Optional[List[Dict[str, Any]]] = None  # what /users/self/alphas lists instead
     ignore_setting: Optional[Tuple[str, Any]] = None  # BRAIN runs every alpha with this setting
     delete_finished_400: bool = False   # DELETE of a finished simulation is refused
+    corr_records: Optional[List[Any]] = None   # /correlations/*: [id, correlation] rows instead of the default
     check_quota_full: bool = False      # /check: REGULAR_SUBMISSION FAIL, SELF / PROD PENDING for ever
     rate_limit_long_alphas: bool = False   # GET /alphas/<id>: 429 with a 2604s Retry-After
     sim_get_delay: float = 0.0          # GET /simulations/<id> takes this long (read timeouts)
@@ -463,8 +464,10 @@ def _corr(fb: FakeBrain, q, body, aid, kind) -> Response:
         return 412, {}, {"detail": "Power pool correlation is not available for this alpha."}
     if fb.state.tick(f"corr:{aid}:{kind}") < 2:
         return 200, {"Retry-After": "1"}, None
+    records = fb.state.corr_records or [["X1", 0.2], ["X2", 0.65], ["X3", None], ["X4", 0.4]]
+    values = [r[1] for r in records if r[1] is not None]
     return 200, {}, {"schema": {"name": "correlation", "properties": [{"name": "id"}, {"name": "correlation"}]},
-                     "records": [["X1", 0.2], ["X2", 0.65], ["X3", None], ["X4", 0.4]], "min": 0.2, "max": 0.65}
+                     "records": records, "min": min(values), "max": max(values)}
 
 
 @route("GET", r"/alphas/([^/]+)/recordsets")
@@ -547,7 +550,7 @@ def _operators(fb, q, body) -> Response:
         "Transformational": "bucket hump tail",
         "Cross Sectional": "zscore scale quantile winsorize normalize",
         "Group": "group_neutralize group_rank group_mean",
-        "Vector": "vec_avg vec_sum",
+        "Vector": "vec_avg vec_sum vector_proj",
         "Logical": "if_else equal",
         # expressions the fake platform itself answers in special ways
         "Special": "fail alias dup bad f g h ex x_op",
