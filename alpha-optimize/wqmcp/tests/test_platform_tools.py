@@ -1269,6 +1269,25 @@ async def test_state_survives_a_restart(mcp_session, fake, tmp_path, monkeypatch
     fresh._executor.shutdown(wait=False)
 
 
+def test_concurrent_state_saves_leave_one_valid_file_with_the_newest_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "STATE_FILE", str(tmp_path / "state.json"))
+    client = pf.BrainApiClient()
+    try:
+        for i in range(40):                  # 40 saves fired without a running loop: all written in threads
+            client._queue_numbers = i
+            client.save_state()
+        client._executor.shutdown(wait=True)
+        import concurrent.futures
+        client._queue_numbers = 79
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:    # and 40 more at the same moment
+            for _ in range(40):
+                pool.submit(client.save_state)
+    finally:
+        client._executor.shutdown(wait=False)
+    saved = json.loads((tmp_path / "state.json").read_text())        # never a half-written file
+    assert saved["queue_numbers"] == 79 and list(tmp_path.iterdir()) == [tmp_path / "state.json"]
+
+
 async def test_brain_status_names_the_release(mcp_session, fake):
     async with mcp_session() as s:
         out = await call(s, "brain_status")
