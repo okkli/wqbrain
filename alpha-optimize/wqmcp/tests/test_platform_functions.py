@@ -967,7 +967,7 @@ def test_constant_signal_warning():
 
 
 def test_stale_limits_depend_on_the_mode():
-    assert pf._stale_limit(True, True) == 480 and pf._stale_limit(False, True) == 300
+    assert pf._stale_limit(True, True) == 900 and pf._stale_limit(False, True) == 300
     assert pf._stale_limit(True, False) == 1200 and pf._stale_limit(False, False) == 600
 
 
@@ -1143,3 +1143,26 @@ def test_edge_checks_and_warnings_on_the_limit():
     assert pf._quota_full_pending({"is": {"checks": [{"name": "REGULAR_SUBMISSION", "result": "FAIL"},
                                                     {"name": "SELF_CORRELATION", "result": "PENDING"}]}}) is True
     assert pf._endpoint_family("https://api.worldquantbrain.com/alphas/X1/check") == "alphas"
+
+
+# --- field report 2026-11-19 --------------------------------------------------------
+
+def test_slow_operators_are_graded_by_window_and_ts_entropy_is_not_slow():
+    assert pf._slow_operator_warnings("ts_entropy(x, 20)") == []
+    assert pf._slow_operator_warnings("poly_regression(y, x, 250)") == []
+    assert pf._slow_operator_warnings("poly_regression(y, x, 500)")[0].startswith("likely_hang")
+    assert pf._slow_operator_warnings("ts_kurtosis(x, d=180)")[0].startswith("likely_hang")
+    assert pf._slow_operator_warnings("ts_mean(x, 1000)")[0].startswith("slow")
+
+
+def test_retry_after_is_the_time_a_run_still_needs():
+    assert pf._suggested_wait(("multi", "FULL"), 60, None) == 300
+    assert pf._suggested_wait(("multi", "QUICK"), 60, 400.0) == 300
+    assert pf._suggested_wait(("single", "QUICK"), 50, None) == 30
+    assert pf._suggested_wait(("multi", "QUICK"), 1000, 600.0) == 150
+
+
+def test_eastern_day_resets_at_new_york_midnight():
+    day, start, reset = pf._eastern_day(1792400000)      # 2026-10-19 ~ 05:33 UTC = 01:33 EDT
+    assert day == "2026-10-19" and start.startswith("2026-10-19T00:00:00-04:00")
+    assert reset.startswith("2026-10-20T00:00:00-04:00")

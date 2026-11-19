@@ -865,6 +865,13 @@ class ProdMemoService:
                                         f'{PROD_EST_MIN_SLOPE} -> above {PROD_EST_RESUME_SLOPE}): the local '
                                         'pool does not tell this alpha apart, only the usual range there')
         if reasons:
+            # A low-confidence point value (.70 for every new axis, 2026-10/11) was read as
+            # "on the line": give no point value, only the band, and say so.
+            if out['value'] is not None:
+                out['line_value'] = out['value']
+                out['value'] = None
+                out.setdefault('no_point_estimate', 'low confidence: no discriminating power for this '
+                                                    'alpha, only the usual range; measure it on BRAIN')
             out['over_threshold'] = None if out['range'][0] <= PROD_THRESHOLD < out['range'][1] \
                 else out['over_threshold']
             out['note'] = ('Low confidence: ' + '; '.join(reasons) + '. Prod can be well outside this '

@@ -39,13 +39,16 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_RESULTS_DIR` | `<wqmcp>/results` | 带 `tag` 的模拟结果写到这里的 `<tag>.jsonl` |
 | `WQMCP_WATCH_SECONDS` / `WQMCP_WATCH_INTERVAL` | `10800` / `30` | 带 `tag` 的模拟在后台最多跟踪多久、每隔几秒查一次 |
 | `WQMCP_STALE_MULTI_SECONDS` / `WQMCP_STALE_SINGLE_SECONDS` | `1200` / `600` | FULL 模拟的进度这么久没动，就标为 `stale` |
-| `WQMCP_STALE_QUICK_MULTI_SECONDS` / `WQMCP_STALE_QUICK_SINGLE_SECONDS` | `480` / `300` | QUICK 模拟的同一阈值 |
+| `WQMCP_STALE_QUICK_MULTI_SECONDS` / `WQMCP_STALE_QUICK_SINGLE_SECONDS` | `900` / `300` | QUICK 模拟的同一阈值。实际阈值还会放宽到同类批次中位耗时的 1.5 倍，批内有慢算子时再翻倍；stale 只提示「慢」，不再建议 cancel |
+| `WQMCP_DAILY_ALPHA_LIMIT` / `WQMCP_DAILY_ALPHA_MARGIN` | `5000` / `100` | BRAIN 每个美东自然日的 alpha 上限。模拟 429 时若当日剩余 ≤ margin，报 `DAILY_QUOTA_EXHAUSTED`（不进队列），而不是「并发满」。当日数量见 `brain_status().daily_alphas` |
+| `WQMCP_DAILY_SOFT_STOP` | `4700` | 当日数量加本批会超过它时，`create_simulation` 拒发（`REFUSED` / `DAILY_SOFT_STOP`），`force=True` 可越过；`0` 关闭 |
 | `WQMCP_STATE_FILE` | `<wqmcp>/state/server_state.json` | 重启后要保留的状态：每个模拟提交了什么、tag、已写入的结果、发枪队列。设为空则只放内存 |
 | `WQMCP_PROGRESS_SECONDS` | `10` | 调用进行中每隔几秒向客户端发一次进度通知 |
 | `WQMCP_SLOW_CALL_SECONDS` | `50` | 超过这个时长的调用在日志里记为 WARNING |
 | `WQMCP_LOOP_STALL_SECONDS` | `2` | 事件循环卡住超过这个时长，就把卡住的位置和正在等待的调用写进日志 |
 | `WQMCP_AUTO_RETRY_GLITCH` | `1` | multi 的子项全部失败且没有任何原因时，把每一项单独重发一次（找出坏的那项）。设为 `0` 关闭 |
-| `WQMCP_SLOW_OPERATORS` | `ts_theilsen,ts_entropy` | 预检对含这些算子的项给出“曾让模拟卡死”的提示（只提示，不拦） |
+| `WQMCP_SLOW_OPERATORS` | `ts_theilsen:0,poly_regression:500,ts_quantile:2500,ts_skewness:180,ts_kurtosis:180,ts_ir:1000` | `算子:窗口`，窗口达到这个值时预检给 `likely_hang` 提示（只提示，不拦；0 = 任何窗口）。`ts_entropy` 已移除（24 批全部正常） |
+| `WQMCP_LONG_WINDOW` | `750` | 任何 `ts_*` 窗口达到这个值时给 `slow` 提示（一批 30~45 分钟属正常） |
 | `WQMCP_CORR_STALL_SECONDS` | `300` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
 | `WQMCP_CORR_THROTTLED_INTERVAL` | `60` | 被限流期间每个查询的轮询间隔（秒） |
 | `WQMCP_CORR_HOLD_SECONDS` | `90` | 只在关闭后台模式时有用：返回 PENDING 之后名额为这个 alpha 保留多久 |
@@ -110,6 +113,14 @@ create_simulation(type="SA", combo="combo_expr", selection=["sel_a", "sel_b"])  
 - RAA 完成后返回父 id，以及每个区域子 alpha 的一行指标。
 
 `cancel_simulation` 可以取消排队中或运行中的模拟，释放名额。
+
+## 等结果：不要循环调用 `get_simulation`
+
+一批 multi 要 5~20 分钟，而一次调用最多等 40 秒。循环调用时每一轮都要重读整个上下文，大部分调用只拿到 RUNNING。推荐的等法：
+
+- 发枪时带 `tag`，回包里的 `wait` 给出后台命令，例如 `python3 scripts/wqwait.py <tag> <N> --sim <id>`。它轮询 `GET /results/<tag>.jsonl`，只数真正的结果行（有 id，或有最终状态），齐了以后打印精简表。服务地址取 `$WQMCP_RESULTS_URL`，默认 `http://127.0.0.1:8761`。
+- 或者等过 RUNNING 回包里的 `retry_after_seconds` 再问。这个值现在是这类批次预计还要多久（30~300 秒），不再是 BRAIN 的 5 秒。
+- 取结果用 `get_simulation(format="brief")`：批头 `base_set` 只写一次，每行只写与它不同的设置，用 label 代替表达式，全空列不输出；`last=N` 只回最后 N 行。
 
 ## 工具一览（31 个）
 

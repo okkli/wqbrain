@@ -300,10 +300,13 @@ def _get_sim(fb: FakeBrain, q, body, sid: str) -> Response:
     if sim.get("glitch"):
         return 200, {}, {"id": sid, "status": "ERROR" if st.glitch_message else "FAIL",
                          "message": st.glitch_message, "alpha": None}
-    if st.cancel_others and sim.get("regular") != "fail()" and "C" in sid:
+    if st.cancel_others and sim.get("regular") not in ("fail()", "heavy()") and "C" in sid:
         parent = sid.split("C")[0]
-        if any(st.sims.get(c, {}).get("regular") == "fail()" for c in st.sims.get(parent, {}).get("children", [])):
+        if any(st.sims.get(c, {}).get("regular") in ("fail()", "heavy()")
+               for c in st.sims.get(parent, {}).get("children", [])):
             return 200, {}, {"id": sid, "status": "CANCELLED", "message": None, "alpha": None}
+    if sim.get("regular") == "heavy()":
+        return 200, {}, {"id": sid, "status": "ERROR", "message": "Simulation took too much resource", "alpha": None}
     if sim.get("regular") == "fail()":
         return 200, {}, {"id": sid, "status": "ERROR", "message": "Attempted to use unknown variable \"foo\"",
                          "alpha": None}

@@ -524,6 +524,9 @@ def test_prod_estimate_is_fitted_per_region_and_says_when_it_cannot_be_trusted()
     far = estimate(0.12)
     assert far['confidence'] == 'low' and 'correlates only 0.12' in far['note']
     assert 'below what the estimate was calibrated on' in far['note']
+    # low confidence: no point value (.70 everywhere read as "on the line"), only the band
+    assert far['value'] is None and far['line_value'] is not None and far['range']
+    assert 'no discriminating power' in far['no_point_estimate']
     row = service.compact_check({'alpha_id': 'x', 'recommendation': 'check', 'prod_est': far,
                                  'local': {}, 'platform': {}, 'platform_status': 'not_requested'})
     assert row['prod_est_confidence'] == 'low'

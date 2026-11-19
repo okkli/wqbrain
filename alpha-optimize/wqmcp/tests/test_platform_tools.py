@@ -179,7 +179,7 @@ async def test_multi_sweep_overrides_and_lint(mcp_session, fake):
                         per_alpha_settings=[{"decay": 3}, {"neutralization": "MARKET"},
                                             {"simulation_mode": "QUICK"}])
         assert ok["status"] == "SUBMITTED" and ok["mode"] == "multi"
-        assert ok["children"][0] == {"index": 0, "overrides": {"decay": 3}, "ops_est": 1}
+        assert ok["children"][0] == {"index": 0, "overrides": {"decay": 3}} and ok["ops_est"] == [1, 1, 1]
         body = posted(fake)[0]
         assert [b["regular"] for b in body] == ["rank(x)"] * 3
         assert body[0]["settings"]["decay"] == 3 and body[1]["settings"]["neutralization"] == "MARKET"
@@ -864,7 +864,7 @@ async def test_submissions_wait_in_the_queue_first_in_first_out(mcp_session, fak
     async with mcp_session() as s:
         first = await call(s, "create_simulation", expressions="rank(a)", queue=True)
         assert first["status"] == "QUEUED" and first["queue_id"] == "Q1" and first["queue_position"] == 1
-        assert first["next"] == "get_simulation(simulation_ids=['Q1'], wait_seconds=30)"
+        assert first["next"] == "get_simulation(simulation_ids=['Q1'], format=\"brief\")"
         second = await call(s, "create_simulation", expressions=["rank(b)", "rank(c)"], queue=True)
         third = await call(s, "create_simulation", expressions="rank(d)", queue=True)
         assert (second["queue_id"], second["queue_position"], second["mode"]) == ("Q2", 2, "multi")
@@ -1007,11 +1007,11 @@ async def test_running_time_replaces_progress_and_stuck_runs_are_flagged(mcp_ses
     async with mcp_session() as s:
         sub = await call(s, "create_simulation", expressions="rank(x)")
         run = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
-        assert run["status"] == "RUNNING" and "progress" not in run and run["running_seconds"] >= 0
+        assert run["status"] == "RUNNING" and run["progress"] == 0.5 and run["running_seconds"] >= 0
         assert "stale" not in run
         monkeypatch.setattr(pf, "STALE_SINGLE_SECONDS", 0.0)
         stuck = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
-        assert stuck["stale"] is True and "cancel_simulation" in stuck["note"]
+        assert stuck["stale"] is True and "cancel_simulation" in stuck["note"] and "Keep polling" in stuck["note"]
         assert f'resubmit=\\"{sub["simulation_id"]}\\"' in stuck["note"] or \
             f'resubmit="{sub["simulation_id"]}"' in stuck["note"]
 
@@ -1191,7 +1191,8 @@ async def test_a_running_multi_says_why_there_is_no_child_count(mcp_session, fak
         sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"])
         run = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
     assert run["status"] == "RUNNING" and run["type"] == "MULTI" and run["total_children"] == 2
-    assert "does not list its children" in run["note"]
+    assert "note" not in run and "progress_url" not in run       # no repeated sentence on every poll
+    assert run["retry_after_seconds"] >= 30                         # the time a run needs, not 5s
 
 
 async def test_finished_results_are_not_repeated(mcp_session, fake):
@@ -1201,9 +1202,11 @@ async def test_finished_results_are_not_repeated(mcp_session, fake):
         b = await call(s, "create_simulation", expressions=["rank(c)", "rank(d)"])
         await call(s, "get_simulation", simulation_ids=a["simulation_id"], wait_seconds=10)
         await call(s, "get_simulation", simulation_ids=b["simulation_id"], wait_seconds=10)
-        first = await call(s, "get_simulation", simulation_ids=[a["simulation_id"], b["simulation_id"]])
+        first = await call(s, "get_simulation", simulation_ids=[a["simulation_id"], b["simulation_id"]], client="J")
         assert all("alpha_results" in x for x in first["simulations"])      # the first time in full
-        again = await call(s, "get_simulation", simulation_ids=[a["simulation_id"], b["simulation_id"]])
+        anon = await call(s, "get_simulation", simulation_ids=[a["simulation_id"], b["simulation_id"]])
+        assert all("alpha_results" in x for x in anon["simulations"])       # no client=: always in full
+        again = await call(s, "get_simulation", simulation_ids=[a["simulation_id"], b["simulation_id"]], client="J")
         assert again["simulations"] == [
             {"simulation_id": a["simulation_id"], "status": "COMPLETE", "rows": 2, "rows_available": True,
              "returned_before": True},
@@ -1381,14 +1384,15 @@ def test_client_labels_are_short_and_stable(monkeypatch):
 
 
 async def test_parallel_polls_of_one_id_get_the_rows_once(mcp_session, fake):
+    """Only for a caller that names itself: subagents sharing one session each get the rows."""
     fake.state.child_polls_needed = 2
     async with mcp_session() as s:
         sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"])
         outs = await asyncio.gather(*[call(s, "get_simulation", simulation_ids=sub["simulation_id"],
-                                           wait_seconds=10) for _ in range(3)])
+                                           wait_seconds=10, client="J") for _ in range(3)])
         full = [o for o in outs if "alpha_results" in o]
         assert len(full) == 1 and all(o["returned_before"] is True for o in outs if o not in full)
-        again = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
+        again = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], client="J")
         assert len(again["alpha_results"]) == 2                              # asked again: in full
 
 
@@ -1571,7 +1575,7 @@ async def test_a_warning_on_the_limit_is_an_edge_and_all_clear_says_so(mcp_sessi
     assert row["warns"] == ["IS_LADDER 1.58=1.58 (edge)"] and row["all_clear"] is False
     assert row["ladder"] == 1.58 and row["edge"] == ["SHARPE 1.6~1.58"] and "IS_LADDER" in row["y2_note"]
     head, line = [x.split("\t") for x in tsv["tsv"].splitlines()]
-    assert head[-5:] == ["robust", "ladder", "all_clear", "edge", "maxtrade"]      # appended at the end
+    assert head[18:23] == ["robust", "ladder", "all_clear", "edge", "maxtrade"]    # appended at the end
     assert line[head.index("all_clear")] == "false" and line[head.index("ladder")] == "1.58"
     assert quick["alpha"]["maxtrade_applied"] is False and "maxTrade" in quick["quick_note"]
 
@@ -1703,3 +1707,138 @@ async def test_too_few_arguments_are_caught_before_sending(mcp_session, fake):
         out = await call(s, "create_simulation", expressions=["group_mean(close, industry)", "rank(close)"])
     assert out["problems"][0]["index"] == 0 and "group_mean: needs at least 3 arguments, got 2" in out["problems"][0]["issues"][0]
     assert not [b for b in posted(fake) if isinstance(b, list)]
+
+
+# --- field report + token report 2026-11-19 ------------------------------------------
+
+async def test_brief_gives_the_base_settings_once_and_no_expressions(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions="rank(x)", tag="br", labels=["d3", "d5"],
+                         per_alpha_settings=[{"decay": 3}, {"decay": 5}])
+        await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], format="brief")
+    head, *lines = [x.split("\t") for x in out["brief"].splitlines()]
+    assert "expr" not in head and "label" in head and "new_result" not in head and "cluster" not in head
+    cells = [dict(zip(head, x)) for x in lines]
+    assert [c["label"] for c in cells] == ["d3", "d5"] and [c["set"] for c in cells] == ["decay=3.0", "decay=5.0"]
+    assert "universe=TOP3000" in out["base_set"] and "decay" not in out["base_set"]
+    assert "progress_url" not in out and "alpha_results" not in out
+
+
+async def test_an_alias_is_not_a_new_result(mcp_session, fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        multi = await call(s, "create_simulation", expressions=["rank(a)", "alias(x)", "dup()", "dup()"],
+                           validate_expressions=False, tag="al")
+        out = await call(s, "get_simulation", simulation_ids=multi["simulation_id"], wait_seconds=10)
+        tsv = await call(s, "get_simulation", simulation_ids=multi["simulation_id"], format="tsv")
+    rows = {r["index"]: r for r in out["alpha_results"]}
+    assert rows[1]["reused_kind"] == "alias" and rows[1]["reused_from"] == "OLD1" and rows[1]["new_result"] is False
+    assert rows[3]["new_result"] is False and "new_result" not in rows[0]
+    assert out["reused_rows"] == [1, 3] and out["new_results"] == 2
+    head, *lines = [x.split("\t") for x in tsv["tsv"].splitlines()]
+    assert head[-2:] == ["reused_from", "new_result"]
+    assert [x[-1] for x in lines] == ["true", "false", "true", "false"]
+    logged = [json.loads(x) for x in (tmp_path / "al.jsonl").read_text().splitlines()]
+    assert logged[1]["new_result"] is False and logged[0]["region"] == "USA" and logged[0]["delay"] == 1
+
+
+async def test_the_daily_cap_is_not_reported_as_full_slots(mcp_session, fake, monkeypatch):
+    from fake_brain import alpha
+    monkeypatch.setattr(pf, "DAILY_ALPHA_LIMIT", 20)
+    monkeypatch.setattr(pf, "DAILY_ALPHA_MARGIN", 2)
+    monkeypatch.setattr(pf, "DAILY_SOFT_STOP", 0)
+    fake.state.listed = [alpha(f"T{i}") for i in range(19)]
+    fake.state.sim_slots_full = True
+    async with mcp_session() as s:
+        status = await call(s, "brain_status")
+        assert status["daily_alphas"]["count"] == 19 and status["daily_alphas"]["quota_exhausted"] is True
+        out = await call(s, "create_simulation", expressions="rank(a)", queue=True)
+        assert out["status"] == "DAILY_QUOTA_EXHAUSTED" and "queue_id" not in out
+        assert out["daily_alphas"]["remaining"] == 1 and "resets_at" in out["daily_alphas"]
+        fake.state.listed = [alpha("T0")]
+        await asyncio.sleep(0)
+        pf.brain_client._daily = None
+        busy = await call(s, "create_simulation", expressions="rank(a)", queue=False)
+        assert busy["status"] == "RATE_LIMITED"                    # far from the cap: slots really are full
+        monkeypatch.setattr(pf, "DAILY_SOFT_STOP", 1)
+        fake.state.sim_slots_full = False
+        stop = await call(s, "create_simulation", expressions="rank(a)")
+        assert stop["status"] == "REFUSED" and stop["reason"] == "DAILY_SOFT_STOP"
+        forced = await call(s, "create_simulation", expressions="rank(a)", force=True)
+        assert forced["status"] == "SUBMITTED"
+
+
+async def test_a_waived_prod_is_not_all_clear(mcp_session, fake):
+    fake.state.alpha_checks = [{"name": "LOW_SHARPE", "result": "PASS", "value": 2.0, "limit": 1.25},
+                               {"name": "SELF_CORRELATION", "result": "PASS", "value": 0.5, "limit": 0.7},
+                               {"name": "PROD_CORRELATION", "result": "PASS", "value": 0.8163, "limit": 0.7}]
+    async with mcp_session() as s:
+        out = await call(s, "check_alpha", alpha_id="A1", wait_seconds=10)
+    assert out["verdict"] == "pass" and out["all_clear"] is False and out["waived"] == ["PROD"]
+    assert out["correlations"]["prod"] == {"value": 0.8163, "limit": 0.7, "result": "PASS", "waived": True,
+                                           "over_threshold": True}
+    assert "waived" in out["verdict_basis"]
+
+
+async def test_the_others_are_resent_once_after_too_much_resource(mcp_session, fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed, fake.state.cancel_others = 1, True
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["rank(a)", "heavy()", "rank(c)"],
+                         validate_expressions=False, tag="rs", labels=["a", "h", "c"])
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        again = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
+        assert again["auto_retry"]["resent_as"] == out["auto_retry"]["resent_as"]       # only once
+        new = out["auto_retry"]["resent_as"]
+        done = await call(s, "get_simulation", simulation_ids=new, wait_seconds=10)
+    assert out["auto_retry"]["items"] == [0, 2] and out["auto_retry"]["left_out"] == [1]
+    assert [b["regular"] for b in fake.state.calls("POST", "/simulations")[-1]["body"]] == ["rank(a)", "rank(c)"]
+    assert done["status"] == "COMPLETE"
+    logged = [json.loads(x) for x in (tmp_path / "rs.jsonl").read_text().splitlines()]
+    fresh = [r for r in logged if r["simulation_id"] == new and r["status"] == "COMPLETE"]
+    assert sorted((r["index"], r["label"]) for r in fresh) == [(0, "a"), (2, "c")]
+    first = [r for r in logged if r["simulation_id"] == sub["simulation_id"]]
+    assert sorted((r["index"], r["status"]) for r in first) == [(0, "RESENT"), (1, "ERROR"), (2, "RESENT")]
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("wqwait", pf.os.path.join(pf.os.path.dirname(pf.__file__),
+                                                                            "scripts", "wqwait.py"))
+    wqwait = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wqwait)
+    picked = wqwait.pick(logged, {sub["simulation_id"]}, 0)       # heavy ERROR + the two resent results
+    assert sorted((r["index"], r["status"]) for r in picked) == [(0, "COMPLETE"), (1, "ERROR"), (2, "COMPLETE")]
+
+
+async def test_metrics_held_back_by_a_429_are_logged_later_not_empty(mcp_session, fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"], tag="lim")
+        fake.state.rate_limit_long_alphas = True
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        assert out["status"] == "UNKNOWN" and out["metrics_pending"] == [0, 1]
+        assert not (tmp_path / "lim.jsonl").exists()
+        fake.state.rate_limit_long_alphas = False
+        pf.brain_client._blocked.clear()
+        done = await call(s, "get_simulation", simulation_ids=sub["simulation_id"])
+    assert done["status"] == "COMPLETE" and done["log_flushed"] is True
+    assert all(json.loads(x)["sharpe"] == 1.4 for x in (tmp_path / "lim.jsonl").read_text().splitlines())
+
+
+async def test_user_rule_ops_whitelist_fields_and_dry_run(mcp_session, fake):
+    async with mcp_session() as s:
+        out = await call(s, "create_simulation", dry_run=True, ops_rule="user", max_ops=2, max_fields=1,
+                         allowed_operators=["rank", "ts_backfill", "ts_mean"],
+                         expressions=["rank(ts_backfill(close, 5))", "ts_mean(close, 5) - volume",
+                                      "zscore(close)"], validate_expressions=False)
+        assert out["status"] == "DRY_RUN" and out["ops_est"] == [2, 2, 1] and out["ops_user"] == [1, 2, 1]
+        assert out["would_send"] == [0] and not fake.state.calls("POST", "/simulations")
+        issues = {p["index"]: " ".join(p["issues"]) for p in out["problems"]}
+        assert "max_fields=1" in issues[1] and "allowed_operators: zscore" in issues[2]
+        both = await call(s, "create_simulation", expressions="rank(close)", max_trade="ON", max_position="ON")
+        assert both["status"] == "REFUSED" and "cannot both be ON" in both["refused"][0]["issues"][0]
+        ram = await call(s, "create_simulation", expressions="rank(close)", region="EUR", universe="TOP2500",
+                         neutralization="ram", validate_expressions=False)
+        assert ram["settings_used"]["neutralization"] == "REVERSION_AND_MOMENTUM"
