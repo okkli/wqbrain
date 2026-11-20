@@ -467,7 +467,9 @@ async def test_check_reports_prod_est_from_local_pool_and_compacts():
     row = service.compact_check(full)
     assert row['prod_est'] == est['value'] and row['pool'] == pool and row['prod_est_range'] == est['range']
     assert set(row) == {'alpha_id', 'recommendation', 'prod_est', 'prod_est_confidence', 'prod_est_range',
-                        'pool', 'self', 'prod_lower_bound', 'platform_prod', 'platform_status'}
+                        'pool', 'self', 'prod_lower_bound', 'platform_prod', 'platform_status',
+                        'pool_top', 'self_top'}
+    assert row['pool_top'] and row['pool_top'][0].split()[1] == str(pool)     # the alpha behind the max
 
 
 @pytest.mark.asyncio

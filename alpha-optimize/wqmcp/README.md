@@ -49,6 +49,8 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_AUTO_RETRY_GLITCH` | `1` | multi 的子项全部失败且没有任何原因时，把每一项单独重发一次（找出坏的那项）。设为 `0` 关闭 |
 | `WQMCP_SLOW_OPERATORS` | `ts_theilsen:0,poly_regression:500,ts_quantile:2500,ts_skewness:180,ts_kurtosis:180,ts_ir:1000` | `算子:窗口`，窗口达到这个值时预检给 `likely_hang` 提示（只提示，不拦；0 = 任何窗口）。`ts_entropy` 已移除（24 批全部正常） |
 | `WQMCP_LONG_WINDOW` | `750` | 任何 `ts_*` 窗口达到这个值时给 `slow` 提示（一批 30~45 分钟属正常） |
+| `WQMCP_HEAVY_MULTI` | `4` | 一个 multi 里读 VECTOR 字段、用风险因子中性化或 regression_neut 的项多于这个数时给警告（整批 too much resource 的风险） |
+| `WQMCP_PUBLIC_URL` | 空 | 回包 `wait` 命令里的服务地址；空时取客户端连进来的地址 |
 | `WQMCP_CORR_STALL_SECONDS` | `300` | 有 alpha 在算、却这么久没有任何结果出来，就判定为被限流 |
 | `WQMCP_CORR_THROTTLED_INTERVAL` | `60` | 被限流期间每个查询的轮询间隔（秒） |
 | `WQMCP_CORR_HOLD_SECONDS` | `90` | 只在关闭后台模式时有用：返回 PENDING 之后名额为这个 alpha 保留多久 |
@@ -118,7 +120,7 @@ create_simulation(type="SA", combo="combo_expr", selection=["sel_a", "sel_b"])  
 
 一批 multi 要 5~20 分钟，而一次调用最多等 40 秒。循环调用时每一轮都要重读整个上下文，大部分调用只拿到 RUNNING。推荐的等法：
 
-- 发枪时带 `tag`，回包里的 `wait` 给出后台命令，例如 `python3 scripts/wqwait.py <tag> <N> --sim <id>`。它轮询 `GET /results/<tag>.jsonl`，只数真正的结果行（有 id，或有最终状态），齐了以后打印精简表。服务地址取 `$WQMCP_RESULTS_URL`，默认 `http://127.0.0.1:8761`。
+- 发枪时带 `tag`，回包里的 `wait` 给出后台命令，例如 `python3 scripts/wqwait.py <tag> <N> --sim <id>`。它轮询 `GET /results/<tag>.jsonl`，只数真正的结果行（有 id，或有最终状态），齐了以后打印精简表。服务地址取 `--url` 或 `$WQMCP_RESULTS_URL`（回包里的 `wait` 命令已经带上），默认 `http://127.0.0.1:8761`。请求直连，不走系统 HTTP 代理；连续 6 次失败（`--max-errors`）以退出码 3 结束，不会空等到超时。
 - 或者等过 RUNNING 回包里的 `retry_after_seconds` 再问。这个值现在是这类批次预计还要多久（30~300 秒），不再是 BRAIN 的 5 秒。
 - 取结果用 `get_simulation(format="brief")`：批头 `base_set` 只写一次，每行只写与它不同的设置，用 label 代替表达式，全空列不输出；`last=N` 只回最后 N 行。
 

@@ -11,7 +11,12 @@ N        result lines to wait for (one per item of the batch).
 --sim    count only lines of these simulation ids (and items resent from them);
          without it, every line after the first K (--since) counts.
 --max    give up after this many seconds (default 3000); exit code 2 then.
-Server:  $WQMCP_RESULTS_URL, default http://127.0.0.1:8761.
+--url    the MCP server (default $WQMCP_RESULTS_URL, else http://127.0.0.1:8761). The
+         create_simulation answer's "wait" command sets it to the address you reached.
+         Requests go straight to it, never through an HTTP proxy (a system proxy answered
+         503 for a server it could not reach).
+--max-errors  stop with exit code 3 after this many failed requests in a row (default 6),
+         instead of waiting out --max against a server that is not there.
 
 A line counts when it is a result: it has an alpha id, or a final status
 (ERROR / FAIL / CANCELLED ...). RESENT / RETRYING lines and rows without an id
@@ -30,8 +35,11 @@ import urllib.request
 NOT_RESULTS = {"RESENT", "RETRYING", "RUNNING", "UNKNOWN", "QUEUED", ""}
 
 
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def fetch(base: str, tag: str) -> list:
-    with urllib.request.urlopen(f"{base.rstrip('/')}/results/{tag}.jsonl", timeout=30) as resp:
+    with _DIRECT.open(f"{base.rstrip('/')}/results/{tag}.jsonl", timeout=30) as resp:
         text = resp.read().decode("utf-8")
     rows = []
     for line in text.splitlines():
@@ -49,8 +57,9 @@ def is_result(row: dict) -> bool:
 def pick(rows: list, sims: set, since: int) -> list:
     if sims:     # a simulation id, the queue id it waited under, or a batch it was resent from
         sims = set(sims)
-        while True:      # follow resends of resends (a resent batch split again)
-            more = {r.get("simulation_id") for r in rows if r.get("resent_from") in sims} - sims - {None}
+        while True:      # follow resends of resends (a resent batch split again), and queue ids
+            more = {r.get("simulation_id") for r in rows
+                    if r.get("resent_from") in sims or r.get("queue_id") in sims} - sims - {None}
             if not more:
                 break
             sims |= more
@@ -78,15 +87,25 @@ def main() -> int:
     ap.add_argument("--since", type=int, default=0)
     ap.add_argument("--max", type=float, default=3000.0)
     ap.add_argument("--interval", type=float, default=20.0)
+    ap.add_argument("--url", default=os.environ.get("WQMCP_RESULTS_URL", "http://127.0.0.1:8761"))
+    ap.add_argument("--max-errors", type=int, default=6)
     args = ap.parse_args()
-    base = os.environ.get("WQMCP_RESULTS_URL", "http://127.0.0.1:8761")
+    base = args.url
     deadline = time.time() + args.max
     got: list = []
+    errors = 0
     while True:
         try:
             got = pick(fetch(base, args.tag), set(args.sim), args.since)
-        except (urllib.error.URLError, OSError) as e:      # the server restarting: keep waiting
-            print(f"# {e}", file=sys.stderr)
+            errors = 0
+        except (urllib.error.URLError, OSError) as e:      # a restart takes a few: keep waiting a while
+            errors += 1
+            print(f"# {base}: {e}", file=sys.stderr)
+            if errors >= args.max_errors:
+                print(f"# {errors} failed requests in a row: is {base} the MCP server? "
+                      "(--url / WQMCP_RESULTS_URL)", file=sys.stderr)
+                print(brief(got))
+                return 3
         if len(got) >= args.n or time.time() >= deadline:
             break
         time.sleep(args.interval)

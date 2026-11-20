@@ -928,7 +928,7 @@ class ProdMemoService:
         local = full['local']
         platform_prod = finite_number((full['platform'].get('prod') or {}).get('max'))
         est = full.get('prod_est')
-        return {
+        row = {
             'alpha_id': full['alpha_id'],
             'recommendation': full['recommendation'],
             'prod_est': est['value'] if est else None,
@@ -940,6 +940,12 @@ class ProdMemoService:
             'platform_prod': platform_prod,
             'platform_status': full['platform_status'],
         }
+        for kind in ('pool', 'self'):
+            # which alphas those maxima come from: the targets to decorrelate from
+            top = (local.get(kind) or {}).get('top') or []
+            if top:
+                row[f'{kind}_top'] = [f"{t['id']} {t['corr']}" for t in top]
+        return row
 
     async def check(self, alpha_id, run_platform_check=False):
         """Decision facade: should this alpha's platform Prod check be skipped?"""
@@ -1017,6 +1023,10 @@ class ProdMemoService:
         }
         if not result.get('available'):
             out['reason'] = result.get('reason')
+        top = [{'id': r.get('alphaId'), 'corr': r.get('correlation')}
+               for r in (result.get('records') or [])[:3] if isinstance(r, dict) and r.get('alphaId')]
+        if top:
+            out['top'] = top
         if include_witness:
             out['witness'] = result.get('witness')
             out['referenceCount'] = result.get('referenceCount')

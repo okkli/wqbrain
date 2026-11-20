@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 
 import pytest
@@ -476,7 +477,9 @@ async def test_check_alpha_kinds(mcp_session, fake):
 async def test_update_alpha_single_and_bulk(mcp_session, fake):
     async with mcp_session() as s:
         one = await call(s, "update_alpha", alpha_ids="A1", name="mine", color="RED", tags=["t"])
-        assert one["alpha"]["name"] == "mine"
+        assert one["changed"] == {"name": "mine", "color": "RED", "tags": ["t"]} and "alpha" not in one
+        full = await call(s, "update_alpha", alpha_ids="A1", name="mine", verbose=True)
+        assert full["alpha"]["name"] == "mine"
         many = await call(s, "update_alpha", alpha_ids=["A1", "A2"], favorite=True, color="GREEN")
         assert many["updated"] == ["color", "favorite"]
         refused = await call(s, "update_alpha", alpha_ids=["A1", "A2"], name="x")
@@ -1842,3 +1845,199 @@ async def test_user_rule_ops_whitelist_fields_and_dry_run(mcp_session, fake):
         ram = await call(s, "create_simulation", expressions="rank(close)", region="EUR", universe="TOP2500",
                          neutralization="ram", validate_expressions=False)
         assert ram["settings_used"]["neutralization"] == "REVERSION_AND_MOMENTUM"
+
+
+# ------------------------------------------------------------- field report 2026-11-19
+
+async def test_the_long_generic_error_also_splits_the_batch(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    fake.state.glitch_batches = 1
+    fake.state.glitch_message = ("There was an error while running the simulation. Please try again or contact "
+                                 "BRAIN support if this problem persists.")
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"])
+        first = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+    assert first["status"] == "RETRIED" and len(first["retried_as"]) == 2
+    assert pf.brain_client._retried_reason[sub["simulation_id"]] == "silent"
+
+
+async def test_a_batch_where_every_child_was_too_heavy_is_sent_again_item_by_item(mcp_session, fake, tmp_path,
+                                                                                 monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["heavy()", "heavy()"], validate_expressions=False,
+                         tag="hv")
+        first = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        assert first["status"] == "RETRIED" and first["auto_retry"] == "too_much_resource"
+        assert len(posted(fake)) == 3                      # the batch, then each item alone
+        again = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+    assert again["retried_as"] == first["retried_as"] and "too much resource" in again["note"]
+    assert len(posted(fake)) == 3                          # not split a second time
+    saved = pf.brain_client  # the split survives a restart: it is in the state file
+    assert saved._retried[sub["simulation_id"]] == first["retried_as"]
+
+
+async def test_a_multi_mixing_universes_is_refused_and_settings_used_shows_shared_settings_only(mcp_session, fake):
+    async with mcp_session() as s:
+        mixed = await call(s, "create_simulation", expressions="rank(close)", region="USA", universe="TOP3000",
+                           per_alpha_settings=[{}, {}, {"universe": "TOP1000"}])
+        swept = await call(s, "create_simulation", expressions="rank(close)", validate_expressions=False,
+                           per_alpha_settings=[{"decay": 3}, {"decay": 5}])
+    assert "error" in mixed and [p["index"] for p in mixed["problems"]] == [2]
+    assert "mixing region / universe / delay" in mixed["problems"][0]["issues"][-1]
+    assert "decay" not in swept["settings_used"] and swept["settings_per_item"] == ["decay"]
+
+
+async def test_datasets_list_every_theme_by_default(mcp_session, fake):
+    async with mcp_session() as s:
+        await call(s, "get_datasets", region="EUR", universe="TOP2500")
+        await call(s, "get_datasets", region="EUR", universe="TOP2500", theme="true")
+    first, second = fake.state.calls("GET", "/data-sets")[-2:]
+    assert "theme" not in first["query"] and second["query"]["theme"] == "true"
+
+
+async def test_pyramids_filtered_compact_and_performance_without_daily_pnl(mcp_session, fake):
+    async with mcp_session() as s:
+        mult = await call(s, "get_activity", kind="pyramid-multipliers", region="USA", delay=1)
+        none = await call(s, "get_activity", kind="pyramid-multipliers", region="JPN")
+        perf = await call(s, "get_alpha_performance", alpha_id="A1")
+    assert mult["pyramids"] == {"USA/D1": {"PRICE_VOLUME": 1.2, "ANALYST": 1.2, "MODEL": 1.2, "NEWS": 1.2}}
+    assert none["pyramids"] == {}
+    assert perf["delta"] == {"sharpe": 0.1} and "pnl" not in perf and "2025" in perf["yearly"]
+
+
+def test_performance_brief_and_check_all_view():
+    out = pf._performance_brief({"stats": {"before": {"sharpe": 1.0, "bookSize": 1}, "after": {"sharpe": 1.2,
+                                                                                               "bookSize": 1}},
+                                 "pnl": {"records": [[1, 2, 3]] * 50},
+                                 "yearlyStats": {"before": {"schema": {"properties": [{"name": "year"},
+                                                                                      {"name": "sharpe"}]},
+                                                            "records": [["2020", 1.1]]}}})
+    assert out["delta"] == {"sharpe": 0.2} and out["yearly"] == {"2020": {"before": {"sharpe": 1.1}}}
+    assert "pnl" not in out and out["pnl_omitted"]
+    sub, corr = pf._all_view(
+        {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "value": 1.6}, {"name": "LOW_FITNESS", "result": "FAIL"},
+                    {"name": "PROD_CORRELATION", "result": "PASS", "value": 0.5}], "correlations": {"prod": {}}},
+        {"checks": {"self": {"status": "DONE", "top": [{"id": "X", "correlation": 0.6, "name": "n", "sharpe": 2}]}}})
+    assert sub["checks"] == [{"name": "LOW_FITNESS", "result": "FAIL"}] and sub["passed"] == ["LOW_SHARPE 1.6"]
+    assert corr["checks"]["self"]["top"] == [{"id": "X", "corr": 0.6}]
+
+
+async def test_a_logged_simulation_answers_from_its_log_when_brain_is_too_slow(mcp_session, fake, tmp_path,
+                                                                             monkeypatch):
+    monkeypatch.setattr(pf, "RESULTS_DIR", str(tmp_path))
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["rank(a)", "rank(b)"], tag="slow")
+        done = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        assert done["status"] == "COMPLETE" and done["log_flushed"] is True
+
+        async def hang(*a, **k):
+            await asyncio.sleep(60)
+        monkeypatch.setattr(pf.brain_client, "check_simulation_progress", hang)
+        monkeypatch.setattr(pf, "TOOL_DEADLINE", 6.0)
+        out = await call(s, "get_simulation", simulation_ids=[sub["simulation_id"], "NOPE1"])
+    by_id = {x["simulation_id"]: x for x in out["simulations"]}
+    assert by_id[sub["simulation_id"]]["from_log"] is True and by_id[sub["simulation_id"]]["status"] == "COMPLETE"
+    assert len(by_id[sub["simulation_id"]]["alpha_results"]) == 2
+    assert by_id["NOPE1"]["status"] == "UNKNOWN" and by_id["NOPE1"]["timed_out"] is True
+
+
+async def test_a_field_get_datafields_listed_counts_as_checked_when_lookups_are_slow(client, monkeypatch):
+    client._note_listed([{"id": "event_scores_x", "type": "VECTOR"}], "EUR", 1)
+
+    async def slow(name):
+        await asyncio.sleep(5)
+    monkeypatch.setattr(client, "field_info", slow)
+    monkeypatch.setattr(client, "operator_categories", lambda: asyncio.sleep(0, {}))
+    problems, warnings = await client.field_problems(
+        [(0, "vec_avg(event_scores_x) + other_field_x", {"region": "EUR", "delay": 1})], budget=0.2)
+    text = " ".join(w["issue"] for w in warnings)
+    assert "other_field_x" in text and "event_scores_x" not in text
+
+
+def test_wqwait_gives_up_on_a_server_that_is_not_there(monkeypatch, capsys):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("wqwait", pf.os.path.join(pf.os.path.dirname(pf.__file__),
+                                                                            "scripts", "wqwait.py"))
+    wqwait = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wqwait)
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")       # never used: requests go direct
+    monkeypatch.setattr(sys, "argv", ["wqwait", "t", "3", "--url", "http://127.0.0.1:9", "--interval", "0",
+                                      "--max-errors", "2"])
+    assert wqwait.main() == 3
+    assert "failed requests in a row" in capsys.readouterr().err
+    # a queued multi (Q5, sent as S1) split into singles S3, S4; S4 waited in the queue as Q8
+    rows = [{"simulation_id": "S3", "queue_id": "Q5", "resent_from": "S1", "status": "RESENT", "index": 0},
+            {"simulation_id": "Q8", "queue_id": "Q5", "resent_from": "S1", "status": "RESENT", "index": 1},
+            {"simulation_id": "S3", "resent_from": "S1", "status": "COMPLETE", "id": "A", "index": 0},
+            {"simulation_id": "S4", "queue_id": "Q8", "resent_from": "S1", "status": "COMPLETE", "id": "B",
+             "index": 1}]
+    assert sorted(r["id"] for r in wqwait.pick(rows, {"Q5"}, 0)) == ["A", "B"]   # a queue id follows its batch
+    assert [r["id"] for r in wqwait.pick(rows, {"Q8"}, 0)] == ["B"]              # one item: not its siblings
+
+
+async def test_one_note_for_several_ids_is_said_once(mcp_session, fake, monkeypatch):
+    async def state(url, wait, compact=True):
+        sid = url.rsplit("/", 1)[-1]
+        return {"status": "RUNNING", "retry_after_seconds": 30,
+                "note": f"slow batch {sid}: keep polling, cancel_simulation then resubmit=\"{sid}\"" + " x" * 50}
+    monkeypatch.setattr(pf.brain_client, "check_simulation_progress", state)
+    async with mcp_session() as s:
+        out = await call(s, "get_simulation", simulation_ids=["S1", "S2"], client="J")
+        again = await call(s, "get_simulation", simulation_ids=["S1", "S2"], client="J")
+    assert out["note"].startswith("[S1, S2] slow batch <id>") and out["note"].count("keep polling") == 1
+    assert again["note"].startswith("as before: ") and len(again["note"]) < 120
+
+
+async def test_a_split_batch_whose_items_waited_in_the_queue_survives_a_restart(mcp_session, fake, tmp_path,
+                                                                                monkeypatch):
+    monkeypatch.setattr(pf, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(pf, "SUBMIT_QUEUE_INTERVAL", 0.05)
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["heavy()", "heavy()"], validate_expressions=False)
+        fake.state.sim_slots_full = True                 # the singles have to wait in the queue
+        first = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+        assert first["status"] == "RETRIED" and all(r.startswith("Q") for r in first["retried_as"])
+        fake.state.sim_slots_full = False
+        for _ in range(100):
+            if not any(r.startswith("Q") for r in pf.brain_client._retried[sub["simulation_id"]]):
+                break
+            await asyncio.sleep(0.05)
+    assert not any(r.startswith("Q") for r in pf.brain_client._retried[sub["simulation_id"]])
+    pf.brain_client.save_state()
+    await asyncio.sleep(0.3)
+    fresh = pf.BrainApiClient()                                  # the server after a restart
+    monkeypatch.setattr(pf, "brain_client", fresh)
+    fresh.load_state()
+    async with create_connected_server_and_client_session(pf.mcp._mcp_server) as s:
+        out = await call(s, "get_simulation", simulation_ids=sub["simulation_id"], wait_seconds=10)
+    fresh._executor.shutdown(wait=False)
+    assert [r["status"] for r in out["alpha_results"]] == ["ERROR", "ERROR"]
+    assert all("too much resource" in r["message"] for r in out["alpha_results"])     # not "queue entry lost"
+
+
+async def test_two_checks_at_once_split_a_too_heavy_batch_only_once(mcp_session, fake):
+    fake.state.child_polls_needed = 1
+    async with mcp_session() as s:
+        sub = await call(s, "create_simulation", expressions=["heavy()", "heavy()"], validate_expressions=False)
+    url = f"{pf.brain_client.base_url}/simulations/{sub['simulation_id']}"
+    a, b = await asyncio.gather(pf.brain_client._check_once(url, True), pf.brain_client._check_once(url, False))
+    assert len(posted(fake)) == 3                      # the batch, then each item alone, once
+    assert {a["status"], b["status"]} <= {"RETRIED", "RUNNING"}        # the second follows the singles
+
+
+async def test_a_multi_with_many_risk_neutralized_items_is_warned(mcp_session, fake):
+    async with mcp_session() as s:
+        out = await call(s, "create_simulation", dry_run=True, region="USA", universe="TOP3000",
+                         expressions=["rank(close)", "rank(open)", "rank(high)", "rank(low)",
+                                      "regression_neut(rank(close), rank(volume))", "rank(volume)"],
+                         per_alpha_settings=[{"neutralization": "SLOW"}, {"neutralization": "FAST"},
+                                             {"neutralization": "ram"}, {"neutralization": "CROWDING"}, {}, {}])
+        few = await call(s, "create_simulation", dry_run=True, expressions=["rank(close)", "rank(open)"],
+                         per_alpha_settings=[{"neutralization": "SLOW"}, {"neutralization": "FAST"}])
+    warned = " ".join(out.get("warnings") or [])
+    assert "5 items use a risk-factor neutralization or regression_neut" in warned and "[0, 1, 2, 3, 4]" in warned
+    assert "risk-factor" not in " ".join(few.get("warnings") or [])
