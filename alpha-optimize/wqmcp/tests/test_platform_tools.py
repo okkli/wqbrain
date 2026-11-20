@@ -2041,3 +2041,23 @@ async def test_a_multi_with_many_risk_neutralized_items_is_warned(mcp_session, f
     warned = " ".join(out.get("warnings") or [])
     assert "5 items use a risk-factor neutralization or regression_neut" in warned and "[0, 1, 2, 3, 4]" in warned
     assert "risk-factor" not in " ".join(few.get("warnings") or [])
+
+
+async def test_a_queue_id_sent_before_a_restart_still_finds_its_simulation(mcp_session, fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "STATE_FILE", str(tmp_path / "state.json"))
+    fake.state.sim_slots_full, fake.state.child_polls_needed = True, 1
+    async with mcp_session() as s:
+        queued = await call(s, "create_simulation", expressions="rank(q)", queue=True)
+        fake.state.sim_slots_full = False
+        sent = await call(s, "get_simulation", simulation_ids=queued["queue_id"], wait_seconds=10)
+    assert sent["status"] == "COMPLETE"
+    pf.brain_client.save_state()
+    pf.brain_client._executor.shutdown(wait=True)
+    fresh = pf.BrainApiClient()                                  # the server after a restart
+    monkeypatch.setattr(pf, "brain_client", fresh)
+    fresh.load_state()
+    assert not fresh._queue_done
+    async with create_connected_server_and_client_session(pf.mcp._mcp_server) as s:
+        again = await call(s, "get_simulation", simulation_ids=queued["queue_id"])
+    assert again["status"] == "COMPLETE" and again["queue_id"] == queued["queue_id"]
+    fresh._executor.shutdown(wait=False)

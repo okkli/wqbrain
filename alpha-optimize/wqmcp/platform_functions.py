@@ -3023,8 +3023,14 @@ class BrainApiClient:
 
     def queued_submission(self, queue_id: str) -> Optional[Dict[str, Any]]:
         queue_id = str(queue_id).strip().upper()
-        return next((e for e in self.submit_queue if e["queue_id"] == queue_id),
-                    self._queue_done.get(queue_id))
+        entry = next((e for e in self.submit_queue if e["queue_id"] == queue_id),
+                     self._queue_done.get(queue_id))
+        if entry is None:   # sent before a restart: the simulation list (in the state file) knows it
+            row = next((r for r in self.recent_simulations if r.get("queue_id") == queue_id), None)
+            if row:
+                entry = {"queue_id": queue_id, "status": "SUBMITTED", "kind": row.get("kind"), "alphas": row.get("alphas"),
+                         "simulation_id": row["simulation_id"]}
+        return entry
 
     def queued_state(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """What a caller is told about a submission that went through the queue."""
