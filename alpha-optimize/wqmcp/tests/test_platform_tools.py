@@ -898,6 +898,51 @@ async def test_submissions_wait_in_the_queue_first_in_first_out(mcp_session, fak
     assert [(k, v.get("regular")) for k, v in fake.state.sims.items()] == [("S1", "rank(a)"), ("S2", "rank(d)")]
 
 
+async def test_a_waiting_raa_does_not_hold_back_the_other_lanes(mcp_session, fake, monkeypatch):
+    monkeypatch.setattr(pf, "SUBMIT_QUEUE_INTERVAL", 0.05)
+    fake.state.sim_lanes_full, fake.state.child_polls_needed = ("raa",), 1
+    async with mcp_session() as s:
+        raa = await call(s, "create_simulation", expressions="rank(a)", type="RA", queue=True)
+        assert (raa["status"], raa["queue_id"], raa["queue_position"], raa["lane"]) == ("QUEUED", "Q1", 1, "raa")
+        assert "2 RAA at a time" in raa["note"]
+        usa = await call(s, "create_simulation", expressions="rank(b)", queue=True)
+        assert usa["status"] == "SUBMITTED"                       # BRAIN has room for it: sent at once
+        again = await call(s, "create_simulation", expressions="rank(c)", type="RA", queue=True)
+        assert (again["queue_id"], again["queue_position"]) == ("Q2", 2)   # behind the first RAA
+
+        assert [pf._sim_lane(*a) for a in (("SUPER", "USA"), ("REGULAR", "GLB"), ("REGULAR", "KOR"),
+                                           ("REGION_AGNOSTIC", "ALL"))] == ["super", "glb", "main", "raa"]
+        fake.state.sim_lanes_full = ("raa", "glb")
+        glb = await call(s, "create_simulation", expressions=["rank(d)", "rank(e)"], region="GLB",
+                         universe="TOP3000", queue=True, validate_expressions=False)
+        assert (glb["status"], glb["queue_id"], glb["queue_position"], glb["lane"]) == ("QUEUED", "Q3", 1, "glb")
+        listing = await call(s, "get_simulation")
+        assert [(q["queue_position"], q["queue_id"], q["lane"]) for q in listing["submit_queue"]] == \
+            [(1, "Q1", "raa"), (2, "Q2", "raa"), (3, "Q3", "glb")]
+
+        fake.state.sim_lanes_full = ("raa",)                      # GLB frees up, the RAA place does not
+        done = await call(s, "get_simulation", simulation_ids="Q3", wait_seconds=10)
+        assert done["status"] == "COMPLETE"                       # passed the two RAA ahead of it
+        assert (await call(s, "get_simulation", simulation_ids="Q2"))["queue_position"] == 2
+        fake.state.sim_lanes_full = ()
+        both = await call(s, "get_simulation", simulation_ids=["Q1", "Q2"], wait_seconds=10)
+        assert both["status"] == "COMPLETE"
+    accepted = ["raa" if v.get("raa") else v.get("regular") for v in fake.state.sims.values()]
+    assert [e for e in accepted if e in ("raa", "rank(b)", "rank(d)")] == ["rank(b)", "rank(d)", "raa", "raa"]
+
+
+async def test_without_lanes_the_queue_is_one_line(mcp_session, fake, monkeypatch):
+    monkeypatch.setattr(pf, "SUBMIT_QUEUE_LANES", False)
+    fake.state.sim_lanes_full = ("raa",)
+    async with mcp_session() as s:
+        raa = await call(s, "create_simulation", expressions="rank(a)", type="RA", queue=True)
+        assert raa["status"] == "QUEUED" and "lane" not in raa
+        usa = await call(s, "create_simulation", expressions="rank(b)", queue=True)
+        assert (usa["status"], usa["queue_position"]) == ("QUEUED", 2)      # nobody overtakes
+        for q in ("Q1", "Q2"):
+            await call(s, "cancel_simulation", simulation_id=q)
+
+
 async def test_concurrent_items_without_a_slot_are_queued(mcp_session, fake):
     fake.state.sim_post_limit = 1
     async with mcp_session() as s:

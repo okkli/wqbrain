@@ -2204,6 +2204,8 @@ class BrainApiClient:
         self._logged.update(state.get("logged") or [])
         self._queue_numbers = max(self._queue_numbers, int(state.get("queue_numbers") or 0))
         self.submit_queue = [e for e in state.get("queue") or [] if e.get("status") == "QUEUED"]
+        for e in self.submit_queue:
+            e.setdefault("lane", _payload_lane(e.get("type"), e.get("payloads")))
         for row in reversed(state.get("recent") or []):
             self.recent_simulations.appendleft(row)
         self._silent_fields.update(state.get("silent_fields") or {})
@@ -3014,6 +3016,7 @@ class BrainApiClient:
         self._queue_numbers += 1
         entry = {"queue_id": f"Q{self._queue_numbers}", "status": "QUEUED", "kind": kind, "body": body,
                  "what": what, "type": sim_type, "payloads": payloads, "alphas": len(payloads),
+                 "lane": _payload_lane(sim_type, payloads),
                  "enqueued": time.time(), "attempts": 0, "meta": meta}
         self.submit_queue.append(entry)
         self.save_state()
@@ -3037,16 +3040,21 @@ class BrainApiClient:
         out = {"status": entry["status"], "queue_id": entry["queue_id"], "kind": entry["kind"],
                "alphas": entry["alphas"]}
         if entry["status"] == "QUEUED":
-            ahead = self.submit_queue.index(entry)
+            lane = entry.get("lane") or "main"
+            # its place among those it waits behind: the same lane (other lanes do not hold it back)
+            ahead = sum(1 for e in self.submit_queue[:self.submit_queue.index(entry)]
+                        if (e.get("lane") or "main") == lane)
             holders = self.slot_holders()
             if holders:
                 out["slots_held_by"] = holders     # running simulations of this server, by client
+            if SUBMIT_QUEUE_LANES:
+                out["lane"] = lane
             out.update(queue_position=ahead + 1, waiting_seconds=int(time.time() - entry["enqueued"]),
                        attempts=entry["attempts"], retry_after_seconds=15.0,
                        note=("The account's simulation slots are full. Queued requests wait in this "
                              "server's queue (first in, first out) and are sent as soon as BRAIN accepts "
                              "them. Follow one with get_simulation(simulation_ids=<its queue_id>); "
-                             "cancel_simulation takes it out."))
+                             "cancel_simulation takes it out." + _LANE_NOTES.get(lane if SUBMIT_QUEUE_LANES else "", "")))
         else:
             out.update({k: entry[k] for k in ("simulation_id", "progress_url", "error", "waited_seconds")
                         if entry.get(k) is not None})
@@ -3078,7 +3086,7 @@ class BrainApiClient:
     def submit_queue_snapshot(self) -> List[Dict[str, Any]]:
         return [{"queue_position": i + 1, "queue_id": e["queue_id"], "kind": e["kind"],
                  "alphas": e["alphas"], "waiting_seconds": int(time.time() - e["enqueued"]),
-                 "attempts": e["attempts"],
+                 "attempts": e["attempts"], **({"lane": e.get("lane") or "main"} if SUBMIT_QUEUE_LANES else {}),
                  **{k: (e.get("meta") or {})[k] for k in ("tag", "client") if (e.get("meta") or {}).get(k)},
                  "expr": _cut((e["payloads"][0].get("regular") or e["payloads"][0].get("combo") or ""), 80)}
                 for i, e in enumerate(self.submit_queue)]
@@ -3113,50 +3121,74 @@ class BrainApiClient:
                 "note": "No longer in the queue." + (
                     " It was sent: cancel the simulation_id instead." if entry.get("simulation_id") else "")}
 
-    async def _run_submit_queue(self) -> None:
-        """Send the queued submissions in order; the first one blocks the others, so
-        nothing overtakes."""
-        while self.submit_queue:
-            entry = self.submit_queue[0]
-            if time.time() - entry["enqueued"] > SUBMIT_QUEUE_SECONDS:
-                self._queue_finished(entry, "ERROR", error=(
-                    f"no simulation slot became free within {int(SUBMIT_QUEUE_SECONDS // 60)} minutes"))
-                continue
+    def lane_waiting(self, lane: str) -> bool:
+        """Does a queued submission of this lane wait already (a new one then goes behind it)?"""
+        return any((e.get("lane") or "main") == lane for e in self.submit_queue)
+
+    async def _send_queued(self, entry: Dict[str, Any]) -> Optional[float]:
+        """Try one queued submission. None: it left the queue (sent, refused or timed out);
+        a number: BRAIN has no place for it, try again in that many seconds."""
+        if time.time() - entry["enqueued"] > SUBMIT_QUEUE_SECONDS:
+            self._queue_finished(entry, "ERROR", error=(
+                f"no simulation slot became free within {int(SUBMIT_QUEUE_SECONDS // 60)} minutes"))
+            return None
+        try:
+            posted = await self._post_simulation(entry["body"], entry["what"])
+        except Exception as e:   # BRAIN refused it: not a matter of waiting
+            self._queue_finished(entry, "ERROR", error=str(e) or repr(e))
+            return None
+        if isinstance(posted, dict) and posted.get("status") == "DAILY_QUOTA_EXHAUSTED":
+            self._queue_finished(entry, "ERROR", error=posted["note"], daily_quota_exhausted=True)
+            meta = entry.get("meta") or {}
+            if meta.get("tag"):      # the log says these never ran
+                qmeta = {**meta, "queue_id": entry["queue_id"]}
+                await self._append_tag_lines(meta["tag"], [
+                    {**self._tag_record(entry["queue_id"], qmeta, i), "status": "DAILY_QUOTA_EXHAUSTED",
+                     "submitted_expr": _cut(p.get("regular") or p.get("combo") or "", _COMPACT_EXPR_CHARS)}
+                    for i, p in enumerate(entry.get("payloads") or [])])
+            return None
+        if isinstance(posted, dict):
+            entry["attempts"] += 1
+            told = posted["retry_after_seconds"] if posted.get("retry_after_from_brain") else 0.0
+            return min(max(told, SUBMIT_QUEUE_INTERVAL), SUBMIT_QUEUE_MAX_INTERVAL)
+        simulation_id, location = posted
+        if entry not in self.submit_queue:      # cancelled while the POST was under way: nobody waits for it
             try:
-                posted = await self._post_simulation(entry["body"], entry["what"])
-            except Exception as e:   # BRAIN refused it: not a matter of waiting
-                self._queue_finished(entry, "ERROR", error=str(e) or repr(e))
-                continue
-            if isinstance(posted, dict) and posted.get("status") == "DAILY_QUOTA_EXHAUSTED":
-                self._queue_finished(entry, "ERROR", error=posted["note"], daily_quota_exhausted=True)
-                meta = entry.get("meta") or {}
-                if meta.get("tag"):      # the log says these never ran
-                    qmeta = {**meta, "queue_id": entry["queue_id"]}
-                    await self._append_tag_lines(meta["tag"], [
-                        {**self._tag_record(entry["queue_id"], qmeta, i), "status": "DAILY_QUOTA_EXHAUSTED",
-                         "submitted_expr": _cut(p.get("regular") or p.get("combo") or "", _COMPACT_EXPR_CHARS)}
-                        for i, p in enumerate(entry.get("payloads") or [])])
-                continue
-            if isinstance(posted, dict):
-                entry["attempts"] += 1
-                told = posted["retry_after_seconds"] if posted.get("retry_after_from_brain") else 0.0
-                await asyncio.sleep(min(max(told, SUBMIT_QUEUE_INTERVAL), SUBMIT_QUEUE_MAX_INTERVAL))
-                continue
-            simulation_id, location = posted
-            self._remember_simulation(simulation_id, entry["kind"], entry["type"], entry["alphas"],
-                                      entry["payloads"], {**(entry.get("meta") or {}), "queue_id": entry["queue_id"]})
-            for ids in self._retried.values():      # a split batch follows its item by the simulation id
-                for k, ref in enumerate(ids):     # (the queue id is gone after a restart)
-                    if ref == entry["queue_id"]:
-                        ids[k] = simulation_id
-            self._queue_finished(entry, "SUBMITTED", simulation_id=simulation_id, progress_url=location)
+                await self._request('delete', f"{self.base_url}/simulations/{simulation_id}")
+            except Exception:
+                pass
+            return None
+        self._remember_simulation(simulation_id, entry["kind"], entry["type"], entry["alphas"],
+                                  entry["payloads"], {**(entry.get("meta") or {}), "queue_id": entry["queue_id"]})
+        for ids in self._retried.values():      # a split batch follows its item by the simulation id
+            for k, ref in enumerate(ids):     # (the queue id is gone after a restart)
+                if ref == entry["queue_id"]:
+                    ids[k] = simulation_id
+        self._queue_finished(entry, "SUBMITTED", simulation_id=simulation_id, progress_url=location)
+        return None
+
+    async def _run_submit_queue(self) -> None:
+        """Send the queued submissions in order. Within a lane the first one blocks the
+        others, so nothing overtakes; a lane BRAIN has no place for does not block the
+        other lanes (each pass tries the first of every lane, oldest first)."""
+        while self.submit_queue:
+            blocked: Dict[str, float] = {}
+            for entry in list(self.submit_queue):
+                lane = entry.get("lane") or "main"
+                if lane in blocked or entry not in self.submit_queue:
+                    continue
+                wait = await self._send_queued(entry)
+                if wait is not None:
+                    blocked[lane] = wait
+            if blocked:
+                await asyncio.sleep(max(blocked.values()))
 
     async def _submit(self, kind: str, body: Any, what: str, sim_type: str,
                       payloads: List[Dict[str, Any]], queue: bool,
                       meta: Optional[Dict[str, Any]] = None) -> Any:
         """POST now, or queue when the slots are full. Returns (id, location), or the
         RATE_LIMITED / QUEUED dict."""
-        if queue and self.submit_queue:
+        if queue and self.lane_waiting(_payload_lane(sim_type, payloads)):
             return self._queue_submission(kind, body, what, sim_type, payloads, meta)   # nobody overtakes
         posted = await self._post_simulation(body, what)
         if isinstance(posted, dict) and queue and posted.get("status") == "RATE_LIMITED":
@@ -6342,6 +6374,38 @@ SUBMIT_QUEUE_MAX = int(os.environ.get("WQMCP_SUBMIT_QUEUE_MAX", "50"))
 SUBMIT_QUEUE_SECONDS = float(os.environ.get("WQMCP_SUBMIT_QUEUE_SECONDS", "7200"))
 SUBMIT_QUEUE_INTERVAL = float(os.environ.get("WQMCP_SUBMIT_QUEUE_INTERVAL", "15"))
 SUBMIT_QUEUE_MAX_INTERVAL = float(os.environ.get("WQMCP_SUBMIT_QUEUE_MAX_INTERVAL", "60"))
+# BRAIN limits simulations per kind, not only per account: 2 REGION_AGNOSTIC at a time
+# (2026-11-27: 74 accepted in a day, never a third within 138s of the first), fewer GLB
+# than other regions. Every limit answers the same 429, so the queue keeps one line per
+# lane: an RAA waiting for an RAA place does not hold back a SUPER or a USA multi that
+# BRAIN would take (that cost 21 minutes for 7 requests on 2026-11-27; the same evening a
+# SUPER was refused for 19 minutes with 4 RAA behind it while BRAIN took a USA and an RAA
+# sent directly). 0 = one line.
+SUBMIT_QUEUE_LANES = os.environ.get("WQMCP_SUBMIT_QUEUE_LANES", "1") != "0"
+
+
+def _sim_lane(sim_type: Any, region: Any = None) -> str:
+    """The line a simulation waits in: "raa", "super", "glb" or "main" (one line when lanes are off)."""
+    if not SUBMIT_QUEUE_LANES:
+        return "main"
+    if str(sim_type or "").upper() == "REGION_AGNOSTIC":
+        return "raa"
+    if str(sim_type or "").upper() == "SUPER":
+        return "super"
+    return "glb" if str(region or "").upper() == "GLB" else "main"
+
+
+_LANE_NOTES = {
+    "raa": " Lane raa: BRAIN runs 2 RAA at a time on the account; simulations of other kinds are not held back by this one.",
+    "glb": " Lane glb: BRAIN runs fewer GLB simulations at a time than other regions; other regions are not held back by this one.",
+    "super": " Lane super: SuperAlpha simulations wait for each other only; other kinds are not held back by this one.",
+    "main": " Lane main: waiting RAA / SUPER / GLB requests do not hold this one back.",
+}
+
+
+def _payload_lane(sim_type: Any, payloads: Any) -> str:
+    first = (payloads or [{}])[0] or {}
+    return _sim_lane(sim_type or first.get("type"), (first.get("settings") or {}).get("region"))
 # A simulation whose progress has not moved for this long is reported as stale.
 STALE_MULTI_SECONDS = float(os.environ.get("WQMCP_STALE_MULTI_SECONDS", "1200"))
 STALE_SINGLE_SECONDS = float(os.environ.get("WQMCP_STALE_SINGLE_SECONDS", "600"))
@@ -6892,10 +6956,11 @@ async def create_simulation(
         concurrent takes one slot per item.
       queue (default on): full slots -> status QUEUED with a queue_id ("Q7") that
         get_simulation / cancel_simulation accept; queue=False -> RATE_LIMITED.
+        Lanes raa / super / glb / main each keep their own order: a waiting RAA does not hold back the rest.
 
     type: "REGULAR" (expressions; language="PYTHON" needs lookback), "SUPER"/"SA"
       (combo + selection, lists pair one-to-one), "REGION_AGNOSTIC"/"RA" (one
-      FASTEXPR in GLB/USA/ASI/EUR, universe LARGE/MEDIUM/SMALL, 4 slots).
+      FASTEXPR in GLB/USA/ASI/EUR, universe LARGE/MEDIUM/SMALL; BRAIN runs 2 at a time).
     mode: "auto" (default), "single", "multi" (2-10 REGULAR in one request: one
       failing child sinks the batch, so it is linted first), "concurrent" (one id
       per item).
@@ -7287,13 +7352,16 @@ async def _submit_concurrently(items: List[SimulationData], children: List[Dict[
         r = brain_client._queue_submission("single", payload, "simulation", item.type, [payload], meta_of(i))
         return {**children[i], **{k: r[k] for k in keep if k in r}}
 
-    if queue and brain_client.submit_queue:          # others wait already: nobody overtakes
-        rows = [enqueue(i, item) for i, item in enumerate(items)]
-    else:
-        rows = list(await asyncio.gather(*(submit(i, item) for i, item in enumerate(items))))
-        if queue:
-            rows = [enqueue(i, items[i]) if r.get("status") == "RATE_LIMITED" else r
-                    for i, r in enumerate(rows)]
+    # others of its lane wait already: nobody overtakes (another lane's line does not count)
+    behind = [bool(queue) and brain_client.lane_waiting(_sim_lane(item.type, item.settings.region))
+              for item in items]
+
+    async def direct(i: int, item: SimulationData) -> Optional[Dict[str, Any]]:
+        return None if behind[i] else await submit(i, item)
+
+    sent = await asyncio.gather(*(direct(i, item) for i, item in enumerate(items)))
+    rows = [enqueue(i, items[i]) if r is None or (queue and r.get("status") == "RATE_LIMITED") else r
+            for i, r in enumerate(sent)]
     ids = [r["simulation_id"] for r in rows if r.get("status") == "SUBMITTED"]
     queued = [r["queue_id"] for r in rows if r.get("status") == "QUEUED"]
     limited = [r for r in rows if r.get("status") == "RATE_LIMITED"]
@@ -7322,8 +7390,8 @@ async def _submit_concurrently(items: List[SimulationData], children: List[Dict[
                      "cancel_simulation like a simulation id.")
     if limited:
         out["retry_after_seconds"] = max((r.get("retry_after_seconds") or 0) for r in limited) or 30.0
-        notes.append("RATE_LIMITED items hit the account's concurrent-simulation limit (an RAA takes "
-                      "4 slots): resubmit just those once running simulations finish.")
+        notes.append("RATE_LIMITED items hit the account's concurrent-simulation limit (BRAIN runs 2 RAA "
+                      "at a time): resubmit just those once running simulations finish.")
     if capped:
         notes.append(f"{len(capped)} item(s) hit BRAIN's daily alpha cap (DAILY_QUOTA_EXHAUSTED): "
                      "see daily_alphas for the count and the reset time.")

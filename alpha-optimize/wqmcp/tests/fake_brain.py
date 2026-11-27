@@ -56,6 +56,7 @@ class FakeState:
     credd_calls: int = 0
     counters: Dict[str, int] = field(default_factory=dict)
     sim_slots_full: bool = False
+    sim_lanes_full: tuple = ()   # of "raa", "glb", "main": BRAIN's per-kind limits, same 429 as full slots
     sims: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     next_sim: int = 1
     alphas: List[Dict[str, Any]] = field(default_factory=list)
@@ -236,6 +237,10 @@ def _create_sim(fb: FakeBrain, q, body) -> Response:
             return 400, {}, {"detail": "Invalid expression: unexpected end"}
     if st.sim_slots_full:
         return 429, {"Retry-After": "30"}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
+    kind = ("raa" if items[0].get("type") == "REGION_AGNOSTIC"
+            else "glb" if items[0].get("settings", {}).get("region") == "GLB" else "main")
+    if kind in st.sim_lanes_full:
+        return 429, {}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
     if st.sim_post_limit and st.tick("sim_posts") > st.sim_post_limit:
         return 429, {"Retry-After": "30"}, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
     sid = f"S{st.next_sim}"

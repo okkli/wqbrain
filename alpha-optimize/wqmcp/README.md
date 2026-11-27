@@ -31,6 +31,7 @@ WQMCP_TRANSPORT=stdio python platform_functions.py
 | `WQMCP_SUBMIT_QUEUE` | `1` | 模拟名额满时，请求进入本服务的先进先出队列等待。设为 `0` 则直接返回 `RATE_LIMITED` |
 | `WQMCP_SUBMIT_QUEUE_MAX` / `WQMCP_SUBMIT_QUEUE_SECONDS` | `50` / `7200` | 发枪队列最多排几个请求、一个请求最多等多久 |
 | `WQMCP_SUBMIT_QUEUE_INTERVAL` | `15` | 名额满时每隔几秒重试队首的请求 |
+| `WQMCP_SUBMIT_QUEUE_LANES` | `1` | 发枪队列按通道各排各的：`raa`（RAA，BRAIN 同时只跑 2 个）、`super`（SuperAlpha）、`glb`（GLB 区域）、`main`（其余）。同一通道内先进先出、不插队；一个通道被 429 挡住时不拦其他通道。设为 `0` 则恢复成一条队 |
 | `WQMCP_MAX_WAIT_SECONDS` | `40` | 任何工具单次调用最多等多久。连接在静默约 45 秒后会断开，所以 `wait_seconds` 超过这个值会被截到这个值 |
 | `WQMCP_TOOL_DEADLINE_SECONDS` | `75` | 只读工具超过这个时间没有结果就放弃并返回 `timed_out`，不会一直挂着 |
 | `WQMCP_COMPACT_EXPR_CHARS` | `1500` | 精简行里表达式最多保留多少字符，`0` 表示不截断 |
